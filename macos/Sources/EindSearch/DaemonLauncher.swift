@@ -13,6 +13,14 @@ final class DaemonLauncher {
 
     var isRunning: Bool { process?.isRunning == true }
 
+    /// The agent `eind service enable` installs. When it exists the service
+    /// owns the daemon and the app must not start a competing one.
+    static var loginServiceInstalled: Bool {
+        let agent = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/LaunchAgents/eind.plist")
+        return FileManager.default.fileExists(atPath: agent.path)
+    }
+
     /// EIND_BINARY, then PATH, then the places `go install` and Homebrew put
     /// binaries, because an app launched from Finder gets a minimal PATH.
     nonisolated static func locateBinary(

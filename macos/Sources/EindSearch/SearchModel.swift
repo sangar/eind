@@ -85,6 +85,10 @@ final class SearchModel {
     private func startDaemonIfNeeded() {
         guard !daemonLaunchAttempted else { return }
         daemonLaunchAttempted = true
+        if DaemonLauncher.loginServiceInstalled {
+            connectionError = "The eind login service is enabled but not answering yet. Waiting for it."
+            return
+        }
         guard let binary = DaemonLauncher.locateBinary() else {
             connectionError! += " The eind binary was not found; install it with `go install`, or set EIND_BINARY."
             return
