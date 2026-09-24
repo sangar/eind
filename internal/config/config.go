@@ -29,11 +29,20 @@ func Default() Config {
 		home = "."
 	}
 	return Config{
-		Roots: []string{home},
-		Excludes: []string{
-			"/proc", "/sys", "/dev", "/run",
-			"/System/Volumes", "/Volumes", "/private/var/vm",
-		},
+		Roots:    []string{home},
+		Excludes: DefaultExcludes(),
+	}
+}
+
+// DefaultExcludes leaves out virtual filesystems, other volumes, and the
+// caches and dependency trees that hold a third of a developer's files while
+// almost never being what a search is for.
+func DefaultExcludes() []string {
+	return []string{
+		"/proc", "/sys", "/dev", "/run",
+		"/System/Volumes", "/Volumes", "/private/var/vm",
+		"~/Library/Caches", "~/.local/share/mise",
+		"node_modules", ".git", ".cache",
 	}
 }
 
@@ -120,6 +129,9 @@ func parse(f *os.File) (Config, error) {
 	if len(cfg.Roots) == 0 {
 		cfg.Roots = Default().Roots
 	}
+	if len(cfg.Excludes) == 0 {
+		cfg.Excludes = DefaultExcludes()
+	}
 	return cfg, nil
 }
 
@@ -142,6 +154,8 @@ func Render(cfg Config) string {
 	b.WriteString("# exclude = pattern to leave out. Without a slash it matches names\n")
 	b.WriteString("#           (node_modules, *.tmp); with a slash it matches full paths\n")
 	b.WriteString("#           and everything below (/proc, ~/Library/Caches, **/.git).\n")
+	b.WriteString("#           Delete a line to index that location again. A file with\n")
+	b.WriteString("#           no exclude lines at all uses the defaults listed here.\n")
 	b.WriteString("#\n")
 	b.WriteString("# Run `eind index` after changing this file.\n\n")
 	for _, r := range cfg.Roots {

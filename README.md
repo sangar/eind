@@ -232,8 +232,8 @@ eind config --init            # write the defaults, then edit the file
 root = ~
 root = /Volumes/Data
 
-exclude = /proc
-exclude = **/node_modules
+exclude = node_modules
+exclude = ~/Library/Caches
 exclude = *.tmp
 ```
 
@@ -241,8 +241,14 @@ exclude = *.tmp
 names; with a slash it is matched against the full path and excludes
 everything below it. Run `eind index` after editing.
 
-To index a whole machine, set `root = /`. The defaults already exclude
-`/proc`, `/sys`, `/dev`, `/run`, `/Volumes` and `/System/Volumes`.
+By default `eind` excludes `node_modules`, `.git` and `.cache` folders,
+`~/Library/Caches`, `~/.local/share/mise`, and the virtual and foreign
+filesystems `/proc`, `/sys`, `/dev`, `/run`, `/Volumes`, `/System/Volumes`
+and `/private/var/vm`. On a developer's machine that is roughly half of all
+files, and almost never what a search is for. The exclude lines in the config
+file replace this list, so `eind config --init` writes it out for editing:
+delete a line to index that location again. To index a whole machine, set
+`root = /`.
 
 ## Keeping the index fresh
 
