@@ -268,6 +268,37 @@ systemctl --user enable --now eind-watch
 On Linux, inotify needs one watch per directory. For large trees raise the
 limit: `sudo sysctl fs.inotify.max_user_watches=1048576`.
 
+## Compared with find
+
+`find` walks the filesystem and stats every entry on each run, so it costs
+the same whether the query is selective or not. `eind` answers from its
+index. Measured on a MacBook with 2.07 million files and 378,000 folders
+under two roots, warm cache, best of three runs:
+
+| Query | find | eind (CLI) | eind (daemon) |
+|---|---|---|---|
+| `eind server.go` | 52 s | 112 ms | 5 ms |
+| `eind ext:pdf size:>1mb` | 52 s | 108 ms | 4 ms |
+| `eind ext:go dm:last7days` | 52 s | 120 ms | 4 ms |
+| `eind folder:wfn:node_modules` | 51 s | 108 ms | 2 ms |
+| `eind a` (1.4 million hits) | 52 s | 189 ms | 186 ms |
+
+The CLI spends nearly all of its time loading the 82 MB index; the daemon
+keeps it in memory, so only the search remains. Building the index from
+scratch took 15 s.
+
+The price is freshness: `find` is always exact, while `eind` is as current as
+its watcher. In the last query above `eind` counted 86 stale entries out of
+1.4 million, files that had been deleted since the index was last updated.
+
+`find` needs no setup, searches any path, and can act on what it finds with
+`-exec` and `-delete`. `eind` needs an index and a list of roots, and only
+finds; pipe `eind -0` into `xargs -0` to act on results. `find` can filter by
+permissions, owner and symlink type; `eind` cannot. `eind` can filter by
+name length, path depth, extension lists and human date and size ranges,
+rank by relevance, and match case-insensitive substrings by default, where
+`find` needs `-iname '*server.go*'`.
+
 ## How it works
 
 The index is a flat array of entries. Each entry stores its name, its parent's
