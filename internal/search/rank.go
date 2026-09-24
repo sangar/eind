@@ -59,11 +59,11 @@ type ranked struct {
 }
 
 // topK keeps the k best rows using a heap whose top is the worst kept row.
-func topK(rows []ranked, k int, better func(a, b ranked) int) []ranked {
+func topK[T any](rows []T, k int, better func(a, b T) int) []T {
 	if k == 0 {
 		return nil
 	}
-	h := &worstFirst{rows: make([]ranked, 0, k+1), better: better}
+	h := &worstFirst[T]{rows: make([]T, 0, k+1), better: better}
 	for _, r := range rows {
 		if h.Len() < k {
 			heap.Push(h, r)
@@ -76,16 +76,16 @@ func topK(rows []ranked, k int, better func(a, b ranked) int) []ranked {
 	return h.rows
 }
 
-type worstFirst struct {
-	rows   []ranked
-	better func(a, b ranked) int
+type worstFirst[T any] struct {
+	rows   []T
+	better func(a, b T) int
 }
 
-func (h *worstFirst) Len() int           { return len(h.rows) }
-func (h *worstFirst) Less(i, j int) bool { return h.better(h.rows[i], h.rows[j]) > 0 }
-func (h *worstFirst) Swap(i, j int)      { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
-func (h *worstFirst) Push(x any)         { h.rows = append(h.rows, x.(ranked)) }
-func (h *worstFirst) Pop() any {
+func (h *worstFirst[T]) Len() int           { return len(h.rows) }
+func (h *worstFirst[T]) Less(i, j int) bool { return h.better(h.rows[i], h.rows[j]) > 0 }
+func (h *worstFirst[T]) Swap(i, j int)      { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
+func (h *worstFirst[T]) Push(x any)         { h.rows = append(h.rows, x.(T)) }
+func (h *worstFirst[T]) Pop() any {
 	last := h.rows[len(h.rows)-1]
 	h.rows = h.rows[:len(h.rows)-1]
 	return last

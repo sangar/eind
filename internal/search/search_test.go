@@ -3,6 +3,7 @@ package search
 import (
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -139,5 +140,34 @@ func TestSortOrders(t *testing.T) {
 		if got := first(c.key, c.desc); got != c.want {
 			t.Errorf("sort %v desc=%v: first = %q, want %q", c.key, c.desc, got, c.want)
 		}
+	}
+}
+
+func TestTopMatchesSortForEveryKey(t *testing.T) {
+	ix := sample()
+	// "a" and "a.txt" beside each other: as strings "/r/a" < "/r/a.txt" < "/r/a/b"
+	// because '.' sorts before the separator, which a per-component compare gets wrong.
+	r := uint32(0)
+	a := ix.Add(index.Entry{Name: "a", Parent: r, IsDir: true})
+	ix.Add(index.Entry{Name: "a.txt", Parent: r})
+	ix.Add(index.Entry{Name: "b", Parent: a})
+	all, _ := Run(ix, query.IsDir{Dir: false})
+	all = append(all, a)
+	for _, key := range []SortKey{SortPath, SortName, SortSize, SortModified, SortCreated, SortExt} {
+		for _, desc := range []bool{false, true} {
+			sorted := Top(ix, slices.Clone(all), key, desc, -1)
+			for _, keep := range []int{1, 2, 3} {
+				got := Top(ix, slices.Clone(all), key, desc, keep)
+				if !reflect.DeepEqual(got, sorted[:keep]) {
+					t.Errorf("key %v desc %v keep %d: got %v, want %v", key, desc, keep, names(ix, got), names(ix, sorted[:keep]))
+				}
+			}
+		}
+	}
+	byPath := Top(ix, slices.Clone(all), SortPath, false, 3)
+	got := []string{ix.Path(byPath[0]), ix.Path(byPath[1]), ix.Path(byPath[2])}
+	want := []string{filepath.Join(root, "a"), filepath.Join(root, "a.txt"), filepath.Join(root, "a", "b")}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("path order = %v, want %v", got, want)
 	}
 }

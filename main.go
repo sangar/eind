@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -301,14 +303,14 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 		fmt.Println(len(hits))
 		return nil
 	}
+	keep := -1
+	if f.maxResults > 0 {
+		keep = f.offset + f.maxResults
+	}
 	if sortKey == search.SortRelevance {
-		keep := -1
-		if f.maxResults > 0 {
-			keep = f.offset + f.maxResults
-		}
 		hits = search.Rank(ix, hits, node, keep)
 	} else {
-		search.Sort(ix, hits, sortKey, f.descending)
+		hits = search.Top(ix, hits, sortKey, f.descending, keep)
 	}
 	hits = hits[min(f.offset, len(hits)):]
 	if f.maxResults > 0 && f.maxResults < len(hits) {
@@ -500,6 +502,7 @@ func runDaemon(name string, args []string, serve bool) error {
 	if err != nil {
 		return err
 	}
+	limitDaemonMemory()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var mu sync.RWMutex
@@ -545,6 +548,22 @@ func cmdService(args []string) error {
 	}
 	fmt.Printf("eind serve now runs at login; definition at %s\n", path)
 	return nil
+}
+
+// limitDaemonMemory keeps a long-running daemon close to the size of its
+// index: the collector runs at half the default headroom and treats the loaded
+// index plus half again as a ceiling. The server returns what large queries
+// borrowed once requests go quiet, see Server.releaseMemoryWhenIdle.
+func limitDaemonMemory() {
+	if os.Getenv("GOMEMLIMIT") != "" || os.Getenv("GOGC") != "" {
+		return
+	}
+	debug.SetGCPercent(50)
+	debug.FreeOSMemory()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	live := int64(m.HeapAlloc)
+	debug.SetMemoryLimit(live + max(live/2, 128<<20))
 }
 
 func cmdStatus(args []string) error {

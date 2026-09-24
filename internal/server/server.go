@@ -22,6 +22,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -106,7 +107,16 @@ type Server struct {
 	mu        *sync.RWMutex
 	indexPath string
 	log       io.Writer
+
+	idleMu  sync.Mutex
+	release *time.Timer
 }
+
+// A burst of per-keystroke queries over a large index can allocate hundreds
+// of megabytes of temporaries. The runtime hands freed memory back to the OS
+// slowly, so the daemon would stay that large; instead it collects and
+// releases once no request has arrived for this long.
+const idleBeforeRelease = 2 * time.Second
 
 // New serves ix, taking mu's read lock for every request so the index may be
 // updated concurrently under its write lock.
@@ -213,6 +223,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) handle(ctx context.Context, req Request, send func(any)) {
+	defer s.releaseMemoryWhenIdle()
 	switch req.Op {
 	case "", "search":
 		s.search(ctx, req, send)
@@ -225,6 +236,15 @@ func (s *Server) handle(ctx context.Context, req Request, send func(any)) {
 	default:
 		send(ErrorResponse{ID: req.ID, Error: fmt.Sprintf("unknown op %q", req.Op)})
 	}
+}
+
+func (s *Server) releaseMemoryWhenIdle() {
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.release != nil {
+		s.release.Stop()
+	}
+	s.release = time.AfterFunc(idleBeforeRelease, debug.FreeOSMemory)
 }
 
 func (s *Server) search(ctx context.Context, req Request, send func(any)) {
@@ -272,7 +292,11 @@ func (s *Server) search(ctx context.Context, req Request, send func(any)) {
 		}
 		hits = search.Rank(s.ix, hits, node, keep)
 	} else {
-		search.Sort(s.ix, hits, sortKey, req.Descending)
+		keep := -1
+		if limit >= 0 {
+			keep = offset + limit
+		}
+		hits = search.Top(s.ix, hits, sortKey, req.Descending, keep)
 	}
 	if ctx.Err() != nil {
 		send(CancelledResponse{ID: req.ID, Cancelled: true})
