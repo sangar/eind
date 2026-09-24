@@ -92,11 +92,14 @@ struct ContentView: View {
     @ViewBuilder
     private var emptyState: some View {
         if let error = model.connectionError {
-            ContentUnavailableView(
-                "Not connected",
-                systemImage: "bolt.slash",
-                description: Text(error)
-            )
+            ContentUnavailableView {
+                Label("Not connected", systemImage: "bolt.slash")
+            } description: {
+                Text(error)
+                if let output = model.daemonOutput {
+                    Text(output).font(.callout.monospaced()).padding(.top, 4)
+                }
+            }
         } else if let error = model.queryError {
             ContentUnavailableView(
                 "Invalid query",

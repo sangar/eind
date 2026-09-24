@@ -37,6 +37,11 @@ final class EindClient {
         connection.start(queue: .main)
     }
 
+    func disconnect() {
+        connection?.cancel()
+        connection = nil
+    }
+
     /// Sends a search and returns its id so the caller can ignore stale replies.
     func search(_ query: String, limit: Int) -> Int {
         nextID += 1
