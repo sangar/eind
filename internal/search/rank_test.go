@@ -45,8 +45,11 @@ func TestRankWithoutNameTermsFallsBackToNameOrder(t *testing.T) {
 	ix := sample()
 	node, _ := query.Parse("ext:go", query.Defaults{})
 	hits, _ := Run(ix, node)
-	hits = Rank(ix, hits, node, -1)
-	if ix.Entries[hits[0]].Name != "main.go" {
-		t.Errorf("first = %q", ix.Entries[hits[0]].Name)
+	all := Rank(ix, slices.Clone(hits), node, -1)
+	if ix.Entries[all[0]].Name != "main.go" || ix.Entries[all[1]].Name != "main_test.go" {
+		t.Errorf("order = %v", all)
+	}
+	if top := Rank(ix, slices.Clone(hits), node, 1); !reflect.DeepEqual(top, all[:1]) {
+		t.Errorf("top-1 = %v, want %v", top, all[:1])
 	}
 }

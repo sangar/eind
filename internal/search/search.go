@@ -87,8 +87,39 @@ type textM struct {
 	needle string
 	re     *regexp.Regexp
 	mode   query.TextMode
+	glob   globKind
 	path   bool
 	cased  bool
+}
+
+// globKind is a wildcard pattern simple enough to match without a regexp:
+// "*x", "x*" and "*x*" are by far the most typed, and a leading "*" alone
+// would otherwise run a regexp over every name in the index.
+type globKind int
+
+const (
+	notSimpleGlob globKind = iota
+	globSuffix
+	globPrefix
+	globContains
+)
+
+func simpleGlob(pattern string) (globKind, string) {
+	if strings.ContainsRune(pattern, '?') {
+		return notSimpleGlob, ""
+	}
+	inner := strings.Trim(pattern, "*")
+	if strings.ContainsRune(inner, '*') || inner == pattern {
+		return notSimpleGlob, ""
+	}
+	switch {
+	case strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*"):
+		return globContains, inner
+	case strings.HasPrefix(pattern, "*"):
+		return globSuffix, inner
+	default:
+		return globPrefix, inner
+	}
 }
 
 func (m textM) match(c *ctx) bool {
@@ -109,6 +140,14 @@ func (m textM) match(c *ctx) bool {
 	}
 	if m.re != nil {
 		return m.re.MatchString(hay)
+	}
+	switch m.glob {
+	case globSuffix:
+		return strings.HasSuffix(hay, m.needle)
+	case globPrefix:
+		return strings.HasPrefix(hay, m.needle)
+	case globContains:
+		return strings.Contains(hay, m.needle)
 	}
 	switch m.mode {
 	case query.WholeName:
@@ -255,6 +294,15 @@ func compileAll(ix *index.Index, nodes []query.Node) ([]matcher, error) {
 
 func compileText(t query.Text) (matcher, error) {
 	m := textM{mode: t.Mode, path: t.Path, cased: t.CaseSensitive}
+	if t.Mode == query.Wildcard {
+		if kind, needle := simpleGlob(t.Text); kind != notSimpleGlob {
+			m.glob, m.needle = kind, needle
+			if !t.CaseSensitive {
+				m.needle = strings.ToLower(needle)
+			}
+			return m, nil
+		}
+	}
 	switch t.Mode {
 	case query.Regex, query.Wildcard:
 		pattern := t.Text

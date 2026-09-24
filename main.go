@@ -517,7 +517,6 @@ func runDaemon(name string, args []string, serve bool) error {
 			if err := <-serveErr; err != nil {
 				fmt.Fprintln(os.Stderr, "eind: server:", err)
 			}
-			os.Remove(g.socketPath)
 		}()
 	}
 	fmt.Fprintln(os.Stderr, watch.ServiceHint())

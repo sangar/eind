@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const label = "eind"
@@ -79,7 +80,9 @@ func (m manager) enable(executable string) error {
 		return err
 	}
 	if m.goos == "darwin" {
-		_ = run("launchctl", "bootout", m.launchdDomain()+"/"+label) // not loaded yet on first enable
+		if err := m.bootout(); err != nil {
+			return err
+		}
 		return run("launchctl", "bootstrap", m.launchdDomain(), path)
 	}
 	if err := run("systemctl", "--user", "daemon-reload"); err != nil {
@@ -94,7 +97,7 @@ func (m manager) disable() error {
 		return fmt.Errorf("no service installed at %s", path)
 	}
 	if m.goos == "darwin" {
-		if err := run("launchctl", "bootout", m.launchdDomain()+"/"+label); err != nil && !strings.Contains(err.Error(), "No such process") {
+		if err := m.bootout(); err != nil {
 			return err
 		}
 	} else if err := run("systemctl", "--user", "disable", "--now", label+".service"); err != nil {
@@ -107,6 +110,26 @@ func (m manager) disable() error {
 		return run("systemctl", "--user", "daemon-reload")
 	}
 	return nil
+}
+
+// bootout unloads the agent if launchd has it and waits until it is gone.
+// launchctl returns as soon as the stop signal is sent, and a bootstrap while
+// the old registration lingers fails with an I/O error.
+func (m manager) bootout() error {
+	target := m.launchdDomain() + "/" + label
+	err := run("launchctl", "bootout", target)
+	if err != nil && strings.Contains(err.Error(), "No such process") {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		if run("launchctl", "print", target) != nil {
+			return nil
+		}
+	}
+	return errors.New("launchctl bootout: the eind agent did not stop within 15 seconds")
 }
 
 // Enable writes the service definition for executable and starts it now and
@@ -166,7 +189,6 @@ func launchdPlist(executable, logPath string) string {
   <key>ProgramArguments</key><array><string>` + xmlEscape(executable) + `</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>` + xmlEscape(logPath) + `</string>
   <key>StandardErrorPath</key><string>` + xmlEscape(logPath) + `</string>
 </dict></plist>

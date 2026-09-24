@@ -1,18 +1,32 @@
 package service
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
+// capture records service manager commands. launchctl print reports a
+// service as gone, and bootout of a missing service fails like launchctl does.
 func capture(t *testing.T) *[]string {
 	t.Helper()
 	var calls []string
 	previous := run
+	loaded := false
 	run = func(name string, args ...string) error {
 		calls = append(calls, name+" "+strings.Join(args, " "))
+		switch {
+		case name == "launchctl" && args[0] == "bootstrap":
+			loaded = true
+		case name == "launchctl" && args[0] == "bootout" && !loaded:
+			return errors.New("Boot-out failed: 3: No such process")
+		case name == "launchctl" && args[0] == "bootout":
+			loaded = false
+		case name == "launchctl" && args[0] == "print" && !loaded:
+			return errors.New("Could not find service")
+		}
 		return nil
 	}
 	t.Cleanup(func() { run = previous })
@@ -36,6 +50,13 @@ func TestEnableOnMacWritesAgentAndBootstrapsIt(t *testing.T) {
 	}
 	if got := strings.Join(*calls, "\n"); got != "launchctl bootout gui/501/eind\nlaunchctl bootstrap gui/501 "+m.unitPath() {
 		t.Errorf("commands:\n%s", got)
+	}
+	*calls = nil
+	if err := m.disable(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(*calls, "\n"); got != "launchctl bootout gui/501/eind\nlaunchctl print gui/501/eind" {
+		t.Errorf("disable commands:\n%s", got)
 	}
 }
 

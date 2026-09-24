@@ -246,3 +246,51 @@ func TestServiceRejectsUnknownAction(t *testing.T) {
 		t.Errorf("out = %q, err = %v", out, err)
 	}
 }
+
+// A daemon shutting down must not remove the socket of the daemon that has
+// already replaced it; closing its own listener is what removes its file.
+func TestStoppingDaemonLeavesSuccessorSocketAlone(t *testing.T) {
+	fx := newFixture(t)
+	dir, err := os.MkdirTemp("", "eind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "s")
+	start := func() *exec.Cmd {
+		cmd := exec.Command(binary, "serve", "--socket", sock)
+		cmd.Env = append(os.Environ(), "EIND_CONFIG="+fx.config, "EIND_INDEX="+fx.index)
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return cmd
+	}
+	waitFor := func(cond func() bool, what string) {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if cond() {
+				return
+			}
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	socketExists := func() bool { _, err := os.Stat(sock); return err == nil }
+
+	first := start()
+	waitFor(socketExists, "first daemon")
+	holdOpen, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holdOpen.Close()
+	first.Process.Signal(os.Interrupt)
+	waitFor(func() bool { return !socketExists() }, "first daemon to close its listener")
+
+	second := start()
+	defer func() { second.Process.Signal(os.Interrupt); second.Wait() }()
+	waitFor(socketExists, "second daemon")
+	holdOpen.Close()
+	first.Wait()
+	if !socketExists() {
+		t.Fatal("the stopping daemon removed its successor's socket")
+	}
+}

@@ -13,7 +13,8 @@ import (
 // Rank orders hits the way a launcher wants them: names that equal a search
 // term come first, then names starting with it, then names containing it at
 // a word boundary, then plain substring matches. Ties go to shallower paths,
-// then to name order. Queries without plain name terms fall back to name order.
+// then to name order. Queries without plain name terms, such as "*.pdf" or
+// "ext:go", come in name order.
 //
 // Only the best keep hits are returned, in rank order; keep < 0 returns them
 // all. Selecting the top few hundred out of a million is far cheaper than
@@ -23,13 +24,12 @@ func Rank(ix *index.Index, hits []uint32, n query.Node, keep int) []uint32 {
 		keep = len(hits)
 	}
 	terms := plainTerms(n)
-	if len(terms) == 0 {
-		Sort(ix, hits, SortName, false)
-		return hits[:keep]
-	}
 	rows := make([]ranked, len(hits))
 	for k, h := range hits {
-		rows[k] = ranked{hit: h, score: score(ix.Lower[h], terms), depth: depth(ix, h)}
+		rows[k] = ranked{hit: h}
+		if len(terms) > 0 {
+			rows[k].score, rows[k].depth = score(ix.Lower[h], terms), depth(ix, h)
+		}
 	}
 	better := func(a, b ranked) int {
 		return cmp.Or(
