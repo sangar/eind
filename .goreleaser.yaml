@@ -1,0 +1,63 @@
+version: 2
+project_name: eind
+
+builds:
+  - env: [CGO_ENABLED=0]
+    goos: [darwin, linux, freebsd, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: freebsd
+        goarch: arm64
+      - goos: windows
+        goarch: arm64
+    ldflags: ["-s -w -X main.version={{ .Version }}"]
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE, README.md]
+
+nfpms:
+  - package_name: eind
+    homepage: https://github.com/OWNER/eind
+    maintainer: Gard Sandholt <gard.sandholt@gmail.com>
+    description: Instant file name search with a live index.
+    license: MIT
+    formats: [deb, rpm, apk, archlinux]
+    contents:
+      - src: packaging/eind.service
+        dst: /usr/lib/systemd/user/eind.service
+      - src: packaging/50-eind.conf
+        dst: /usr/lib/sysctl.d/50-eind.conf
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+
+homebrew_casks:
+  - repository:
+      owner: OWNER
+      name: homebrew-tap
+    homepage: https://github.com/OWNER/eind
+    description: Instant file name search with a live index.
+    license: MIT
+    binaries: [eind]
+    caveats: |
+      Keep the index fresh and every search instant with:
+        eind service enable
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/eind"]
+          end
+    zap:
+      trash:
+        - "~/Library/LaunchAgents/eind.plist"
+        - "~/Library/Logs/eind.log"
+        - "~/.local/share/eind"
+        - "~/.config/eind"
+
+changelog:
+  use: git

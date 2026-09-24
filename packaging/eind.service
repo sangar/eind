@@ -1,0 +1,10 @@
+[Unit]
+Description=eind file index daemon
+
+[Service]
+ExecStart=/usr/bin/eind serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

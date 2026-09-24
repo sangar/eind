@@ -23,6 +23,7 @@ import (
 	"eind/internal/query"
 	"eind/internal/search"
 	"eind/internal/server"
+	"eind/internal/service"
 	"eind/internal/tui"
 	"eind/internal/watch"
 )
@@ -36,6 +37,7 @@ Usage:
   eind index [--root DIR]...    build the index from the configured roots
   eind watch                    keep the index up to date from filesystem events
   eind serve                    watch, and answer queries over a Unix socket (for GUIs)
+  eind service enable|disable   run eind serve at login (launchd agent or systemd user unit)
   eind status                   show where the index and config live, and their size
   eind config [--init]          show the effective config, or write a default file
   eind tui                      open the interactive view
@@ -110,6 +112,8 @@ func run(args []string) error {
 			return cmdServe(append(flags, positional[1:]...))
 		case "status":
 			return cmdStatus(flags)
+		case "service":
+			return cmdService(positional[1:])
 		case "config":
 			return cmdConfig(append(flags, positional[1:]...))
 		case "tui":
@@ -520,6 +524,30 @@ func runDaemon(name string, args []string, serve bool) error {
 	return watch.Run(ctx, ix, ex, g.indexPath, *interval, &mu, os.Stderr)
 }
 
+func cmdService(args []string) error {
+	if len(args) != 1 || (args[0] != "enable" && args[0] != "disable") {
+		return errors.New("usage: eind service enable|disable")
+	}
+	if args[0] == "disable" {
+		path, err := service.Disable()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("stopped eind serve and removed %s\n", path)
+		return nil
+	}
+	exe, err := service.ExecutablePath()
+	if err != nil {
+		return err
+	}
+	path, err := service.Enable(exe)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("eind serve now runs at login; definition at %s\n", path)
+	return nil
+}
+
 func cmdStatus(args []string) error {
 	fs := newFlagSet("eind status")
 	var g globals
@@ -536,6 +564,11 @@ func cmdStatus(args []string) error {
 		fmt.Printf("daemon: running at %s\n", g.socketPath)
 	} else {
 		fmt.Printf("daemon: not running (start with `eind serve`, socket %s)\n", g.socketPath)
+	}
+	if path, ok := service.Installed(); ok {
+		fmt.Printf("service: enabled, %s\n", path)
+	} else {
+		fmt.Println("service: not enabled (run `eind service enable` to start eind serve at login)")
 	}
 	fmt.Printf("index:  %s", g.indexPath)
 	st, err := os.Stat(g.indexPath)

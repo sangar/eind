@@ -238,3 +238,11 @@ func TestServeAnswersOverTheSocket(t *testing.T) {
 		t.Errorf("query errors should come back from the daemon: %q, %v", out, err)
 	}
 }
+
+func TestServiceRejectsUnknownAction(t *testing.T) {
+	fx := newFixture(t)
+	out, err := fx.run(t, "service", "restart")
+	if err == nil || !strings.Contains(out, "usage: eind service enable|disable") {
+		t.Errorf("out = %q, err = %v", out, err)
+	}
+}

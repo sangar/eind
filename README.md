@@ -13,19 +13,31 @@ Windows.
 
 ## Install
 
+macOS, with Homebrew:
+
+```sh
+brew install OWNER/tap/eind
+eind service enable           # run eind serve from login
+```
+
+Debian, Ubuntu, Fedora, Alpine and Arch: install the `.deb`, `.rpm`, `.apk`
+or `.pkg.tar.zst` from the releases page with your package manager. The
+package ships a systemd user unit that is enabled for every user and starts
+at their next login; `systemctl --user start eind` starts it right away. It
+also raises the inotify watch limit that a home directory needs.
+
+From source, with Go 1.26 or newer (no C dependencies, `CGO_ENABLED=0` works):
+
 ```sh
 git clone <this repository> eind && cd eind
 go install .                  # puts eind in $(go env GOPATH)/bin
+eind service enable
 ```
 
-Or `make build` and copy `eind` somewhere on your `PATH`. Go 1.26 or newer is
-required; there are no C dependencies, so `CGO_ENABLED=0` builds work too.
-
-Then enable the daemon as a user service, see [Keeping the index
-fresh](#keeping-the-index-fresh). With `eind serve` running, the index stays
-current and every search, from the command line, the interactive view or a
-GUI, is answered from memory in a few milliseconds. Without it each `eind`
-command loads the index from disk first, about 110 ms for two million files.
+With `eind serve` running, the index stays current and every search, from
+the command line, the interactive view or a GUI, is answered from memory in a
+few milliseconds. Without it each `eind` command loads the index from disk
+first, about 110 ms for two million files.
 
 ## Quick start
 
@@ -234,53 +246,31 @@ To index a whole machine, set `root = /`. The defaults already exclude
 
 ## Keeping the index fresh
 
-`eind watch` loads the index, subscribes to change notifications for every
-root (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows)
-and saves the updated index every ten seconds while changes accumulate.
-Renames, moves and newly created folders are picked up in full. `eind serve`
-does the same and additionally answers queries over the socket, so run that
-one if anything else on the machine will query eind.
+`eind serve` loads the index, subscribes to change notifications for every
+root (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows),
+saves the updated index every ten seconds while changes accumulate, and
+answers queries over the socket. Renames, moves and newly created folders are
+picked up in full. `eind watch` does the same without the socket.
 
-Run it as a user service so it is always on.
-
-macOS, `~/Library/LaunchAgents/eind.watch.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>eind.watch</string>
-  <key>ProgramArguments</key><array><string>/usr/local/bin/eind</string><string>serve</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardErrorPath</key><string>/tmp/eind-watch.log</string>
-</dict></plist>
-```
+Run it as a login service so it is always on:
 
 ```sh
-launchctl load ~/Library/LaunchAgents/eind.watch.plist
+eind service enable           # start now and at every login
+eind service disable          # stop and remove it
+eind status                   # shows whether the daemon and the service are set up
 ```
 
-Linux, `~/.config/systemd/user/eind-watch.service`:
+On macOS this writes `~/Library/LaunchAgents/eind.plist`, a launchd agent
+that logs to `~/Library/Logs/eind.log`. On Linux it writes
+`~/.config/systemd/user/eind.service` and enables it with `systemctl --user`.
+The service starts the `eind` found on your `PATH`, so upgrading the binary in
+place is enough. The Linux packages instead ship
+`/usr/lib/systemd/user/eind.service`, enabled for all users; use one or the
+other, not both.
 
-```ini
-[Unit]
-Description=eind file index watcher
-
-[Service]
-ExecStart=%h/go/bin/eind serve
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-```sh
-systemctl --user enable --now eind-watch
-```
-
-On Linux, inotify needs one watch per directory. For large trees raise the
-limit: `sudo sysctl fs.inotify.max_user_watches=1048576`.
+On Linux, inotify needs one watch per directory. The packages install a
+sysctl snippet for this; otherwise raise the limit yourself:
+`sudo sysctl fs.inotify.max_user_watches=1048576`.
 
 ## Compared with find and fd
 
@@ -343,8 +333,12 @@ away on save.
 
 ```sh
 make test          # go vet + go test ./...
-make release       # cross-compile into dist/ for macOS, Linux, FreeBSD and Windows
+make snapshot      # build archives, deb/rpm/apk/Arch packages and the Homebrew cask into dist/
+make release       # the same for a tagged commit, published as a GitHub release
 ```
+
+Releases are described in `.goreleaser.yaml`; the Linux packages take their
+systemd unit, sysctl snippet and install scripts from `packaging/`.
 
 ## License
 

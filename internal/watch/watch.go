@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"time"
 
@@ -94,8 +93,5 @@ func collectBurst(events <-chan notify.EventInfo, changed map[string]bool) {
 
 // ServiceHint explains how to keep `eind watch` running in the background.
 func ServiceHint() string {
-	if runtime.GOOS == "darwin" {
-		return "Tip: keep it running with a launchd agent; see README.md for a template."
-	}
-	return "Tip: keep it running with a systemd user service; see README.md for a template."
+	return "Tip: `eind service enable` keeps it running in the background from login."
 }
