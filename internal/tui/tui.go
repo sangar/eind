@@ -2,6 +2,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -15,6 +16,9 @@ import (
 	"eind/internal/query"
 	"eind/internal/search"
 )
+
+// typingPause is how long the input must be idle before a search starts.
+const typingPause = 40 * time.Millisecond
 
 // Run opens the interactive view and returns the path the user accepted with
 // Enter, or "" if they quit.
@@ -30,24 +34,67 @@ func Run(ix *index.Index, defaults query.Defaults) (string, error) {
 	return run(screen, ix, defaults)
 }
 
+type result struct {
+	generation int
+	hits       []uint32
+	err        error
+	elapsed    time.Duration
+}
+
+// run keeps the event loop free: searches happen on their own goroutine and
+// are cancelled as soon as the input changes again.
 func run(screen tcell.Screen, ix *index.Index, defaults query.Defaults) (string, error) {
 	screen.EnableMouse(tcell.MouseButtonEvents)
-	v := &view{ix: ix, defaults: defaults, screen: screen}
-	v.search()
+	events := make(chan tcell.Event, 64)
+	quit := make(chan struct{})
+	go screen.ChannelEvents(events, quit)
+	defer close(quit)
+
+	v := &view{ix: ix, defaults: defaults, screen: screen, results: make(chan result, 1)}
+	defer v.cancelSearch()
+	v.startSearch()
+	var settled <-chan time.Time
 	for {
 		v.draw()
-		switch ev := screen.PollEvent().(type) {
-		case *tcell.EventResize:
-			screen.Sync()
-		case *tcell.EventMouse:
-			v.mouse(ev)
-		case *tcell.EventKey:
-			if done, result := v.key(ev); done {
-				return result, nil
+		select {
+		case ev := <-events:
+			action := v.handle(ev)
+			switch action {
+			case actQuit:
+				return "", nil
+			case actAccept:
+				if !v.searching {
+					return v.selectedPath(), nil
+				}
+				v.acceptWhenDone = true
+			case actInputChanged:
+				v.cancelSearch()
+				v.searching = true
+				settled = time.After(typingPause)
+			}
+		case <-settled:
+			settled = nil
+			v.startSearch()
+		case r := <-v.results:
+			if r.generation != v.generation {
+				continue
+			}
+			v.apply(r)
+			if v.acceptWhenDone {
+				return v.selectedPath(), nil
 			}
 		}
 	}
 }
+
+type action int
+
+const (
+	actNone action = iota
+	actQuit
+	actAccept
+	actInputChanged
+)
 
 type view struct {
 	ix       *index.Index
@@ -60,52 +107,111 @@ type view struct {
 	top      int
 	elapsed  time.Duration
 	err      string
+
+	results        chan result
+	generation     int
+	cancel         context.CancelFunc
+	searching      bool
+	acceptWhenDone bool
 }
 
-func (v *view) search() {
+func (v *view) cancelSearch() {
+	if v.cancel != nil {
+		v.cancel()
+		v.cancel = nil
+	}
+}
+
+func (v *view) startSearch() {
+	v.cancelSearch()
+	v.generation++
+	v.searching = true
+	ctx, cancel := context.WithCancel(context.Background())
+	v.cancel = cancel
+	go runSearch(ctx, v.ix, string(v.input), v.defaults, v.generation, v.results)
+}
+
+func runSearch(ctx context.Context, ix *index.Index, input string, defaults query.Defaults, generation int, results chan<- result) {
 	start := time.Now()
-	node, err := query.Parse(string(v.input), v.defaults)
+	r := result{generation: generation}
+	node, err := query.Parse(input, defaults)
 	if err == nil {
-		v.hits, err = search.Run(v.ix, node)
+		r.hits, err = search.RunContext(ctx, ix, node)
 	}
 	if err != nil {
-		v.err = err.Error()
-		v.hits = nil
-	} else {
-		v.err = ""
-		search.Sort(v.ix, v.hits, search.SortName, false)
+		r.err = err
+	} else if strings.TrimSpace(input) != "" {
+		// A blank query lists the whole index; leaving it
+		// in index order keeps that instant even for millions of entries.
+		search.Sort(ix, r.hits, search.SortName, false)
 	}
-	v.elapsed = time.Since(start)
-	v.selected = 0
-	v.top = 0
+	r.elapsed = time.Since(start)
+	select {
+	case results <- r:
+	case <-ctx.Done():
+	}
 }
 
-func (v *view) key(ev *tcell.EventKey) (done bool, result string) {
+func (v *view) apply(r result) {
+	v.searching = false
+	v.cancel = nil
+	v.elapsed = r.elapsed
+	v.selected, v.top = 0, 0
+	if r.err != nil {
+		v.err = r.err.Error()
+		v.hits = nil
+		return
+	}
+	v.err = ""
+	v.hits = r.hits
+}
+
+func (v *view) selectedPath() string {
+	if len(v.hits) == 0 {
+		return ""
+	}
+	return v.ix.Path(v.hits[v.selected])
+}
+
+func (v *view) handle(ev tcell.Event) action {
+	switch ev := ev.(type) {
+	case *tcell.EventResize:
+		v.screen.Sync()
+	case *tcell.EventMouse:
+		v.mouse(ev)
+	case *tcell.EventKey:
+		return v.key(ev)
+	}
+	return actNone
+}
+
+func (v *view) key(ev *tcell.EventKey) action {
 	_, height := v.screen.Size()
 	page := max(height-3, 1)
 	switch ev.Key() {
 	case tcell.KeyEscape, tcell.KeyCtrlC:
-		return true, ""
+		return actQuit
 	case tcell.KeyEnter:
-		if len(v.hits) == 0 {
-			return true, ""
-		}
-		return true, v.ix.Path(v.hits[v.selected])
+		return actAccept
 	case tcell.KeyCtrlO:
-		if len(v.hits) > 0 {
-			openWithSystem(v.ix.Path(v.hits[v.selected]))
+		if p := v.selectedPath(); p != "" {
+			openWithSystem(p)
 		}
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if len(v.input) > 0 {
 			v.input = v.input[:len(v.input)-1]
-			v.search()
+			return actInputChanged
 		}
 	case tcell.KeyCtrlU:
-		v.input = v.input[:0]
-		v.search()
+		if len(v.input) > 0 {
+			v.input = v.input[:0]
+			return actInputChanged
+		}
 	case tcell.KeyCtrlW:
-		v.input = deleteWord(v.input)
-		v.search()
+		if len(v.input) > 0 {
+			v.input = deleteWord(v.input)
+			return actInputChanged
+		}
 	case tcell.KeyDown, tcell.KeyCtrlN:
 		v.move(1)
 	case tcell.KeyUp, tcell.KeyCtrlP:
@@ -120,9 +226,9 @@ func (v *view) key(ev *tcell.EventKey) (done bool, result string) {
 		v.move(len(v.hits))
 	case tcell.KeyRune:
 		v.input = append(v.input, ev.Rune())
-		v.search()
+		return actInputChanged
 	}
-	return false, ""
+	return actNone
 }
 
 func (v *view) mouse(ev *tcell.EventMouse) {
@@ -185,6 +291,9 @@ func (v *view) draw() {
 	}
 
 	status := fmt.Sprintf(" %s of %s objects  %s", withCommas(len(v.hits)), withCommas(v.ix.Len()), v.elapsed.Round(time.Millisecond))
+	if v.searching {
+		status = fmt.Sprintf(" %s of %s objects  searching...", withCommas(len(v.hits)), withCommas(v.ix.Len()))
+	}
 	if v.err != "" {
 		status = " " + v.err
 	}
@@ -217,7 +326,7 @@ func (v *view) drawRow(y, width int, hit uint32, selected bool) {
 	if dir != "" {
 		available := width - x - metaWidth - 2
 		if available > 4 {
-			x = putString(v.screen, x, y, "  "+truncate(dir, available), style.Dim(true))
+			putString(v.screen, x, y, "  "+truncate(dir, available), style.Dim(true))
 		}
 	}
 	putString(v.screen, width-metaWidth, y, meta, style.Dim(true))
@@ -276,7 +385,7 @@ func openWithSystem(path string) {
 	default:
 		cmd = exec.Command("xdg-open", path)
 	}
-	cmd.Stdout, cmd.Stderr = nil, nil
-	_ = cmd.Start()
-	go func() { _ = cmd.Wait() }()
+	if err := cmd.Start(); err == nil {
+		go func() { _ = cmd.Wait() }()
+	}
 }

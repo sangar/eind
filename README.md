@@ -87,10 +87,14 @@ Run `eind --help` for the full list.
 ## Interactive view
 
 `eind` with no query, or `eind tui`, opens a full-screen list that filters as
-you type, using the same query syntax. Arrow keys, Page Up/Down, Home/End and
-the mouse wheel move; Enter prints the selected path to stdout and exits;
-Ctrl-O opens the selection with the system opener; Esc quits. Because the
-result goes to stdout, it composes with the shell:
+you type, using the same query syntax. Searches run in the background and are
+cancelled the moment you type again, so the input never blocks. A blank
+query lists the whole index; it is shown in index order,
+while any other query is sorted by name. Arrow keys, Page Up/Down, Home/End
+and the mouse wheel move; Enter prints the selected path to stdout and exits
+(if a search is still running, it waits for those results first); Ctrl-O opens
+the selection with the system opener; Esc quits. Because the result goes to
+stdout, it composes with the shell:
 
 ```sh
 vim "$(eind)"

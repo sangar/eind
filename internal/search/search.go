@@ -2,6 +2,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,8 @@ import (
 
 // ctx carries one entry through the matcher tree, building its full path
 // only if some matcher asks for it.
+const cancelCheckInterval = 8192
+
 type ctx struct {
 	ix        *index.Index
 	i         uint32
@@ -353,6 +356,11 @@ func findChildDir(ix *index.Index, parent uint32, lowerName string) (uint32, boo
 
 // Run returns the indices of all live entries matching the query, in index order.
 func Run(ix *index.Index, n query.Node) ([]uint32, error) {
+	return RunContext(context.Background(), ix, n)
+}
+
+// RunContext is Run with cancellation; it returns ctx.Err() once cancelled.
+func RunContext(cancel context.Context, ix *index.Index, n query.Node) ([]uint32, error) {
 	m, err := compile(ix, n)
 	if err != nil {
 		return nil, err
@@ -375,6 +383,9 @@ func Run(ix *index.Index, n query.Node) ([]uint32, error) {
 			c := &ctx{ix: ix}
 			var hits []uint32
 			for i := lo; i < hi; i++ {
+				if i%cancelCheckInterval == 0 && cancel.Err() != nil {
+					return
+				}
 				if !ix.Live(uint32(i)) {
 					continue
 				}
@@ -387,6 +398,9 @@ func Run(ix *index.Index, n query.Node) ([]uint32, error) {
 		}(lo, hi, slot)
 	}
 	wg.Wait()
+	if err := cancel.Err(); err != nil {
+		return nil, err
+	}
 	n2 := 0
 	for _, p := range parts {
 		n2 += len(p)
