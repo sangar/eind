@@ -149,6 +149,21 @@ Status request and response:
 Errors come back as `{"id": 1, "error": "size: expected a size such as 10mb, got \"huge!\""}`.
 Connections are independent; open as many as you like.
 
+### macOS app
+
+`macos/` holds a small SwiftUI client for the daemon: a search field, a table
+of results with Finder icons, size and modified date, and the index summary in
+the footer. Double-click or Enter opens a result; the context menu reveals it
+in Finder or copies its path. It connects to the same default socket as the
+daemon (`EIND_SOCKET` overrides it) and reconnects when `eind serve` starts.
+
+```sh
+eind serve &
+cd macos && swift run
+```
+
+Requires Xcode 16 or newer and macOS 14.
+
 Try it from a shell:
 
 ```sh
