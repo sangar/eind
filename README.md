@@ -1,17 +1,27 @@
 # eind
 
-Instant file search for the terminal.
+Instant file search on macOS, Linux, Windows and FreeBSD.
 
 `eind` indexes the names of every file and folder under your chosen roots once,
 then answers searches from that index in a few milliseconds, with a simple query
 language, example: `report ext:pdf size:>1mb dm:thisweek !draft`.
-A watcher keeps the index current from filesystem events, and `eind` on its own
-opens an interactive search-as-you-type view.
+A daemon keeps the index current from filesystem events and answers queries
+over a Unix socket, ranked the way a launcher wants them; the command line
+and an interactive search-as-you-type view use the same engine.
 
-Linux and macOS are the primary targets. It also builds for FreeBSD and
-Windows.
+Linux is the primary target and design decisions lean towards the launcher
+use: a systemd user service, XDG paths, per-keystroke queries that cancel
+each other, relevance ranking, and defaults that leave out what a launcher
+should never offer. macOS is fully supported and ships a small SwiftUI client
+as a reference; FreeBSD and Windows build too.
 
 ## Install
+
+Debian, Ubuntu, Fedora, Alpine and Arch: install the `.deb`, `.rpm`, `.apk`
+or `.pkg.tar.zst` from the releases page with your package manager. The
+package ships a systemd user unit that is enabled for every user and starts
+at their next login; `systemctl --user start eind` starts it right away. It
+also raises the inotify watch limit that a home directory needs.
 
 macOS, with Homebrew:
 
@@ -19,12 +29,6 @@ macOS, with Homebrew:
 brew install OWNER/tap/eind
 eind service enable           # run eind serve from login
 ```
-
-Debian, Ubuntu, Fedora, Alpine and Arch: install the `.deb`, `.rpm`, `.apk`
-or `.pkg.tar.zst` from the releases page with your package manager. The
-package ships a systemd user unit that is enabled for every user and starts
-at their next login; `systemctl --user start eind` starts it right away. It
-also raises the inotify watch limit that a home directory needs.
 
 From source, with Go 1.26 or newer (no C dependencies, `CGO_ENABLED=0` works):
 
@@ -110,7 +114,7 @@ Run `eind --help` for the full list.
 
 ## Daemon and socket API
 
-`eind serve` is what a GUI or launcher should talk to. It loads the index once,
+`eind serve` is what a launcher or GUI should talk to. It loads the index once,
 keeps it fresh from filesystem events exactly like `eind watch`, and answers
 queries from memory over a Unix socket in a few milliseconds. On a 2.2 million
 entry index a typical query round-trips in about 10 ms.
@@ -241,14 +245,17 @@ exclude = *.tmp
 names; with a slash it is matched against the full path and excludes
 everything below it. Run `eind index` after editing.
 
-By default `eind` excludes `node_modules`, `.git` and `.cache` folders,
-`~/Library/Caches`, `~/.local/share/mise`, and the virtual and foreign
-filesystems `/proc`, `/sys`, `/dev`, `/run`, `/Volumes`, `/System/Volumes`
-and `/private/var/vm`. On a developer's machine that is roughly half of all
-files, and almost never what a search is for. The exclude lines in the config
-file replace this list, so `eind config --init` writes it out for editing:
-delete a line to index that location again. To index a whole machine, set
-`root = /`.
+By default `eind` excludes what a launcher should never offer: `node_modules`,
+`.git` and `.cache` folders everywhere, and, derived from the platform it runs
+on, the user's cache directory, the trash, and the virtual or foreign
+filesystems. On Linux that is `~/.local/share/Trash`, `/proc`, `/sys`, `/dev`
+and `/run`; on macOS `~/Library/Caches`, `~/.Trash`, `/dev`, `/Volumes`,
+`/System/Volumes` and `/private/var/vm`. On a developer's machine these hold
+roughly half of all files. Tool-specific trees such as `~/.local/share/mise`
+or `~/.cargo/registry` are worth adding yourself. The exclude lines in the
+config file replace the default list, so `eind config --init` writes it out
+for editing: delete a line to index that location again. To index a whole
+machine, set `root = /`.
 
 ## Keeping the index fresh
 

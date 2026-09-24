@@ -34,16 +34,45 @@ func Default() Config {
 	}
 }
 
-// DefaultExcludes leaves out virtual filesystems, other volumes, and the
-// caches and dependency trees that hold a third of a developer's files while
-// almost never being what a search is for.
+// DefaultExcludes leaves out what a launcher never wants to offer: dependency
+// trees and version control internals, the platform's cache directory and
+// trash, and its virtual or foreign filesystems. Everything platform specific
+// is derived from the running system, so the list stays valid wherever eind
+// runs and the config file never mentions another operating system's paths.
 func DefaultExcludes() []string {
-	return []string{
-		"/proc", "/sys", "/dev", "/run",
-		"/System/Volumes", "/Volumes", "/private/var/vm",
-		"~/Library/Caches", "~/.local/share/mise",
-		"node_modules", ".git", ".cache",
+	excludes := []string{"node_modules", ".git", ".cache"}
+	if cache, err := os.UserCacheDir(); err == nil && filepath.Base(cache) != ".cache" && runtime.GOOS != "windows" {
+		excludes = append(excludes, homeRelative(cache))
 	}
+	excludes = append(excludes, platformExcludes()...)
+	return excludes
+}
+
+func platformExcludes() []string {
+	switch runtime.GOOS {
+	case "linux":
+		return []string{"~/.local/share/Trash", "/proc", "/sys", "/dev", "/run"}
+	case "darwin":
+		return []string{"~/.Trash", "/dev", "/System/Volumes", "/Volumes", "/private/var/vm"}
+	case "freebsd", "openbsd", "netbsd":
+		return []string{"~/.local/share/Trash", "/proc", "/dev"}
+	case "windows":
+		return []string{"$Recycle.Bin", "System Volume Information"}
+	}
+	return nil
+}
+
+// homeRelative writes a path under the home directory with a leading ~, which
+// is how users write excludes and keeps the config file readable.
+func homeRelative(p string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if rel, err := filepath.Rel(home, p); err == nil && !strings.HasPrefix(rel, "..") {
+		return "~/" + filepath.ToSlash(rel)
+	}
+	return p
 }
 
 func ConfigPath() string {

@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -36,5 +39,28 @@ func TestRenderedDefaultsRoundTrip(t *testing.T) {
 	cfg := load(t, Render(Default()))
 	if !reflect.DeepEqual(cfg, Default()) {
 		t.Errorf("rendered defaults read back as %+v", cfg)
+	}
+}
+
+func TestDefaultExcludesFitTheRunningPlatform(t *testing.T) {
+	got := DefaultExcludes()
+	for _, want := range []string{"node_modules", ".git", ".cache"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("defaults %v lack %q", got, want)
+		}
+	}
+	foreign := map[string][]string{
+		"darwin": {"/proc", "/sys", "~/.local/share/Trash"},
+		"linux":  {"/Volumes", "~/.Trash", "~/Library/Caches"},
+	}
+	for _, p := range foreign[runtime.GOOS] {
+		if slices.Contains(got, p) {
+			t.Errorf("defaults on %s should not mention %q", runtime.GOOS, p)
+		}
+	}
+	for _, p := range got {
+		if strings.HasPrefix(p, "/home/") || strings.HasPrefix(p, "/Users/") {
+			t.Errorf("%q should be written relative to ~", p)
+		}
 	}
 }
