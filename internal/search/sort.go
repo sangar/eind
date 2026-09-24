@@ -18,6 +18,8 @@ const (
 	SortModified
 	SortCreated
 	SortExt
+	// SortRelevance is handled by Rank, which needs the query; Sort treats it as SortName.
+	SortRelevance
 )
 
 func ParseSortKey(s string) (SortKey, error) {
@@ -34,8 +36,10 @@ func ParseSortKey(s string) (SortKey, error) {
 		return SortCreated, nil
 	case "ext", "extension":
 		return SortExt, nil
+	case "relevance", "rank":
+		return SortRelevance, nil
 	}
-	return 0, fmt.Errorf("unknown sort key %q (use path, name, size, dm, dc or ext)", s)
+	return 0, fmt.Errorf("unknown sort key %q (use path, name, size, dm, dc, ext or relevance)", s)
 }
 
 func Sort(ix *index.Index, hits []uint32, key SortKey, descending bool) {
@@ -50,7 +54,7 @@ func Sort(ix *index.Index, hits []uint32, key SortKey, descending bool) {
 			paths[h] = strings.ToLower(ix.Path(h))
 		}
 		less = func(a, b uint32) int { return cmp.Or(strings.Compare(paths[a], paths[b]), byName(a, b)) }
-	case SortName:
+	case SortName, SortRelevance:
 		less = byName
 	case SortSize:
 		less = func(a, b uint32) int {

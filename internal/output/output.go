@@ -97,7 +97,8 @@ func formatTime(unix int64) string {
 	return time.Unix(unix, 0).Format(timeLayout)
 }
 
-type record struct {
+// Record is one search hit in the JSON, CSV and socket protocols.
+type Record struct {
 	Path     string `json:"path"`
 	Name     string `json:"name"`
 	Type     string `json:"type"`
@@ -106,9 +107,9 @@ type record struct {
 	Created  string `json:"created,omitempty"`
 }
 
-func recordOf(ix *index.Index, h uint32) record {
+func RecordOf(ix *index.Index, h uint32) Record {
 	e := &ix.Entries[h]
-	r := record{
+	r := Record{
 		Path:     ix.Path(h),
 		Name:     e.Name,
 		Type:     "file",
@@ -131,7 +132,7 @@ func writeJSON(w *bufio.Writer, ix *index.Index, hits []uint32) error {
 			w.WriteString(",")
 		}
 		w.WriteString("\n  ")
-		buf, err := json.Marshal(recordOf(ix, h))
+		buf, err := json.Marshal(RecordOf(ix, h))
 		if err != nil {
 			return err
 		}
@@ -152,7 +153,7 @@ func writeCSV(w *bufio.Writer, ix *index.Index, hits []uint32) error {
 		return err
 	}
 	for _, h := range hits {
-		r := recordOf(ix, h)
+		r := RecordOf(ix, h)
 		if err := cw.Write([]string{r.Path, r.Name, r.Type, strconv.FormatInt(r.Size, 10), r.Modified, r.Created}); err != nil {
 			return err
 		}

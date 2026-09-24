@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"eind/internal/output"
 	"eind/internal/query"
 	"eind/internal/search"
+	"eind/internal/server"
 	"eind/internal/tui"
 	"eind/internal/watch"
 )
@@ -33,6 +35,7 @@ Usage:
   eind [options] [query...]     search; with no query, open the interactive view
   eind index [--root DIR]...    build the index from the configured roots
   eind watch                    keep the index up to date from filesystem events
+  eind serve                    watch, and answer queries over a Unix socket (for GUIs)
   eind status                   show where the index and config live, and their size
   eind config [--init]          show the effective config, or write a default file
   eind tui                      open the interactive view
@@ -44,7 +47,7 @@ Search options:
   -p, --match-path     match against the full path instead of the name
   -n, --max-results N  print at most N results
   -o, --offset N       skip the first N results
-  -s, --sort KEY       path (default), name, size, dm, dc or ext
+  -s, --sort KEY       path (default), name, size, dm, dc, ext or relevance
   -d, --descending     reverse the sort order
       --path DIR       only results inside DIR
       --files          only files
@@ -60,6 +63,7 @@ Output options:
 Global options:
       --config FILE    config file  (default %s, env EIND_CONFIG)
       --index FILE     index file   (default %s, env EIND_INDEX)
+      --socket FILE    daemon socket (default %s, env EIND_SOCKET)
   -h, --help           show this help
       --version        show the version
 
@@ -100,6 +104,8 @@ func run(args []string) error {
 			return cmdIndex(append(flags, positional[1:]...))
 		case "watch":
 			return cmdWatch(append(flags, positional[1:]...))
+		case "serve":
+			return cmdServe(append(flags, positional[1:]...))
 		case "status":
 			return cmdStatus(flags)
 		case "config":
@@ -119,7 +125,7 @@ func run(args []string) error {
 // Flags that take a value, so the pre-pass knows to keep the next argument with them.
 var knownValueFlags = map[string]bool{
 	"n": true, "max-results": true, "o": true, "offset": true, "s": true, "sort": true,
-	"path": true, "color": true, "config": true, "index": true, "root": true, "save-interval": true,
+	"path": true, "color": true, "config": true, "index": true, "root": true, "save-interval": true, "socket": true,
 }
 
 // splitFlags lets options appear anywhere on the line,
@@ -165,7 +171,7 @@ func newFlagSet(name string) *flag.FlagSet {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintf(w, usageText, config.ConfigPath(), config.IndexPath())
+	fmt.Fprintf(w, usageText, config.ConfigPath(), config.IndexPath(), server.DefaultSocketPath())
 }
 
 func parseFlags(fs *flag.FlagSet, args []string) error {
@@ -283,7 +289,15 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 		fmt.Println(len(hits))
 		return nil
 	}
-	search.Sort(ix, hits, sortKey, f.descending)
+	if sortKey == search.SortRelevance {
+		keep := -1
+		if f.maxResults > 0 {
+			keep = f.offset + f.maxResults
+		}
+		hits = search.Rank(ix, hits, node, keep)
+	} else {
+		search.Sort(ix, hits, sortKey, f.descending)
+	}
 	hits = hits[min(f.offset, len(hits)):]
 	if f.maxResults > 0 && f.maxResults < len(hits) {
 		hits = hits[:f.maxResults]
@@ -417,10 +431,21 @@ func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
 func cmdWatch(args []string) error {
-	fs := newFlagSet("eind watch")
+	return runDaemon("eind watch", args, false)
+}
+
+func cmdServe(args []string) error {
+	return runDaemon("eind serve", args, true)
+}
+
+// runDaemon keeps the index fresh from filesystem events and, when serving,
+// also answers queries from the same in-memory index over the socket.
+func runDaemon(name string, args []string, serve bool) error {
+	fs := newFlagSet(name)
 	var g globals
 	g.bind(fs)
 	interval := fs.Duration("save-interval", 10*time.Second, "")
+	socketPath := fs.String("socket", server.DefaultSocketPath(), "")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -438,8 +463,26 @@ func cmdWatch(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	var mu sync.RWMutex
+
+	if serve {
+		ln, err := server.Listen(*socketPath)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "serving queries at %s\n", *socketPath)
+		srv := server.New(ix, &mu, g.indexPath, os.Stderr)
+		serveErr := make(chan error, 1)
+		go func() { serveErr <- srv.Serve(ctx, ln) }()
+		defer func() {
+			if err := <-serveErr; err != nil {
+				fmt.Fprintln(os.Stderr, "eind: server:", err)
+			}
+			os.Remove(*socketPath)
+		}()
+	}
 	fmt.Fprintln(os.Stderr, watch.ServiceHint())
-	return watch.Run(ctx, ix, ex, g.indexPath, *interval, os.Stderr)
+	return watch.Run(ctx, ix, ex, g.indexPath, *interval, &mu, os.Stderr)
 }
 
 func cmdStatus(args []string) error {
@@ -454,6 +497,12 @@ func cmdStatus(args []string) error {
 		fmt.Print(" (not present, using defaults)")
 	}
 	fmt.Println()
+	socketPath := server.DefaultSocketPath()
+	if server.Running(socketPath) {
+		fmt.Printf("daemon: running at %s\n", socketPath)
+	} else {
+		fmt.Printf("daemon: not running (start with `eind serve`, socket %s)\n", socketPath)
+	}
 	fmt.Printf("index:  %s", g.indexPath)
 	st, err := os.Stat(g.indexPath)
 	if err != nil {

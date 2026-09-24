@@ -66,6 +66,7 @@ Modifiers can be chained: `folder:case:regex:^Src$`.
 eind [options] [query...]     search; with no query, open the interactive view
 eind index [--root DIR]...    build the index from the configured roots
 eind watch                    keep the index up to date from filesystem events
+eind serve                    watch, and answer queries over a Unix socket (for GUIs)
 eind status                   show where the index and config live, and their size
 eind config [--init]          show the effective config, or write a default file
 eind tui                      open the interactive view
@@ -73,7 +74,7 @@ eind tui                      open the interactive view
 
 Search options: `-r` regex, `-i` match case,
 `-w` whole word, `-p` match path, `-n N` max results, `-o N` offset,
-`-s KEY` sort by `path` (default), `name`, `size`, `dm`, `dc` or `ext`,
+`-s KEY` sort by `path` (default), `name`, `size`, `dm`, `dc`, `ext` or `relevance`,
 `-d` descending, `--path DIR`, `--files`, `--dirs`.
 
 Output options: `--json`, `--csv`, `-0` (NUL separated, for `xargs -0`),
@@ -83,6 +84,76 @@ Options may appear anywhere on the line. Use `--` when a search word collides
 with a subcommand name: `eind -- index`.
 
 Run `eind --help` for the full list.
+
+## Daemon and socket API
+
+`eind serve` is what a GUI or launcher should talk to. It loads the index once,
+keeps it fresh from filesystem events exactly like `eind watch`, and answers
+queries from memory over a Unix socket in a few milliseconds. On a 2.2 million
+entry index a typical query round-trips in about 10 ms.
+
+```sh
+eind serve                          # socket at $XDG_RUNTIME_DIR/eind.sock
+eind serve --socket /run/user/1000/eind.sock
+eind status                         # shows whether a daemon is running
+```
+
+The default socket is `$XDG_RUNTIME_DIR/eind.sock`, falling back to
+`eind-<uid>.sock` in the temp directory; `EIND_SOCKET` or `--socket` override
+it. The socket is created with mode 0600. Unix socket paths are limited to
+about 100 bytes.
+
+The protocol is JSON lines: send one JSON object per line, receive one JSON
+object per request. Any `id` you send is echoed back unchanged.
+
+Search request, all fields except `query` optional:
+
+```json
+{"id": 1, "query": "report ext:pdf", "limit": 50, "offset": 0,
+ "sort": "relevance", "descending": false,
+ "regex": false, "case": false, "whole_word": false, "match_path": false}
+```
+
+`limit` defaults to 100; `-1` returns everything. `sort` is `relevance`
+(default), `path`, `name`, `size`, `dm`, `dc` or `ext`. Relevance puts names
+equal to a search term first, then names starting with it, then names
+containing it at a word boundary, then plain substring matches, with shallower
+paths winning ties; it is also available on the command line as
+`-s relevance`.
+
+Search response:
+
+```json
+{"id": 1, "total": 132, "elapsed_ms": 2.1, "results": [
+  {"path": "/home/me/x/report.pdf", "name": "report.pdf", "type": "file",
+   "size": 1024, "modified": "2024-03-13T10:00:00+01:00",
+   "created": "2024-03-01T08:00:00+01:00"}
+]}
+```
+
+`total` is the number of matches before `offset` and `limit`; `type` is
+`file` or `dir`; `created` is omitted where the platform does not report it.
+
+Sending a new request on a connection cancels the one still running, which
+answers `{"id": 1, "cancelled": true}`. Send a request per keystroke and
+render whichever response arrives with the latest id.
+
+Status request and response:
+
+```json
+{"op": "status"}
+{"files": 1847170, "folders": 330914, "roots": ["/home/me"],
+ "built": "2024-03-13T09:00:00+01:00", "index": "/home/me/.local/share/eind/index.bin"}
+```
+
+Errors come back as `{"id": 1, "error": "size: expected a size such as 10mb, got \"huge!\""}`.
+Connections are independent; open as many as you like.
+
+Try it from a shell:
+
+```sh
+printf '{"query":"readme","limit":3}\n' | nc -U "$XDG_RUNTIME_DIR/eind.sock"
+```
 
 ## Interactive view
 
@@ -132,7 +203,9 @@ To index a whole machine, set `root = /`. The defaults already exclude
 `eind watch` loads the index, subscribes to change notifications for every
 root (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows)
 and saves the updated index every ten seconds while changes accumulate.
-Renames, moves and newly created folders are picked up in full.
+Renames, moves and newly created folders are picked up in full. `eind serve`
+does the same and additionally answers queries over the socket, so run that
+one if anything else on the machine will query eind.
 
 Run it as a user service so it is always on.
 
@@ -143,7 +216,7 @@ macOS, `~/Library/LaunchAgents/eind.watch.plist`:
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>eind.watch</string>
-  <key>ProgramArguments</key><array><string>/usr/local/bin/eind</string><string>watch</string></array>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/eind</string><string>serve</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardErrorPath</key><string>/tmp/eind-watch.log</string>
@@ -161,7 +234,7 @@ Linux, `~/.config/systemd/user/eind-watch.service`:
 Description=eind file index watcher
 
 [Service]
-ExecStart=%h/go/bin/eind watch
+ExecStart=%h/go/bin/eind serve
 Restart=on-failure
 
 [Install]

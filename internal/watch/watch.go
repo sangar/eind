@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/rjeczalik/notify"
@@ -19,8 +20,9 @@ const settleDelay = 250 * time.Millisecond
 
 // Run watches every root of the index and saves it to indexPath whenever
 // changes have accumulated for saveInterval. It returns when ctx is done,
-// after a final save.
-func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath string, saveInterval time.Duration, log io.Writer) error {
+// after a final save. Every mutation of the index happens under mu's write
+// lock, so readers such as the socket server can share the index safely.
+func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath string, saveInterval time.Duration, mu *sync.RWMutex, log io.Writer) error {
 	events := make(chan notify.EventInfo, 4096)
 	for _, root := range ix.Roots {
 		if err := notify.Watch(filepath.Join(root, "..."), events, notify.All); err != nil {
@@ -36,6 +38,8 @@ func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath str
 		if !dirty {
 			return nil
 		}
+		mu.Lock()
+		defer mu.Unlock()
 		before := len(ix.Entries)
 		if err := ix.Save(indexPath); err != nil {
 			return err
@@ -61,11 +65,13 @@ func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath str
 		case ev := <-events:
 			changed := map[string]bool{ev.Path(): true}
 			collectBurst(events, changed)
+			mu.Lock()
 			for p := range changed {
 				if updater.Reconcile(p) {
 					dirty = true
 				}
 			}
+			mu.Unlock()
 		}
 	}
 }

@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 var binary string
@@ -63,8 +65,14 @@ func newFixture(t *testing.T) fixture {
 
 func (fx fixture) run(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	return fx.runWithEnv(t, nil, args...)
+}
+
+func (fx fixture) runWithEnv(t *testing.T, env []string, args ...string) (string, error) {
+	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Env = append(os.Environ(), "EIND_CONFIG="+fx.config, "EIND_INDEX="+fx.index, "NO_COLOR=1")
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -165,5 +173,51 @@ func TestBadInputIsReported(t *testing.T) {
 	out, err = fx.run(t, "--bogus")
 	if err == nil || !strings.Contains(out, "see eind --help") {
 		t.Errorf("expected flag error, got %v\n%s", err, out)
+	}
+}
+
+func TestServeAnswersOverTheSocket(t *testing.T) {
+	fx := newFixture(t)
+	dir, err := os.MkdirTemp("", "eind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "s")
+	cmd := exec.Command(binary, "serve", "--socket", sock)
+	cmd.Env = append(os.Environ(), "EIND_CONFIG="+fx.config, "EIND_INDEX="+fx.index)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cmd.Process.Signal(os.Interrupt); cmd.Wait() }()
+
+	var conn net.Conn
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if conn, err = net.Dial("unix", sock); err == nil {
+			break
+		}
+	}
+	if conn == nil {
+		t.Fatalf("daemon never listened: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte(`{"id":1,"query":"report","limit":5}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		ID      int
+		Total   int
+		Results []struct{ Path, Name string }
+	}
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.ID != 1 || resp.Total != 1 || len(resp.Results) != 1 || resp.Results[0].Name != "report.txt" {
+		t.Errorf("resp = %+v", resp)
+	}
+	out, _ := fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "status")
+	if !strings.Contains(out, "daemon: running at "+sock) {
+		t.Errorf("status should see the daemon:\n%s", out)
 	}
 }
