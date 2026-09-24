@@ -173,3 +173,34 @@ func TestListenReplacesStaleSocketButNotLiveOne(t *testing.T) {
 		t.Error("Running should report the live listener")
 	}
 }
+
+func TestServeShutsDownWhileClientStaysConnected(t *testing.T) {
+	dir, err := os.MkdirTemp("", "eind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	ln, err := Listen(filepath.Join(dir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		New(sampleIndex(), &sync.RWMutex{}, "/idx", os.Stderr).Serve(ctx, ln)
+	}()
+	conn, err := net.Dial("unix", filepath.Join(dir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn, `{"op":"status"}`)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return while a client was still connected")
+	}
+}

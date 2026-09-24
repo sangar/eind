@@ -139,7 +139,8 @@ func Listen(path string) (net.Listener, error) {
 	return ln, nil
 }
 
-// Serve accepts connections until ctx is done, then closes the listener.
+// Serve accepts connections until ctx is done, then closes the listener and
+// every open connection, so shutdown never waits on an idle client.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
@@ -176,6 +177,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	}
 	connCtx, cancelConn := context.WithCancel(ctx)
 	defer cancelConn()
+	go func() {
+		<-connCtx.Done()
+		conn.Close()
+	}()
 	cancelPrevious := func() {}
 	var inflight sync.WaitGroup
 	defer inflight.Wait()
