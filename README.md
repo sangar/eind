@@ -153,8 +153,9 @@ Connections are independent; open as many as you like.
 
 `macos/` holds a small SwiftUI client for the daemon: a search field, a table
 of results with Finder icons, size and modified date, and the index summary in
-the footer. Double-click or Enter opens a result; the context menu reveals it
-in Finder or copies its path. It connects to the same default socket as the
+the footer. Double-click or Enter opens a result, the down arrow moves into
+the list and space shows a Quick Look preview like Finder; the context menu
+reveals a result in Finder or copies its path. It connects to the same default socket as the
 daemon (`EIND_SOCKET` overrides it) and reconnects when `eind serve` starts.
 
 ```sh

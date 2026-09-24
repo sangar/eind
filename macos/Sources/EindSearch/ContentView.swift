@@ -1,10 +1,17 @@
 import AppKit
+import QuickLook
 import SwiftUI
 
 struct ContentView: View {
     @State private var model = SearchModel()
     @State private var selection: SearchResult.ID?
+    @State private var previewURL: URL?
     @FocusState private var searchFieldFocused: Bool
+    @FocusState private var tableFocused: Bool
+
+    private var selectedResult: SearchResult? {
+        model.results.first { $0.id == selection }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,6 +34,7 @@ struct ContentView: View {
                 .focused($searchFieldFocused)
                 .onChange(of: model.query) { model.search() }
                 .onSubmit { openSelectionOrFirstResult() }
+                .onKeyPress(.downArrow) { moveFocusToResults() }
         }
         .padding(12)
     }
@@ -58,9 +66,18 @@ struct ContentView: View {
             }
             .width(min: 120, ideal: 150)
         }
+        .focused($tableFocused)
+        .onKeyPress(.space) { togglePreview() }
+        .quickLookPreview($previewURL, in: model.results.map(\.url))
+        .onChange(of: selection) {
+            if previewURL != nil {
+                previewURL = selectedResult?.url
+            }
+        }
         .contextMenu(forSelectionType: SearchResult.ID.self) { paths in
             if let result = model.results.first(where: { paths.contains($0.id) }) {
                 Button("Open") { model.open(result) }
+                Button("Quick Look") { previewURL = result.url }
                 Button("Reveal in Finder") { model.revealInFinder(result) }
                 Button("Copy Path") { copyToPasteboard(result.path) }
             }
@@ -112,10 +129,24 @@ struct ContentView: View {
     }
 
     private func openSelectionOrFirstResult() {
-        let selected = model.results.first { $0.id == selection } ?? model.results.first
-        if let selected {
-            model.open(selected)
+        if let result = selectedResult ?? model.results.first {
+            model.open(result)
         }
+    }
+
+    private func moveFocusToResults() -> KeyPress.Result {
+        guard let first = model.results.first else { return .ignored }
+        if selectedResult == nil {
+            selection = first.id
+        }
+        tableFocused = true
+        return .handled
+    }
+
+    private func togglePreview() -> KeyPress.Result {
+        guard let result = selectedResult else { return .ignored }
+        previewURL = previewURL == nil ? result.url : nil
+        return .handled
     }
 
     private func copyToPasteboard(_ text: String) {

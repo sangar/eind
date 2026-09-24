@@ -19,6 +19,7 @@ struct SearchResult: Decodable, Identifiable, Hashable {
 
     var id: String { path }
     var isDirectory: Bool { type == "dir" }
+    var url: URL { URL(fileURLWithPath: path) }
     var parentPath: String { (path as NSString).deletingLastPathComponent }
     var modifiedDate: Date? { ISO8601DateFormatter().date(from: modified) }
 }

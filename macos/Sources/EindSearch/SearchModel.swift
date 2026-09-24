@@ -39,11 +39,11 @@ final class SearchModel {
     }
 
     func open(_ result: SearchResult) {
-        NSWorkspace.shared.open(URL(fileURLWithPath: result.path))
+        NSWorkspace.shared.open(result.url)
     }
 
     func revealInFinder(_ result: SearchResult) {
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: result.path)])
+        NSWorkspace.shared.activateFileViewerSelecting([result.url])
     }
 
     private func handle(_ event: EindClient.Event) {
