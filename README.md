@@ -21,6 +21,12 @@ go install .                  # puts eind in $(go env GOPATH)/bin
 Or `make build` and copy `eind` somewhere on your `PATH`. Go 1.26 or newer is
 required; there are no C dependencies, so `CGO_ENABLED=0` builds work too.
 
+Then enable the daemon as a user service, see [Keeping the index
+fresh](#keeping-the-index-fresh). With `eind serve` running, the index stays
+current and every search, from the command line, the interactive view or a
+GUI, is answered from memory in a few milliseconds. Without it each `eind`
+command loads the index from disk first, about 110 ms for two million files.
+
 ## Quick start
 
 ```sh
@@ -83,6 +89,11 @@ Output options: `--json`, `--csv`, `-0` (NUL separated, for `xargs -0`),
 Options may appear anywhere on the line. Use `--` when a search word collides
 with a subcommand name: `eind -- index`.
 
+When `eind serve` is running and serves the same index file, searches are
+answered by it instead of loading the index from disk. Listings of more than
+100,000 results still come from the local index, because they are cheaper to
+produce there than to transfer as JSON.
+
 Run `eind --help` for the full list.
 
 ## Daemon and socket API
@@ -111,10 +122,13 @@ Search request, all fields except `query` optional:
 ```json
 {"id": 1, "query": "report ext:pdf", "limit": 50, "offset": 0,
  "sort": "relevance", "descending": false,
- "regex": false, "case": false, "whole_word": false, "match_path": false}
+ "regex": false, "case": false, "whole_word": false, "match_path": false,
+ "path": "/home/me/Documents", "files": false, "dirs": false}
 ```
 
-`limit` defaults to 100; `-1` returns everything. `sort` is `relevance`
+`limit` defaults to 100; `-1` returns everything and `0` returns only the
+`total`, without sorting. `path` restricts results to one folder and its
+descendants; `files` and `dirs` keep only files or only folders. `sort` is `relevance`
 (default), `path`, `name`, `size`, `dm`, `dc` or `ext`. Relevance puts names
 equal to a search term first, then names starting with it, then names
 containing it at a word boundary, then plain substring matches, with shallower
@@ -268,36 +282,52 @@ systemctl --user enable --now eind-watch
 On Linux, inotify needs one watch per directory. For large trees raise the
 limit: `sudo sysctl fs.inotify.max_user_watches=1048576`.
 
-## Compared with find
+## Compared with find and fd
 
-`find` walks the filesystem and stats every entry on each run, so it costs
-the same whether the query is selective or not. `eind` answers from its
-index. Measured on a MacBook with 2.07 million files and 378,000 folders
-under two roots, warm cache, best of three runs:
+`find` walks the filesystem and stats every entry on each run, so it costs the
+same whether the query is selective or not. `fd` walks too, but in parallel
+and without needless stat calls, and by default it skips hidden and
+gitignored paths. `eind` answers from its index. Measured on a MacBook with
+2.07 million files and 378,000 folders under two roots, warm cache, best of
+several runs, with `eind serve` running as an installation would have it.
+`fd -HI` includes hidden and ignored files so that all three see the same
+tree.
 
-| Query | find | eind (CLI) | eind (daemon) |
-|---|---|---|---|
-| `eind server.go` | 52 s | 112 ms | 5 ms |
-| `eind ext:pdf size:>1mb` | 52 s | 108 ms | 4 ms |
-| `eind ext:go dm:last7days` | 52 s | 120 ms | 4 ms |
-| `eind folder:wfn:node_modules` | 51 s | 108 ms | 2 ms |
-| `eind a` (1.4 million hits) | 52 s | 189 ms | 186 ms |
+| Query | find | fd -HI | fd default | eind |
+|---|---|---|---|---|
+| `eind server.go` | 52 s | 7.5 s | 2.3 s, 2 of 8 hits | 23 ms |
+| `eind ext:pdf size:>1mb` | 52 s | 6.6 s | 5.5 s | 20 ms |
+| `eind ext:go dm:last7days` | 52 s | 7.0 s | 5.9 s | 21 ms |
+| `eind folder:wfn:node_modules` | 51 s | 4.7 s | 2.3 s, 416 of 1,553 hits | 17 ms |
+| `eind --count a` (1.4 million hits) | 52 s | 6.6 s | 5.9 s, 627 k hits | 16 ms |
 
-The CLI spends nearly all of its time loading the 82 MB index; the daemon
-keeps it in memory, so only the search remains. Building the index from
-scratch took 15 s.
+The `eind` column is a whole command line invocation: process start, a
+round trip to the daemon and printing. The search itself takes 2 to 5 ms; the
+daemon spends most of the last query ranking 1.4 million hits when asked for
+a listing rather than a count. Without a daemon each command spends about
+110 ms loading the 82 MB index first. Building the index from scratch took
+15 s.
 
-The price is freshness: `find` is always exact, while `eind` is as current as
-its watcher. In the last query above `eind` counted 86 stale entries out of
-1.4 million, files that had been deleted since the index was last updated.
+The price is freshness: `find` and `fd` are always exact, while `eind` is as
+current as its watcher. In the last query `eind` counted 86 stale entries out
+of 1.4 million, files deleted since the index was last updated.
 
-`find` needs no setup, searches any path, and can act on what it finds with
-`-exec` and `-delete`. `eind` needs an index and a list of roots, and only
-finds; pipe `eind -0` into `xargs -0` to act on results. `find` can filter by
-permissions, owner and symlink type; `eind` cannot. `eind` can filter by
-name length, path depth, extension lists and human date and size ranges,
-rank by relevance, and match case-insensitive substrings by default, where
-`find` needs `-iname '*server.go*'`.
+`fd`'s defaults change the answer, not just the time: they hid 6 of the 8
+`server.go` files and 3 of every 4 `node_modules` folders because those sit
+under hidden or gitignored paths. That is right inside a project and wrong
+for a whole-disk "where did that file go" search. Inside one repository `fd`
+is the better tool: it finishes in tens of milliseconds, respects the ignore
+rules, and needs no index.
+
+`find` and `fd` need no setup, search any path, and can act on what they find
+with `-exec`, `-delete` and `-x`. `eind` needs an index and a list of roots,
+and only finds; pipe `eind -0` into `xargs -0` to act on results. `find`
+filters by permissions and owner, `fd` by owner, symlink and executable type,
+empty files and ignore rules; `eind` does none of that. `eind` combines AND,
+OR, NOT and grouping in one query, takes dates and sizes as words
+(`dm:2024-03`, `size:1mb..5mb`), filters by name length and depth, ranks by
+relevance, and matches case-insensitive substrings by default, where `find`
+needs `-iname '*server.go*'` and `fd` a regex.
 
 ## How it works
 

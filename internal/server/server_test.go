@@ -204,3 +204,15 @@ func TestServeShutsDownWhileClientStaysConnected(t *testing.T) {
 		t.Fatal("Serve did not return while a client was still connected")
 	}
 }
+
+func TestRestrictsToFolderAndKindAndCountsWithZeroLimit(t *testing.T) {
+	conn := startServer(t)
+	resp := roundTrip(t, conn, `{"query":"report","path":"/data/docs","files":true,"limit":0}`)
+	if resp["total"].(float64) != 2 || len(resp["results"].([]any)) != 0 {
+		t.Errorf("want total 2 and no results, got %v", resp)
+	}
+	resp = roundTrip(t, conn, `{"query":"docs","dirs":true}`)
+	if got := names(resp); len(got) != 1 || got[0] != "docs" {
+		t.Errorf("dirs only = %v", got)
+	}
+}

@@ -89,11 +89,13 @@ func main() {
 type globals struct {
 	configPath string
 	indexPath  string
+	socketPath string
 }
 
 func (g *globals) bind(fs *flag.FlagSet) {
 	fs.StringVar(&g.configPath, "config", config.ConfigPath(), "")
 	fs.StringVar(&g.indexPath, "index", config.IndexPath(), "")
+	fs.StringVar(&g.socketPath, "socket", server.DefaultSocketPath(), "")
 }
 
 func run(args []string) error {
@@ -259,13 +261,19 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 	if err != nil {
 		return err
 	}
+	wantTUI := forceTUI || (len(terms) == 0 && stdoutIsTerminal() && !f.count && !f.json && !f.csv)
+	if !wantTUI {
+		if answered, err := searchViaDaemon(g, f, terms); answered {
+			return err
+		}
+	}
 	ix, err := loadOrBuild(g)
 	if err != nil {
 		return err
 	}
 	defaults := query.Defaults{Regex: f.regex, CaseSensitive: f.caseSensitive, WholeWord: f.wholeWord, MatchPath: f.matchPath}
 
-	if forceTUI || (len(terms) == 0 && stdoutIsTerminal() && !f.count && !f.json && !f.csv) {
+	if wantTUI {
 		chosen, err := tui.Run(ix, defaults)
 		if err != nil {
 			return err
@@ -280,7 +288,7 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 	if err != nil {
 		return err
 	}
-	node = applyFilters(node, f)
+	node = query.Restrict(node, f.path, f.filesOnly, f.dirsOnly)
 	hits, err := search.Run(ix, node)
 	if err != nil {
 		return err
@@ -302,6 +310,51 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 	if f.maxResults > 0 && f.maxResults < len(hits) {
 		hits = hits[:f.maxResults]
 	}
+	return output.Write(os.Stdout, ix, hits, outputOptions(f))
+}
+
+// Results travel from the daemon as JSON, which for very large listings costs
+// more than loading the index locally; past this many the caller falls back.
+const daemonResultCap = 100_000
+
+// searchViaDaemon answers from a running eind serve when it serves the same
+// index file this command would otherwise load, which saves loading it.
+func searchViaDaemon(g globals, f searchFlags, terms []string) (answered bool, err error) {
+	client, err := server.Dial(g.socketPath)
+	if err != nil {
+		return false, nil
+	}
+	defer client.Close()
+	status, err := client.Status()
+	if err != nil || status.Index != g.indexPath {
+		return false, nil
+	}
+	limit := daemonResultCap
+	if f.count {
+		limit = 0
+	} else if f.maxResults > 0 {
+		limit = f.maxResults
+	}
+	resp, err := client.Search(server.Request{
+		Query: strings.Join(terms, " "), Limit: &limit, Offset: f.offset,
+		Sort: f.sortKey, Descending: f.descending,
+		Regex: f.regex, Case: f.caseSensitive, WholeWord: f.wholeWord, MatchPath: f.matchPath,
+		Path: f.path, Files: f.filesOnly, Dirs: f.dirsOnly,
+	})
+	if err != nil {
+		return true, err
+	}
+	if f.count {
+		fmt.Println(resp.Total)
+		return true, nil
+	}
+	if f.maxResults == 0 && resp.Total-f.offset > len(resp.Results) {
+		return false, nil
+	}
+	return true, output.WriteRecords(os.Stdout, resp.Results, outputOptions(f))
+}
+
+func outputOptions(f searchFlags) output.Options {
 	opts := output.Options{
 		NullSep: f.null, NameOnly: f.nameOnly,
 		ShowSize: f.showSize, ShowModified: f.showModified, ShowCreated: f.showCreated,
@@ -313,24 +366,7 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 	case f.csv:
 		opts.Format = output.CSV
 	}
-	return output.Write(os.Stdout, ix, hits, opts)
-}
-
-func applyFilters(node query.Node, f searchFlags) query.Node {
-	kids := []query.Node{node}
-	if f.path != "" {
-		kids = append(kids, query.InFolder{Path: f.path})
-	}
-	if f.filesOnly {
-		kids = append(kids, query.IsDir{Dir: false})
-	}
-	if f.dirsOnly {
-		kids = append(kids, query.IsDir{Dir: true})
-	}
-	if len(kids) == 1 {
-		return node
-	}
-	return query.And{Kids: kids}
+	return opts
 }
 
 func useColor(mode string) bool {
@@ -445,7 +481,6 @@ func runDaemon(name string, args []string, serve bool) error {
 	var g globals
 	g.bind(fs)
 	interval := fs.Duration("save-interval", 10*time.Second, "")
-	socketPath := fs.String("socket", server.DefaultSocketPath(), "")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -466,11 +501,11 @@ func runDaemon(name string, args []string, serve bool) error {
 	var mu sync.RWMutex
 
 	if serve {
-		ln, err := server.Listen(*socketPath)
+		ln, err := server.Listen(g.socketPath)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "serving queries at %s\n", *socketPath)
+		fmt.Fprintf(os.Stderr, "serving queries at %s\n", g.socketPath)
 		srv := server.New(ix, &mu, g.indexPath, os.Stderr)
 		serveErr := make(chan error, 1)
 		go func() { serveErr <- srv.Serve(ctx, ln) }()
@@ -478,7 +513,7 @@ func runDaemon(name string, args []string, serve bool) error {
 			if err := <-serveErr; err != nil {
 				fmt.Fprintln(os.Stderr, "eind: server:", err)
 			}
-			os.Remove(*socketPath)
+			os.Remove(g.socketPath)
 		}()
 	}
 	fmt.Fprintln(os.Stderr, watch.ServiceHint())
@@ -497,11 +532,10 @@ func cmdStatus(args []string) error {
 		fmt.Print(" (not present, using defaults)")
 	}
 	fmt.Println()
-	socketPath := server.DefaultSocketPath()
-	if server.Running(socketPath) {
-		fmt.Printf("daemon: running at %s\n", socketPath)
+	if server.Running(g.socketPath) {
+		fmt.Printf("daemon: running at %s\n", g.socketPath)
 	} else {
-		fmt.Printf("daemon: not running (start with `eind serve`, socket %s)\n", socketPath)
+		fmt.Printf("daemon: not running (start with `eind serve`, socket %s)\n", g.socketPath)
 	}
 	fmt.Printf("index:  %s", g.indexPath)
 	st, err := os.Stat(g.indexPath)

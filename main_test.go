@@ -220,4 +220,21 @@ func TestServeAnswersOverTheSocket(t *testing.T) {
 	if !strings.Contains(out, "daemon: running at "+sock) {
 		t.Errorf("status should see the daemon:\n%s", out)
 	}
+
+	// With the index file gone, only the daemon can answer.
+	if err := os.Remove(fx.index); err != nil {
+		t.Fatal(err)
+	}
+	out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "report", "--count")
+	if err != nil || strings.TrimSpace(out) != "1" {
+		t.Errorf("count via daemon = %q, %v", out, err)
+	}
+	out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "--path", fx.root+"/docs", "--files", "--size", "-s", "size", "-d", ".md|.txt")
+	if err != nil || !strings.Contains(out, "notes.md") || !strings.Contains(out, "report.txt") || !strings.Contains(out, "10 B") {
+		t.Errorf("search via daemon = %q, %v", out, err)
+	}
+	out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "size:huge!")
+	if err == nil || !strings.Contains(out, "size:") {
+		t.Errorf("query errors should come back from the daemon: %q, %v", out, err)
+	}
 }

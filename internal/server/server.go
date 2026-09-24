@@ -70,6 +70,9 @@ type Request struct {
 	Case       bool            `json:"case,omitempty"`
 	WholeWord  bool            `json:"whole_word,omitempty"`
 	MatchPath  bool            `json:"match_path,omitempty"`
+	Path       string          `json:"path,omitempty"`  // only results below this folder
+	Files      bool            `json:"files,omitempty"` // only files
+	Dirs       bool            `json:"dirs,omitempty"`  // only folders
 }
 
 type SearchResponse struct {
@@ -239,6 +242,7 @@ func (s *Server) search(ctx context.Context, req Request, send func(any)) {
 		send(ErrorResponse{ID: req.ID, Error: err.Error()})
 		return
 	}
+	node = query.Restrict(node, req.Path, req.Files, req.Dirs)
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -256,6 +260,10 @@ func (s *Server) search(ctx context.Context, req Request, send func(any)) {
 	limit := DefaultLimit
 	if req.Limit != nil {
 		limit = *req.Limit
+	}
+	if limit == 0 {
+		send(SearchResponse{ID: req.ID, Total: total, ElapsedMs: float64(time.Since(start).Microseconds()) / 1000, Results: []output.Record{}})
+		return
 	}
 	if sortKey == search.SortRelevance {
 		keep := -1

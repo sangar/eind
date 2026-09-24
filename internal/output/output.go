@@ -34,15 +34,24 @@ type Options struct {
 const timeLayout = "2006-01-02 15:04"
 
 func Write(w io.Writer, ix *index.Index, hits []uint32, o Options) error {
+	records := make([]Record, 0, len(hits))
+	for _, h := range hits {
+		records = append(records, RecordOf(ix, h))
+	}
+	return WriteRecords(w, records, o)
+}
+
+// WriteRecords prints hits that came from the daemon rather than a local index.
+func WriteRecords(w io.Writer, records []Record, o Options) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 	var err error
 	switch o.Format {
 	case JSON:
-		err = writeJSON(bw, ix, hits)
+		err = writeJSON(bw, records)
 	case CSV:
-		err = writeCSV(bw, ix, hits)
+		err = writeCSV(bw, records)
 	default:
-		err = writePlain(bw, ix, hits, o)
+		err = writePlain(bw, records, o)
 	}
 	if err != nil {
 		return err
@@ -50,33 +59,33 @@ func Write(w io.Writer, ix *index.Index, hits []uint32, o Options) error {
 	return bw.Flush()
 }
 
-func writePlain(w *bufio.Writer, ix *index.Index, hits []uint32, o Options) error {
+func writePlain(w *bufio.Writer, records []Record, o Options) error {
 	terminator := byte('\n')
 	if o.NullSep {
 		terminator = 0
 	}
-	for _, h := range hits {
-		e := &ix.Entries[h]
+	for _, r := range records {
+		isDir := r.Type == "dir"
 		if o.ShowSize {
-			if e.IsDir {
+			if isDir {
 				fmt.Fprintf(w, "%9s  ", "<DIR>")
 			} else {
-				fmt.Fprintf(w, "%9s  ", HumanSize(e.Size))
+				fmt.Fprintf(w, "%9s  ", HumanSize(r.Size))
 			}
 		}
 		if o.ShowModified {
-			w.WriteString(formatTime(e.Modified))
+			w.WriteString(formatTime(r.Modified))
 			w.WriteString("  ")
 		}
 		if o.ShowCreated {
-			w.WriteString(formatTime(e.Created))
+			w.WriteString(formatTime(r.Created))
 			w.WriteString("  ")
 		}
-		text := e.Name
+		text := r.Name
 		if !o.NameOnly {
-			text = ix.Path(h)
+			text = r.Path
 		}
-		if o.Color && e.IsDir {
+		if o.Color && isDir {
 			w.WriteString("\x1b[1;34m")
 			w.WriteString(text)
 			w.WriteString("\x1b[0m")
@@ -90,11 +99,12 @@ func writePlain(w *bufio.Writer, ix *index.Index, hits []uint32, o Options) erro
 	return nil
 }
 
-func formatTime(unix int64) string {
-	if unix == 0 {
+func formatTime(rfc3339 string) string {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
 		return "                "
 	}
-	return time.Unix(unix, 0).Format(timeLayout)
+	return t.Format(timeLayout)
 }
 
 // Record is one search hit in the JSON, CSV and socket protocols.
@@ -125,14 +135,14 @@ func RecordOf(ix *index.Index, h uint32) Record {
 	return r
 }
 
-func writeJSON(w *bufio.Writer, ix *index.Index, hits []uint32) error {
+func writeJSON(w *bufio.Writer, records []Record) error {
 	w.WriteString("[")
-	for i, h := range hits {
+	for i, r := range records {
 		if i > 0 {
 			w.WriteString(",")
 		}
 		w.WriteString("\n  ")
-		buf, err := json.Marshal(RecordOf(ix, h))
+		buf, err := json.Marshal(r)
 		if err != nil {
 			return err
 		}
@@ -140,20 +150,19 @@ func writeJSON(w *bufio.Writer, ix *index.Index, hits []uint32) error {
 			return err
 		}
 	}
-	if len(hits) > 0 {
+	if len(records) > 0 {
 		w.WriteString("\n")
 	}
 	_, err := w.WriteString("]\n")
 	return err
 }
 
-func writeCSV(w *bufio.Writer, ix *index.Index, hits []uint32) error {
+func writeCSV(w *bufio.Writer, records []Record) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write([]string{"path", "name", "type", "size", "modified", "created"}); err != nil {
 		return err
 	}
-	for _, h := range hits {
-		r := RecordOf(ix, h)
+	for _, r := range records {
 		if err := cw.Write([]string{r.Path, r.Name, r.Type, strconv.FormatInt(r.Size, 10), r.Modified, r.Created}); err != nil {
 			return err
 		}
