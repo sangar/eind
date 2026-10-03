@@ -51,11 +51,20 @@ func TestDefaultExcludesFitTheRunningPlatform(t *testing.T) {
 	}
 	foreign := map[string][]string{
 		"darwin": {"/proc", "/sys", "~/.local/share/Trash"},
-		"linux":  {"/Volumes", "~/.Trash", "~/Library/Caches"},
+		"linux":  {"/Volumes", "~/.Trash", "~/Library/Caches", "~/Library/Containers"},
 	}
 	for _, p := range foreign[runtime.GOOS] {
 		if slices.Contains(got, p) {
 			t.Errorf("defaults on %s should not mention %q", runtime.GOOS, p)
+		}
+	}
+	native := map[string][]string{
+		"darwin": {"~/Library/Containers", "~/Library/Group Containers"},
+		"linux":  {"/proc", "~/.local/share/Trash"},
+	}
+	for _, p := range native[runtime.GOOS] {
+		if !slices.Contains(got, p) {
+			t.Errorf("defaults on %s lack %q", runtime.GOOS, p)
 		}
 	}
 	for _, p := range got {

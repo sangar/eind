@@ -36,9 +36,12 @@ func Default() Config {
 
 // DefaultExcludes leaves out what a launcher never wants to offer: dependency
 // trees and version control internals, the platform's cache directory and
-// trash, and its virtual or foreign filesystems. Everything platform specific
-// is derived from the running system, so the list stays valid wherever eind
-// runs and the config file never mentions another operating system's paths.
+// trash, and its virtual or foreign filesystems. On macOS it also leaves out
+// sandboxed app data, because reading ~/Library/Containers and
+// ~/Library/Group Containers makes macOS ask the user to let eind "access data
+// from other apps" on every rebuild. Everything platform specific is derived
+// from the running system, so the list stays valid wherever eind runs and the
+// config file never mentions another operating system's paths.
 func DefaultExcludes() []string {
 	excludes := []string{"node_modules", ".git", ".cache"}
 	if cache, err := os.UserCacheDir(); err == nil && filepath.Base(cache) != ".cache" && runtime.GOOS != "windows" {
@@ -53,7 +56,7 @@ func platformExcludes() []string {
 	case "linux":
 		return []string{"~/.local/share/Trash", "/proc", "/sys", "/dev", "/run"}
 	case "darwin":
-		return []string{"~/.Trash", "/dev", "/System/Volumes", "/Volumes", "/private/var/vm"}
+		return []string{"~/.Trash", "~/Library/Containers", "~/Library/Group Containers", "/dev", "/System/Volumes", "/Volumes", "/private/var/vm"}
 	case "freebsd", "openbsd", "netbsd":
 		return []string{"~/.local/share/Trash", "/proc", "/dev"}
 	case "windows":
