@@ -2,12 +2,14 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -42,7 +44,9 @@ Usage:
   eind service enable|disable   run eind serve at login (launchd agent or systemd user unit)
   eind status                   show where the index and config live, and their size
   eind config [--init]          show the effective config, or write a default file
+  eind config edit              open the config in $VISUAL or $EDITOR, then check it
   eind tui                      open the interactive view
+  eind version                  show the version
 
 Search options:
   -r, --regex          treat terms as regular expressions
@@ -122,6 +126,9 @@ func run(args []string) error {
 			return cmdSearch(flags, nil, true)
 		case "search":
 			return cmdSearch(flags, positional[1:], false)
+		case "version":
+			fmt.Println("eind", version)
+			return nil
 		case "help":
 			printUsage(os.Stdout)
 			return nil
@@ -617,6 +624,12 @@ func cmdConfig(args []string) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
+	switch {
+	case fs.NArg() == 1 && fs.Arg(0) == "edit":
+		return editConfig(g.configPath)
+	case fs.NArg() > 0:
+		return fmt.Errorf("unknown config action %q (want edit)", fs.Arg(0))
+	}
 	if *initialize {
 		created, err := config.WriteDefault(g.configPath)
 		if err != nil {
@@ -635,6 +648,34 @@ func cmdConfig(args []string) error {
 	}
 	fmt.Printf("# %s\n", g.configPath)
 	fmt.Print(config.Render(cfg))
+	return nil
+}
+
+// editConfig opens the config in the user's editor, creating it first if
+// needed, then checks that it still loads.
+func editConfig(path string) error {
+	if _, err := config.WriteDefault(path); err != nil {
+		return err
+	}
+	if err := runEditor(path); err != nil {
+		return err
+	}
+	if _, err := config.Load(path); err != nil {
+		return fmt.Errorf("%w\nrun `eind config edit` again to fix it", err)
+	}
+	fmt.Println("config is valid; run `eind index` to apply it")
+	return nil
+}
+
+// runEditor runs $VISUAL or $EDITOR through the shell, so values with
+// arguments such as "code --wait" work.
+func runEditor(path string) error {
+	editor := cmp.Or(os.Getenv("VISUAL"), os.Getenv("EDITOR"), "vi")
+	cmd := exec.Command("sh", "-c", editor+` "$1"`, "sh", path)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("editor %q: %w", editor, err)
+	}
 	return nil
 }
 

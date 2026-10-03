@@ -164,6 +164,28 @@ func TestStatusAndConfig(t *testing.T) {
 	}
 }
 
+func TestVersionCommandMatchesFlag(t *testing.T) {
+	fx := newFixture(t)
+	cmd, err := fx.run(t, "version")
+	if err != nil || !strings.HasPrefix(cmd, "eind ") {
+		t.Fatalf("version: %v\n%s", err, cmd)
+	}
+	if flag, _ := fx.run(t, "--version"); flag != cmd {
+		t.Errorf("--version = %q, version = %q", flag, cmd)
+	}
+}
+
+func TestConfigEditChecksTheResult(t *testing.T) {
+	fx := newFixture(t)
+	if out, err := fx.runWithEnv(t, []string{"VISUAL=", "EDITOR=true"}, "config", "edit"); err != nil || !strings.Contains(out, "config is valid") {
+		t.Errorf("unchanged config: %v\n%s", err, out)
+	}
+	appendBadKey := `EDITOR=sh -c 'echo bogus = 1 >> "$0"'`
+	if out, err := fx.runWithEnv(t, []string{"VISUAL=", appendBadKey}, "config", "edit"); err == nil || !strings.Contains(out, "unknown key") {
+		t.Errorf("broken config: %v\n%s", err, out)
+	}
+}
+
 func TestBadInputIsReported(t *testing.T) {
 	fx := newFixture(t)
 	out, err := fx.run(t, "size:huge!")
