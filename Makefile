@@ -5,11 +5,11 @@ GORELEASER = go run github.com/goreleaser/goreleaser/v2@latest
 .PHONY: build test snapshot release clean
 
 build:
-	go build -ldflags '$(LDFLAGS)' -o eind .
+	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o eind .
 
 test:
 	go vet ./...
-	go test ./...
+	go test -race ./...
 
 snapshot:
 	$(GORELEASER) release --snapshot --clean
