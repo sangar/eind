@@ -419,12 +419,11 @@ func RunContext(cancel context.Context, ix *index.Index, n query.Node) ([]uint32
 	if chunk < 4096 {
 		chunk = 4096
 	}
-	var parts [][]uint32
+	parts := make([][]uint32, (total+chunk-1)/chunk)
 	var wg sync.WaitGroup
 	for lo := 0; lo < total; lo += chunk {
 		hi := min(lo+chunk, total)
-		parts = append(parts, nil)
-		slot := len(parts) - 1
+		slot := lo / chunk
 		wg.Add(1)
 		go func(lo, hi, slot int) {
 			defer wg.Done()
