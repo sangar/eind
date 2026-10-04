@@ -90,9 +90,17 @@ func main() {
 			os.Exit(0)
 		}
 		fmt.Fprintln(os.Stderr, "eind:", err)
+		if errors.As(err, new(usageError)) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
+
+// usageError marks a mistake on the command line, which exits with status 2.
+type usageError struct{ error }
+
+func usagef(format string, a ...any) error { return usageError{fmt.Errorf(format, a...)} }
 
 type globals struct {
 	configPath string
@@ -196,7 +204,7 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 		os.Exit(0)
 	}
 	if err != nil {
-		return fmt.Errorf("%w (see eind --help)", err)
+		return usagef("%w (see eind --help)", err)
 	}
 	return nil
 }
@@ -535,7 +543,7 @@ func runDaemon(name string, args []string, serve bool) error {
 
 func cmdService(args []string) error {
 	if len(args) != 1 || (args[0] != "enable" && args[0] != "disable") {
-		return errors.New("usage: eind service enable|disable")
+		return usagef("usage: eind service enable|disable")
 	}
 	if args[0] == "disable" {
 		path, err := service.Disable()
@@ -628,7 +636,7 @@ func cmdConfig(args []string) error {
 	case fs.NArg() == 1 && fs.Arg(0) == "edit":
 		return editConfig(g.configPath)
 	case fs.NArg() > 0:
-		return fmt.Errorf("unknown config action %q (want edit)", fs.Arg(0))
+		return usagef("unknown config action %q (want edit)", fs.Arg(0))
 	}
 	if *initialize {
 		created, err := config.WriteDefault(g.configPath)
