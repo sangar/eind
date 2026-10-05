@@ -509,6 +509,9 @@ func runDaemon(name string, args []string, serve bool) error {
 	if err != nil {
 		return err
 	}
+	if err := watch.Supported(); err != nil {
+		return err
+	}
 	ex, err := index.NewExcludes(cfg.Excludes)
 	if err != nil {
 		return err
@@ -532,6 +535,7 @@ func runDaemon(name string, args []string, serve bool) error {
 		serveErr := make(chan error, 1)
 		go func() { serveErr <- srv.Serve(ctx, ln) }()
 		defer func() {
+			stop()
 			if err := <-serveErr; err != nil {
 				fmt.Fprintln(os.Stderr, "eind: server:", err)
 			}

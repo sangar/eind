@@ -23,7 +23,8 @@ brew install OWNER/tap/eind
 eind service enable
 ```
 
-From source, with Go 1.26 or newer:
+From source, with Go 1.26 or newer (on macOS also the Xcode Command Line
+Tools, as the watcher uses FSEvents through cgo):
 
 ```sh
 go install .

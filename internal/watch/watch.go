@@ -25,6 +25,9 @@ const settleDelay = 250 * time.Millisecond
 // index happens under mu's write lock, so readers such as the socket server
 // can share the index safely.
 func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath string, saveInterval time.Duration, mu *sync.RWMutex, log io.Writer) error {
+	if errUnsupported != nil {
+		return errUnsupported
+	}
 	events := make(chan notify.EventInfo, 4096)
 	for _, root := range ix.Roots {
 		if err := notify.Watch(filepath.Join(root, "..."), events, notify.All); err != nil {
@@ -116,6 +119,9 @@ func collectBurst(events <-chan notify.EventInfo, changed map[string]bool) {
 		}
 	}
 }
+
+// Supported reports why this build cannot watch the filesystem, if it cannot.
+func Supported() error { return errUnsupported }
 
 // ServiceHint explains how to keep `eind watch` running in the background.
 func ServiceHint() string {

@@ -2,8 +2,17 @@ version: 2
 project_name: eind
 
 builds:
-  - env: [CGO_ENABLED=0]
-    goos: [darwin, linux, freebsd, windows]
+  # The watcher needs cgo on macOS: without it, notify falls back to kqueue,
+  # which opens every file below the roots and never finishes. Apple's clang
+  # builds both architectures, so release from a Mac.
+  - id: darwin
+    env: [CGO_ENABLED=1]
+    goos: [darwin]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w -X main.version={{ .Version }}"]
+  - id: others
+    env: [CGO_ENABLED=0]
+    goos: [linux, freebsd, windows]
     goarch: [amd64, arm64]
     ignore:
       - goos: freebsd

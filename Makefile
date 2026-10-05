@@ -5,8 +5,11 @@ STATICCHECK = go run honnef.co/go/tools/cmd/staticcheck@latest
 
 .PHONY: build test snapshot release clean
 
+# The watcher needs cgo for FSEvents on macOS; elsewhere the binary is static.
+CGO = $(if $(filter Darwin,$(shell uname -s)),1,0)
+
 build:
-	CGO_ENABLED=0 go build -ldflags '$(LDFLAGS)' -o eind .
+	CGO_ENABLED=$(CGO) go build -ldflags '$(LDFLAGS)' -o eind .
 
 test:
 	go vet ./...
