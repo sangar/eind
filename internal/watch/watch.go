@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +41,7 @@ func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath str
 		return err
 	}
 
+	roots := resolveRoots(ix.Roots)
 	updater := update.New(ix, ex)
 	compact := func(force bool) error {
 		mu.Lock()
@@ -82,8 +84,8 @@ func Run(ctx context.Context, ix *index.Index, ex *index.Excludes, indexPath str
 				return err
 			}
 		case ev := <-events:
-			changed := map[string]bool{ev.Path(): true}
-			collectBurst(events, changed)
+			changed := map[string]bool{roots.indexPath(ev.Path()): true}
+			collectBurst(events, roots, changed)
 			mu.Lock()
 			for p := range changed {
 				updater.Reconcile(p)
@@ -106,18 +108,44 @@ func compactAfter(ix *index.Index) int {
 
 // collectBurst drains events that arrive close together so that a path touched
 // many times in a row is re-examined once.
-func collectBurst(events <-chan notify.EventInfo, changed map[string]bool) {
+func collectBurst(events <-chan notify.EventInfo, roots rootPaths, changed map[string]bool) {
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
 		case ev := <-events:
-			changed[ev.Path()] = true
+			changed[roots.indexPath(ev.Path())] = true
 		case <-time.After(settleDelay):
 			return
 		case <-deadline:
 			return
 		}
 	}
+}
+
+// rootPaths pairs each root with its path after resolving symlinks, which is
+// how FSEvents reports changes: below a root of /var/data, a change arrives
+// as /private/var/data/x.
+type rootPaths []struct{ resolved, root string }
+
+func resolveRoots(roots []string) rootPaths {
+	var out rootPaths
+	for _, root := range roots {
+		root = strings.TrimSuffix(root, string(filepath.Separator))
+		if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
+			out = append(out, struct{ resolved, root string }{resolved, root})
+		}
+	}
+	return out
+}
+
+// indexPath turns a reported path into the path the index knows it by.
+func (r rootPaths) indexPath(path string) string {
+	for _, p := range r {
+		if rest, ok := strings.CutPrefix(path, p.resolved); ok && (rest == "" || rest[0] == filepath.Separator) {
+			return p.root + rest
+		}
+	}
+	return path
 }
 
 // Supported reports why this build cannot watch the filesystem, if it cannot.
