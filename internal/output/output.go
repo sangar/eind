@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"iter"
-	"slices"
 	"strconv"
 	"time"
 
@@ -45,11 +44,6 @@ func Write(w io.Writer, ix *index.Index, hits []uint32, o Options) error {
 			}
 		}
 	}, o)
-}
-
-// WriteRecords prints hits that came from the daemon rather than a local index.
-func WriteRecords(w io.Writer, records []Record, o Options) error {
-	return write(w, slices.Values(records), o)
 }
 
 func write(w io.Writer, records iter.Seq[Record], o Options) error {

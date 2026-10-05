@@ -283,11 +283,6 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 		return err
 	}
 	wantTUI := forceTUI || (len(terms) == 0 && stdoutIsTerminal() && !f.count && !f.json && !f.csv)
-	if !wantTUI {
-		if answered, err := searchViaDaemon(g, f, terms); answered {
-			return err
-		}
-	}
 	ix, err := loadOrBuild(g)
 	if err != nil {
 		return err
@@ -332,47 +327,6 @@ func cmdSearch(flagArgs, terms []string, forceTUI bool) error {
 		hits = hits[:f.maxResults]
 	}
 	return output.Write(os.Stdout, ix, hits, outputOptions(f))
-}
-
-// Results travel from the daemon as JSON, which for very large listings costs
-// more than loading the index locally; past this many the caller falls back.
-const daemonResultCap = 100_000
-
-// searchViaDaemon answers from a running eind serve when it serves the same
-// index file this command would otherwise load, which saves loading it.
-func searchViaDaemon(g globals, f searchFlags, terms []string) (answered bool, err error) {
-	client, err := server.Dial(g.socketPath)
-	if err != nil {
-		return false, nil
-	}
-	defer client.Close()
-	status, err := client.Status()
-	if err != nil || status.Index != g.indexPath {
-		return false, nil
-	}
-	limit := daemonResultCap
-	if f.count {
-		limit = 0
-	} else if f.maxResults > 0 {
-		limit = f.maxResults
-	}
-	resp, err := client.Search(server.Request{
-		Query: strings.Join(terms, " "), Limit: &limit, Offset: f.offset,
-		Sort: f.sortKey, Descending: f.descending,
-		Regex: f.regex, Case: f.caseSensitive, WholeWord: f.wholeWord, MatchPath: f.matchPath,
-		Path: f.path, Files: f.filesOnly, Dirs: f.dirsOnly,
-	})
-	if err != nil {
-		return true, err
-	}
-	if f.count {
-		fmt.Println(resp.Total)
-		return true, nil
-	}
-	if f.maxResults == 0 && resp.Total-f.offset > len(resp.Results) {
-		return false, nil
-	}
-	return true, output.WriteRecords(os.Stdout, resp.Results, outputOptions(f))
 }
 
 func outputOptions(f searchFlags) output.Options {

@@ -198,7 +198,7 @@ func TestBadInputIsReported(t *testing.T) {
 	}
 }
 
-func TestServeAnswersOverTheSocket(t *testing.T) {
+func TestServeAnswersAndJournalsChanges(t *testing.T) {
 	fx := newFixture(t)
 	dir, err := os.MkdirTemp("", "eind")
 	if err != nil {
@@ -243,21 +243,19 @@ func TestServeAnswersOverTheSocket(t *testing.T) {
 		t.Errorf("status should see the daemon:\n%s", out)
 	}
 
-	// With the index file gone, only the daemon can answer.
-	if err := os.Remove(fx.index); err != nil {
+	// Commands search the index file themselves and see the daemon's
+	// changes through its journal.
+	if err := os.WriteFile(filepath.Join(fx.root, "fresh-report.md"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "report", "--count")
-	if err != nil || strings.TrimSpace(out) != "1" {
-		t.Errorf("count via daemon = %q, %v", out, err)
-	}
-	out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "--path", fx.root+"/docs", "--files", "--size", "-s", "size", "-d", ".md|.txt")
-	if err != nil || !strings.Contains(out, "notes.md") || !strings.Contains(out, "report.txt") || !strings.Contains(out, "10 B") {
-		t.Errorf("search via daemon = %q, %v", out, err)
-	}
-	out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "size:huge!")
-	if err == nil || !strings.Contains(out, "size:") {
-		t.Errorf("query errors should come back from the daemon: %q, %v", out, err)
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		out, err = fx.runWithEnv(t, []string{"EIND_SOCKET=" + sock}, "fresh-report", "--count")
+		if err == nil && strings.TrimSpace(out) == "1" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("new file never showed up: %q, %v", out, err)
+		}
 	}
 }
 
