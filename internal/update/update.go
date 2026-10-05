@@ -7,18 +7,28 @@ package update
 
 import (
 	"errors"
+	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"eind/internal/index"
 )
 
+// Updater finds entries by path by walking down from a root through each
+// directory's children. Those are listed in two flat arrays rather than maps,
+// which for a million entries keeps the lookup tables near 10 MB with
+// nothing for the garbage collector to scan.
 type Updater struct {
-	ix       *index.Index
-	ex       *index.Excludes
-	dirs     map[string]uint32   // directory path -> entry
-	children map[uint32][]uint32 // directory entry -> child entries
+	ix *index.Index
+	ex *index.Excludes
+	// The children of entry i are kids[first[i]:first[i+1]], for the
+	// entries that existed at the last Rebuild; later ones are in added.
+	first []uint32
+	kids  []uint32
+	added map[uint32][]uint32
+	roots []uint32
 }
 
 func New(ix *index.Index, ex *index.Excludes) *Updater {
@@ -27,23 +37,55 @@ func New(ix *index.Index, ex *index.Excludes) *Updater {
 	return u
 }
 
-// Rebuild recreates the lookup tables; required after the index is compacted.
+// Rebuild recreates the lookup tables; required after the index is saved
+// or reloaded, which renumbers entries.
 func (u *Updater) Rebuild() {
-	u.dirs = make(map[string]uint32)
-	u.children = make(map[uint32][]uint32)
-	u.absorb(0, uint32(u.ix.Count()))
+	n := u.ix.Count()
+	u.first = make([]uint32, n+1)
+	for i := range uint32(n) {
+		if p := u.ix.Parent(i); p != index.NoParent {
+			u.first[p+1]++
+		}
+	}
+	for k := 1; k <= n; k++ {
+		u.first[k] += u.first[k-1]
+	}
+	u.kids = make([]uint32, u.first[n])
+	u.roots = nil
+	fill := slices.Clone(u.first[:n])
+	for i := range uint32(n) {
+		if p := u.ix.Parent(i); p != index.NoParent {
+			u.kids[fill[p]] = i
+			fill[p]++
+		} else if u.ix.Live(i) {
+			u.roots = append(u.roots, i)
+		}
+	}
+	u.added = make(map[uint32][]uint32)
 }
 
 func (u *Updater) absorb(start, end uint32) {
 	for i := start; i < end; i++ {
-		if !u.ix.Live(i) {
-			continue
-		}
 		if p := u.ix.Parent(i); p != index.NoParent {
-			u.children[p] = append(u.children[p], i)
+			u.added[p] = append(u.added[p], i)
 		}
-		if u.ix.IsDir(i) {
-			u.dirs[u.ix.Path(i)] = i
+	}
+}
+
+// children lists the entries directly below i, removed ones included.
+func (u *Updater) children(i uint32) iter.Seq[uint32] {
+	return func(yield func(uint32) bool) {
+		if int(i)+1 < len(u.first) {
+			for _, c := range u.kids[u.first[i]:u.first[i+1]] {
+				if !yield(c) {
+					return
+				}
+			}
+		}
+		for _, c := range u.added[i] {
+			if !yield(c) {
+				return
+			}
 		}
 	}
 }
@@ -78,20 +120,33 @@ func (u *Updater) underRoot(path string) bool {
 	return false
 }
 
+// lookup finds the live entry at path by walking down from its root.
 func (u *Updater) lookup(path string) (uint32, bool) {
-	if i, ok := u.dirs[path]; ok {
-		return i, true
+	sep := string(os.PathSeparator)
+	for _, root := range u.roots {
+		name := u.ix.Name(root)
+		prefix := strings.TrimSuffix(name, sep)
+		if path == name || path == prefix {
+			return root, true
+		}
+		rest, ok := strings.CutPrefix(path, prefix+sep)
+		if !ok {
+			continue
+		}
+		cur := root
+		for comp := range strings.SplitSeq(rest, sep) {
+			if cur, ok = u.findChild(cur, comp); !ok {
+				return 0, false
+			}
+		}
+		return cur, true
 	}
-	parent, ok := u.dirs[filepath.Dir(path)]
-	if !ok {
-		return 0, false
-	}
-	return u.findChild(parent, filepath.Base(path))
+	return 0, false
 }
 
 func (u *Updater) findChild(parent uint32, name string) (uint32, bool) {
-	for _, c := range u.children[parent] {
-		if u.ix.Name(c) == name {
+	for c := range u.children(parent) {
+		if u.ix.Live(c) && u.ix.Name(c) == name {
 			return c, true
 		}
 	}
@@ -106,8 +161,8 @@ func (u *Updater) upsert(path string, info os.FileInfo) bool {
 		u.remove(i)
 	}
 	parentPath := filepath.Dir(path)
-	parent, ok := u.dirs[parentPath]
-	if !ok {
+	parent, ok := u.lookup(parentPath)
+	if !ok || !u.ix.IsDir(parent) {
 		// The parent is not indexed yet (events arrive out of order);
 		// reconciling it scans this path along with the rest of the subtree.
 		return u.Reconcile(parentPath)
@@ -143,33 +198,18 @@ func (u *Updater) removePath(path string) bool {
 	return true
 }
 
-// remove tombstones an entry and all its descendants and forgets them in the
-// lookup tables.
+// remove marks an entry and all its live descendants as removed.
 func (u *Updater) remove(i uint32) {
-	parent := u.ix.Parent(i)
-	if kids, ok := u.children[parent]; ok {
-		for k, c := range kids {
-			if c == i {
-				u.children[parent] = append(kids[:k], kids[k+1:]...)
-				break
-			}
-		}
-	}
-	// Paths of descendants need their ancestors' names, so tombstone only
-	// after the whole subtree has been collected.
-	var subtree []uint32
 	stack := []uint32{i}
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		subtree = append(subtree, cur)
-		if u.ix.IsDir(cur) {
-			delete(u.dirs, u.ix.Path(cur))
-			stack = append(stack, u.children[cur]...)
-			delete(u.children, cur)
+		if !u.ix.Live(cur) {
+			continue
 		}
-	}
-	for _, cur := range subtree {
 		u.ix.Remove(cur)
+		if u.ix.IsDir(cur) {
+			stack = slices.AppendSeq(stack, u.children(cur))
+		}
 	}
 }
