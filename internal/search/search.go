@@ -122,22 +122,22 @@ func simpleGlob(pattern string) (globKind, string) {
 	}
 }
 
+// match is used for path terms only; name terms are compiled to a nameM.
 func (m textM) match(c *ctx) bool {
-	var hay string
-	switch {
-	case m.re != nil && m.path:
-		hay = c.Path()
-	case m.re != nil:
-		hay = c.ix.Entries[c.i].Name
-	case m.path && m.cased:
-		hay = c.Path()
-	case m.path:
-		hay = c.PathLower()
-	case m.cased:
-		hay = c.ix.Entries[c.i].Name
-	default:
-		hay = c.ix.Lower[c.i]
+	if m.re != nil || m.cased {
+		return m.matchHay(c.Path())
 	}
+	return m.matchHay(c.PathLower())
+}
+
+func (m textM) matchName(name, lower string) bool {
+	if m.re != nil || m.cased {
+		return m.matchHay(name)
+	}
+	return m.matchHay(lower)
+}
+
+func (m textM) matchHay(hay string) bool {
 	if m.re != nil {
 		return m.re.MatchString(hay)
 	}
@@ -196,16 +196,104 @@ func boundaryAfter(s string, i int) bool {
 // Underscores separate words so that ww:main finds main_test.go.
 func isWordRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
 
-type extM struct{ exts []string }
+// nameM is a test that depends on nothing but an entry's name. It runs once
+// per distinct name before the scan, so that the scan looks up one bit per
+// entry instead of matching a million names, most of which repeat.
+type nameM struct {
+	test func(name, lower string) bool
+	bits []uint64 // over the index's distinct names, filled by prepare
+	scan nameScan
+}
 
-func (m extM) match(c *ctx) bool {
-	ext := c.ix.Ext(c.i)
-	for _, e := range m.exts {
-		if e == ext {
-			return true
+// nameScan narrows the names to test to those containing a needle, which the
+// index finds by scanning all names at once.
+type nameScan struct {
+	needle string // "" when the test has no such needle
+	fold   bool   // the needle is lowercase ASCII, matched ignoring ASCII case
+	exact  bool   // containing the needle passes the test, no need to run it
+}
+
+func (m *nameM) match(c *ctx) bool {
+	if id, ok := c.ix.NameID(c.i); ok {
+		return m.bits[id/64]&(1<<(id%64)) != 0
+	}
+	name := c.ix.Name(c.i)
+	return m.test(name, index.Lower(name))
+}
+
+// prepare tests every distinct name, or only the candidates of its scan.
+func (m *nameM) prepare(ix *index.Index) {
+	n := ix.DistinctNames()
+	m.bits = make([]uint64, (n+63)/64)
+	if m.scan.needle != "" {
+		m.prepareScan(ix)
+		return
+	}
+	words := len(m.bits)
+	workers := runtime.GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	for w := range workers {
+		lo, hi := words*w/workers, words*(w+1)/workers
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var scratch []byte
+			for id := lo * 64; id < min(hi*64, n); id++ {
+				name := ix.DistinctName(uint32(id))
+				if m.test(name, index.LowerInto(&scratch, name)) {
+					m.bits[id/64] |= 1 << (id % 64)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (m *nameM) prepareScan(ix *index.Index) {
+	contains, others := ix.NameCandidates(m.scan.needle, m.scan.fold)
+	if !m.scan.exact {
+		others = append(others, contains...)
+		contains = nil
+	}
+	for _, id := range contains {
+		m.bits[id/64] |= 1 << (id % 64)
+	}
+	for _, id := range others {
+		name := ix.DistinctName(id)
+		if m.test(name, index.Lower(name)) {
+			m.bits[id/64] |= 1 << (id % 64)
 		}
 	}
-	return false
+}
+
+// scanFor describes the needle a text test requires, if any.
+func (m textM) scanFor() nameScan {
+	if m.re != nil || m.needle == "" || !m.cased && !isASCII(m.needle) {
+		return nameScan{}
+	}
+	plain := m.glob == globContains || m.glob == notSimpleGlob && m.mode == query.Substring
+	return nameScan{needle: m.needle, fold: !m.cased, exact: plain}
+}
+
+func isASCII(s string) bool {
+	for k := 0; k < len(s); k++ {
+		if s[k] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+func extTest(exts []string) func(name, lower string) bool {
+	return func(_, lower string) bool {
+		ext := index.Ext(lower)
+		for _, e := range exts {
+			if e == ext {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 type fieldM struct {
@@ -217,16 +305,16 @@ func (m fieldM) match(c *ctx) bool { return m.r.Contains(m.value(c)) }
 
 type isDirM struct{ dir bool }
 
-func (m isDirM) match(c *ctx) bool { return c.ix.Entries[c.i].IsDir == m.dir }
+func (m isDirM) match(c *ctx) bool { return c.ix.IsDir(c.i) == m.dir }
 
 type parentM struct{ dir uint32 }
 
-func (m parentM) match(c *ctx) bool { return c.ix.Entries[c.i].Parent == m.dir }
+func (m parentM) match(c *ctx) bool { return c.ix.Parent(c.i) == m.dir }
 
 type inFolderM struct{ dir uint32 }
 
 func (m inFolderM) match(c *ctx) bool {
-	for p := c.ix.Entries[c.i].Parent; p != index.NoParent; p = c.ix.Entries[p].Parent {
+	for p := c.ix.Parent(c.i); p != index.NoParent; p = c.ix.Parent(p) {
 		if p == m.dir {
 			return true
 		}
@@ -234,32 +322,55 @@ func (m inFolderM) match(c *ctx) bool {
 	return false
 }
 
-func compile(ix *index.Index, n query.Node) (matcher, error) {
+// compiler collects the name tests of a query so they can be prepared
+// before the scan.
+type compiler struct {
+	ix    *index.Index
+	names []*nameM
+}
+
+func (cp *compiler) nameTest(test func(name, lower string) bool, scan nameScan) matcher {
+	m := &nameM{test: test, scan: scan}
+	cp.names = append(cp.names, m)
+	return m
+}
+
+func (cp *compiler) compile(n query.Node) (matcher, error) {
+	ix := cp.ix
 	switch n := n.(type) {
 	case query.And:
 		if len(n.Kids) == 0 {
 			return allM{}, nil
 		}
-		kids, err := compileAll(ix, n.Kids)
+		kids, err := cp.compileAll(n.Kids)
 		return andM{kids}, err
 	case query.Or:
-		kids, err := compileAll(ix, n.Kids)
+		kids, err := cp.compileAll(n.Kids)
 		return orM{kids}, err
 	case query.Not:
-		kid, err := compile(ix, n.Kid)
+		kid, err := cp.compile(n.Kid)
 		return notM{kid}, err
 	case query.Text:
-		return compileText(n)
+		m, err := compileText(n)
+		if err != nil || n.Path {
+			return m, err
+		}
+		return cp.nameTest(m.matchName, m.scanFor()), nil
 	case query.Ext:
-		return extM{n.Exts}, nil
+		var scan nameScan
+		if len(n.Exts) == 1 && n.Exts[0] != "" && isASCII(n.Exts[0]) {
+			scan = nameScan{needle: "." + n.Exts[0], fold: true}
+		}
+		return cp.nameTest(extTest(n.Exts), scan), nil
 	case query.Size:
-		return fieldM{n.Range, func(c *ctx) int64 { return c.ix.Entries[c.i].Size }}, nil
+		return fieldM{n.Range, func(c *ctx) int64 { return c.ix.Size(c.i) }}, nil
 	case query.Modified:
-		return fieldM{n.Range, func(c *ctx) int64 { return c.ix.Entries[c.i].Modified }}, nil
+		return fieldM{n.Range, func(c *ctx) int64 { return c.ix.Modified(c.i) }}, nil
 	case query.Created:
-		return fieldM{n.Range, func(c *ctx) int64 { return c.ix.Entries[c.i].Created }}, nil
+		return fieldM{n.Range, func(c *ctx) int64 { return c.ix.Created(c.i) }}, nil
 	case query.NameLen:
-		return fieldM{n.Range, func(c *ctx) int64 { return int64(utf8.RuneCountInString(c.ix.Entries[c.i].Name)) }}, nil
+		r := n.Range
+		return cp.nameTest(func(name, _ string) bool { return r.Contains(int64(utf8.RuneCountInString(name))) }, nameScan{}), nil
 	case query.Depth:
 		return fieldM{n.Range, func(c *ctx) int64 { return int64(depthOf(c.Path())) }}, nil
 	case query.IsDir:
@@ -280,10 +391,10 @@ func compile(ix *index.Index, n query.Node) (matcher, error) {
 	return nil, fmt.Errorf("unsupported query node %T", n)
 }
 
-func compileAll(ix *index.Index, nodes []query.Node) ([]matcher, error) {
+func (cp *compiler) compileAll(nodes []query.Node) ([]matcher, error) {
 	kids := make([]matcher, 0, len(nodes))
 	for _, k := range nodes {
-		m, err := compile(ix, k)
+		m, err := cp.compile(k)
 		if err != nil {
 			return nil, err
 		}
@@ -292,7 +403,7 @@ func compileAll(ix *index.Index, nodes []query.Node) ([]matcher, error) {
 	return kids, nil
 }
 
-func compileText(t query.Text) (matcher, error) {
+func compileText(t query.Text) (textM, error) {
 	m := textM{mode: t.Mode, path: t.Path, cased: t.CaseSensitive}
 	if t.Mode == query.Wildcard {
 		if kind, needle := simpleGlob(t.Text); kind != notSimpleGlob {
@@ -314,7 +425,7 @@ func compileText(t query.Text) (matcher, error) {
 		}
 		re, err := regexp.Compile(pattern)
 		if err != nil {
-			return nil, fmt.Errorf("invalid regex %q: %w", t.Text, err)
+			return textM{}, fmt.Errorf("invalid regex %q: %w", t.Text, err)
 		}
 		m.re = re
 	default:
@@ -367,19 +478,18 @@ func ResolveDir(ix *index.Index, path string) (uint32, bool) {
 	}
 	target := strings.ToLower(filepath.Clean(abs))
 	sep := string(os.PathSeparator)
-	for i := range ix.Entries {
-		e := &ix.Entries[i]
-		if e.Parent != index.NoParent || !e.IsDir {
+	for i := range uint32(ix.Count()) {
+		if ix.Parent(i) != index.NoParent || !ix.IsDir(i) || !ix.Live(i) {
 			continue
 		}
-		root := strings.TrimSuffix(strings.ToLower(e.Name), sep)
+		root := strings.TrimSuffix(index.Lower(ix.Name(i)), sep)
 		if target == root || (root == "" && target == "") {
-			return uint32(i), true
+			return i, true
 		}
 		if !strings.HasPrefix(target, root+sep) {
 			continue
 		}
-		cur := uint32(i)
+		cur := i
 		for _, comp := range strings.Split(target[len(root)+1:], sep) {
 			next, ok := findChildDir(ix, cur, comp)
 			if !ok {
@@ -393,10 +503,9 @@ func ResolveDir(ix *index.Index, path string) (uint32, bool) {
 }
 
 func findChildDir(ix *index.Index, parent uint32, lowerName string) (uint32, bool) {
-	for i := range ix.Entries {
-		e := &ix.Entries[i]
-		if e.Parent == parent && e.IsDir && ix.Lower[i] == lowerName {
-			return uint32(i), true
+	for i := range uint32(ix.Count()) {
+		if ix.Parent(i) == parent && ix.IsDir(i) && ix.Live(i) && index.Lower(ix.Name(i)) == lowerName {
+			return i, true
 		}
 	}
 	return 0, false
@@ -409,11 +518,15 @@ func Run(ix *index.Index, n query.Node) ([]uint32, error) {
 
 // RunContext is Run with cancellation; it returns ctx.Err() once cancelled.
 func RunContext(cancel context.Context, ix *index.Index, n query.Node) ([]uint32, error) {
-	m, err := compile(ix, n)
+	cp := &compiler{ix: ix}
+	m, err := cp.compile(n)
 	if err != nil {
 		return nil, err
 	}
-	total := len(ix.Entries)
+	for _, nm := range cp.names {
+		nm.prepare(ix)
+	}
+	total := ix.Count()
 	workers := runtime.GOMAXPROCS(0)
 	chunk := (total + workers - 1) / workers
 	if chunk < 4096 {

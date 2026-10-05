@@ -24,7 +24,7 @@ func TestRankPrefersExactThenPrefixThenWordThenDepth(t *testing.T) {
 	names := func(hits []uint32) []string {
 		var got []string
 		for _, h := range hits {
-			got = append(got, ix.Entries[h].Name)
+			got = append(got, ix.Name(h))
 		}
 		return got
 	}
@@ -46,7 +46,7 @@ func TestRankWithoutNameTermsFallsBackToNameOrder(t *testing.T) {
 	node, _ := query.Parse("ext:go", query.Defaults{})
 	hits, _ := Run(ix, node)
 	all := Rank(ix, slices.Clone(hits), node, -1)
-	if ix.Entries[all[0]].Name != "main.go" || ix.Entries[all[1]].Name != "main_test.go" {
+	if ix.Name(all[0]) != "main.go" || ix.Name(all[1]) != "main_test.go" {
 		t.Errorf("order = %v", all)
 	}
 	if top := Rank(ix, slices.Clone(hits), node, 1); !reflect.DeepEqual(top, all[:1]) {

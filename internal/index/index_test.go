@@ -3,6 +3,7 @@ package index
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -17,7 +18,7 @@ func sample() *Index {
 	return ix
 }
 
-func TestPathAndLowercaseAndExt(t *testing.T) {
+func TestPathAndExt(t *testing.T) {
 	ix := sample()
 	if got := ix.Path(2); got != filepath.Join("/data", "Docs", "Report.PDF") {
 		t.Errorf("path = %q", got)
@@ -25,8 +26,8 @@ func TestPathAndLowercaseAndExt(t *testing.T) {
 	if got := ix.Path(0); got != "/data" {
 		t.Errorf("root path = %q", got)
 	}
-	if ix.Lower[2] != "report.pdf" || ix.Ext(2) != "pdf" || ix.Ext(1) != "" {
-		t.Errorf("lower/ext wrong: %q %q %q", ix.Lower[2], ix.Ext(2), ix.Ext(1))
+	if Ext(ix.Name(2)) != "pdf" || Ext(ix.Name(1)) != "" {
+		t.Errorf("ext wrong: %q %q", Ext(ix.Name(2)), Ext(ix.Name(1)))
 	}
 }
 
@@ -39,25 +40,36 @@ func TestRootWithTrailingSeparatorDoesNotDouble(t *testing.T) {
 	}
 }
 
-func TestCompactDropsSubtreesAndRenumbers(t *testing.T) {
+func paths(ix *Index) []string {
+	var out []string
+	for i := range uint32(ix.Count()) {
+		if ix.Live(i) {
+			out = append(out, ix.Path(i))
+		}
+	}
+	return out
+}
+
+func TestSaveDropsRemovedSubtreesAndStoresPathOrder(t *testing.T) {
 	ix := sample()
+	ix.Add(Entry{Name: "src.txt", Parent: 0})
+	ix.Add(Entry{Name: "SRC-old", Parent: 0, IsDir: true})
 	ix.Remove(1) // Docs; Report.PDF below it becomes an orphan
-	if ix.Len() != 4 {
-		t.Fatalf("live count = %d", ix.Len())
+	path := filepath.Join(t.TempDir(), "idx", "index.bin")
+	if err := ix.Save(path); err != nil {
+		t.Fatal(err)
 	}
-	ix.Compact()
-	if len(ix.Entries) != 3 {
-		t.Fatalf("after compact %d entries", len(ix.Entries))
-	}
-	if got := ix.Path(2); got != filepath.Join("/data", "src", "main.go") {
-		t.Errorf("renumbered path = %q", got)
+	// Comparing lowercased paths puts "SRC-old" and "src.txt" between "src"
+	// and "src/main.go", because '-' and '.' sort before the separator.
+	want := []string{"/data", "/data/src", "/data/SRC-old", "/data/src.txt", "/data/src/main.go"}
+	if got := paths(ix); !slices.Equal(got, want) {
+		t.Errorf("after save %q, want %q", got, want)
 	}
 }
 
 func TestSaveLoadRoundTrip(t *testing.T) {
 	ix := sample()
-	ix.Entries[2].Modified = 1700000000
-	ix.Entries[2].Created = 1600000000
+	ix.Update(2, 10, 1700000000, 1600000000)
 	ix.BuiltAt = time.Unix(1234567890, 0)
 	path := filepath.Join(t.TempDir(), "idx", "index.bin")
 	if err := ix.Save(path); err != nil {
@@ -67,14 +79,98 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.Entries) != 5 || loaded.Entries[2] != ix.Entries[2] || loaded.Roots[0] != "/data" {
-		t.Errorf("roundtrip mismatch: %+v", loaded.Entries)
+	want := Entry{Name: "Report.PDF", Parent: 1, Size: 10, Modified: 1700000000, Created: 1600000000}
+	if loaded.Count() != 5 || loaded.Entry(2) != want || loaded.Roots[0] != "/data" {
+		t.Errorf("roundtrip mismatch: %+v", loaded.Entry(2))
 	}
-	if !loaded.BuiltAt.Equal(ix.BuiltAt) || loaded.Lower[2] != "report.pdf" {
-		t.Errorf("metadata mismatch")
+	if !loaded.BuiltAt.Equal(ix.BuiltAt) {
+		t.Errorf("built at %v", loaded.BuiltAt)
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing")); err != ErrNotFound {
 		t.Errorf("missing file: %v", err)
+	}
+}
+
+func savedSample(t *testing.T) (*Index, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "index.bin")
+	ix := sample()
+	if err := ix.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.EnableJournal(path); err != nil {
+		t.Fatal(err)
+	}
+	return ix, path
+}
+
+func TestJournalShowsChangesToOtherLoads(t *testing.T) {
+	ix, path := savedSample(t)
+	ix.Add(Entry{Name: "new.go", Parent: 3, Size: 3})
+	ix.Remove(1)
+	ix.Remove(2)
+	ix.Update(4, 99, 5, 6)
+	if err := ix.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/data", "/data/src", "/data/src/main.go", "/data/src/new.go"}
+	if got := paths(loaded); !slices.Equal(got, want) {
+		t.Errorf("paths %q, want %q", got, want)
+	}
+	if loaded.Size(4) != 99 || loaded.Modified(4) != 5 || loaded.Created(4) != 6 {
+		t.Errorf("update lost: %+v", loaded.Entry(4))
+	}
+}
+
+func TestJournalIgnoresHalfWrittenEntry(t *testing.T) {
+	ix, path := savedSample(t)
+	ix.Add(Entry{Name: "kept.go", Parent: 3})
+	if err := ix.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(journalPath(path), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte{opAdd, 3, 0})
+	f.Close()
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Count() != 6 || loaded.Name(5) != "kept.go" {
+		t.Errorf("count %d", loaded.Count())
+	}
+	// A writer continuing the journal first cuts the torn entry off.
+	if err := loaded.EnableJournal(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded.Add(Entry{Name: "after.go", Parent: 3})
+	if err := loaded.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Load(path)
+	if err != nil || again.Count() != 7 || again.Name(6) != "after.go" {
+		t.Errorf("after torn entry: %v %d", err, again.Count())
+	}
+}
+
+func TestFlushReportsIndexWrittenByAnotherProcess(t *testing.T) {
+	ix, path := savedSample(t)
+	other, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	ix.Add(Entry{Name: "lost.go", Parent: 3})
+	if err := ix.Flush(); err != ErrReplaced {
+		t.Errorf("flush = %v, want ErrReplaced", err)
 	}
 }
 
@@ -93,12 +189,12 @@ func TestAddTreeScansAndExcludes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Start != 0 || int(res.End) != len(ix.Entries) {
+	if res.Start != 0 || int(res.End) != ix.Count() {
 		t.Errorf("range %v", res)
 	}
 	paths := map[string]Entry{}
-	for i := range ix.Entries {
-		paths[ix.Path(uint32(i))] = ix.Entries[i]
+	for i := range uint32(ix.Count()) {
+		paths[ix.Path(i)] = ix.Entry(i)
 	}
 	if len(paths) != 5 {
 		t.Errorf("got %d entries: %v", len(paths), paths)

@@ -1,27 +1,29 @@
-// Package index holds the in-memory file index and its on-disk format.
+// Package index holds the file index and its on-disk format.
 //
-// Entries form a tree: every entry stores the index of its parent directory,
-// and a parent is always stored before its children. Full paths are
-// reconstructed on demand by walking up the parent chain, which keeps the
-// index small enough to hold millions of files in memory.
+// Entries form a tree: every entry stores the id of its parent directory, and
+// a parent always has a smaller id than its children. Full paths are rebuilt
+// on demand by walking up the parent chain.
+//
+// An index is an immutable base, memory-mapped from the index file, plus an
+// overlay of changes made since: added entries, removed entries and updated
+// metadata. A running daemon appends every change to a journal next to the
+// index file, so that other processes loading the index see it at once. Save
+// folds the overlay into a new base.
 package index
 
 import (
 	"errors"
-	"fmt"
 	"math"
 	"os"
-	"runtime"
 	"strings"
-	"sync"
 	"time"
+	"unicode/utf8"
+	"unsafe"
 )
 
 const (
 	// NoParent marks a root entry. Its Name is the absolute root path.
 	NoParent uint32 = math.MaxUint32
-	// Tombstone marks an entry that has been removed but not yet compacted away.
-	Tombstone uint32 = math.MaxUint32 - 1
 )
 
 type Entry struct {
@@ -34,79 +36,160 @@ type Entry struct {
 }
 
 type Index struct {
-	Entries []Entry
-	// Lower holds the lowercased name of every entry, for case-insensitive search.
-	Lower      []string
-	Roots      []string
-	BuiltAt    time.Time
-	tombstones int
+	Roots   []string
+	BuiltAt time.Time
+
+	base       base
+	added      []Entry // entries with ids from base.count on
+	dead       bitset  // removed entries, over all ids
+	deadCount  int
+	updated    bitset           // base entries whose metadata is in changes
+	changes    map[uint32]Entry // only Size, Modified and Created are used
+	journal    *journal         // nil unless changes are being journaled
+	generation uint64           // of the base; a journal belongs to one base
 }
 
 func New(roots []string) *Index {
 	return &Index{Roots: roots, BuiltAt: time.Now()}
 }
 
+// Count is one more than the largest entry id, live or not.
+func (ix *Index) Count() int { return ix.base.count + len(ix.added) }
+
+// BaseCount is the number of entries in the base. Ids below it are in path
+// order; entries added since have larger ids.
+func (ix *Index) BaseCount() int { return ix.base.count }
+
 // Len is the number of live entries.
-func (ix *Index) Len() int { return len(ix.Entries) - ix.tombstones }
+func (ix *Index) Len() int { return ix.Count() - ix.deadCount }
 
-func (ix *Index) Live(i uint32) bool { return ix.Entries[i].Parent != Tombstone }
+func (ix *Index) Live(i uint32) bool { return !ix.dead.has(i) }
 
-func (ix *Index) Add(e Entry) uint32 {
-	ix.Entries = append(ix.Entries, e)
-	ix.Lower = append(ix.Lower, strings.ToLower(e.Name))
-	return uint32(len(ix.Entries) - 1)
+func (ix *Index) inBase(i uint32) bool { return int(i) < ix.base.count }
+
+func (ix *Index) addedEntry(i uint32) *Entry { return &ix.added[int(i)-ix.base.count] }
+
+func (ix *Index) Name(i uint32) string {
+	if ix.inBase(i) {
+		return ix.base.name(ix.base.nameID[i])
+	}
+	return ix.addedEntry(i).Name
 }
 
-// Remove tombstones a single entry. Callers removing a directory must also
-// remove its descendants; Compact drops orphaned descendants regardless.
+func (ix *Index) Parent(i uint32) uint32 {
+	if ix.inBase(i) {
+		return ix.base.parent[i]
+	}
+	return ix.addedEntry(i).Parent
+}
+
+func (ix *Index) IsDir(i uint32) bool {
+	if ix.inBase(i) {
+		return ix.base.dir.has(i)
+	}
+	return ix.addedEntry(i).IsDir
+}
+
+func (ix *Index) Size(i uint32) int64 {
+	switch {
+	case !ix.inBase(i):
+		return ix.addedEntry(i).Size
+	case ix.updated.has(i):
+		return ix.changes[i].Size
+	}
+	return ix.base.size[i]
+}
+
+func (ix *Index) Modified(i uint32) int64 {
+	switch {
+	case !ix.inBase(i):
+		return ix.addedEntry(i).Modified
+	case ix.updated.has(i):
+		return ix.changes[i].Modified
+	}
+	return int64(ix.base.modified[i])
+}
+
+func (ix *Index) Created(i uint32) int64 {
+	switch {
+	case !ix.inBase(i):
+		return ix.addedEntry(i).Created
+	case ix.updated.has(i):
+		return ix.changes[i].Created
+	}
+	return int64(ix.base.created[i])
+}
+
+func (ix *Index) Entry(i uint32) Entry {
+	return Entry{Name: ix.Name(i), Parent: ix.Parent(i), Size: ix.Size(i), Modified: ix.Modified(i), Created: ix.Created(i), IsDir: ix.IsDir(i)}
+}
+
+// NameID returns the id of entry i's name among the base's distinct names,
+// which are numbered in name order. Entries added since the base was written
+// have none.
+func (ix *Index) NameID(i uint32) (uint32, bool) {
+	if ix.inBase(i) {
+		return ix.base.nameID[i], true
+	}
+	return 0, false
+}
+
+// DistinctNames is the number of distinct names in the base.
+func (ix *Index) DistinctNames() int { return len(ix.base.nameOff) }
+
+// DistinctName returns the base name with the given id.
+func (ix *Index) DistinctName(id uint32) string { return ix.base.name(id) }
+
+func (ix *Index) Add(e Entry) uint32 {
+	ix.added = append(ix.added, e)
+	i := uint32(ix.Count() - 1)
+	ix.journal.add(e)
+	return i
+}
+
+// Remove marks a single entry as removed. Callers removing a directory must
+// also remove its descendants; Save drops orphaned descendants regardless.
 func (ix *Index) Remove(i uint32) {
-	if ix.Entries[i].Parent == Tombstone {
+	if ix.dead.has(i) {
 		return
 	}
-	ix.Entries[i].Parent = Tombstone
-	ix.Entries[i].Name = ""
-	ix.Lower[i] = ""
-	ix.tombstones++
+	ix.dead.set(i)
+	ix.deadCount++
+	ix.journal.remove(i)
+}
+
+// Update replaces the size and times of entry i.
+func (ix *Index) Update(i uint32, size, modified, created int64) {
+	if !ix.inBase(i) {
+		e := ix.addedEntry(i)
+		e.Size, e.Modified, e.Created = size, modified, created
+	} else {
+		if ix.changes == nil {
+			ix.changes = make(map[uint32]Entry)
+		}
+		ix.changes[i] = Entry{Size: size, Modified: modified, Created: created}
+		ix.updated.set(i)
+	}
+	ix.journal.update(i, size, modified, created)
 }
 
 // Path reconstructs the absolute path of entry i.
 func (ix *Index) Path(i uint32) string {
-	var parts [64]string
-	n := 0
+	var buf [64]string
+	parts := buf[:0]
 	size := 0
 	for {
-		e := &ix.Entries[i]
-		if n < len(parts) {
-			parts[n] = e.Name
-		} else {
-			return ix.deepPath(i)
-		}
-		n++
-		size += len(e.Name) + 1
-		if e.Parent == NoParent {
+		name := ix.Name(i)
+		parts = append(parts, name)
+		size += len(name) + 1
+		p := ix.Parent(i)
+		if p == NoParent {
 			break
 		}
-		i = e.Parent
+		i = p
 	}
 	var b strings.Builder
 	b.Grow(size)
-	for k := n - 1; k >= 0; k-- {
-		joinComponent(&b, parts[k])
-	}
-	return b.String()
-}
-
-func (ix *Index) deepPath(i uint32) string {
-	var parts []string
-	for {
-		e := &ix.Entries[i]
-		parts = append(parts, e.Name)
-		if e.Parent == NoParent {
-			break
-		}
-		i = e.Parent
-	}
-	var b strings.Builder
 	for k := len(parts) - 1; k >= 0; k-- {
 		joinComponent(&b, parts[k])
 	}
@@ -120,24 +203,58 @@ func joinComponent(b *strings.Builder, part string) {
 	b.WriteString(part)
 }
 
-// Ext returns the lowercased extension of entry i without the dot, or "".
-func (ix *Index) Ext(i uint32) string {
-	name := ix.Lower[i]
+// Lower lowercases a name, without allocating for the common case of a name
+// that is already lowercase ASCII.
+func Lower(name string) string {
+	for k := 0; k < len(name); k++ {
+		if c := name[k]; c >= utf8.RuneSelf || 'A' <= c && c <= 'Z' {
+			return strings.ToLower(name)
+		}
+	}
+	return name
+}
+
+// LowerInto is Lower for hot loops: an ASCII name with uppercase letters is
+// lowercased into scratch, and the result is only valid until scratch is
+// reused.
+func LowerInto(scratch *[]byte, name string) string {
+	upper := false
+	for k := 0; k < len(name); k++ {
+		c := name[k]
+		if c >= utf8.RuneSelf {
+			return strings.ToLower(name)
+		}
+		upper = upper || 'A' <= c && c <= 'Z'
+	}
+	if !upper {
+		return name
+	}
+	b := append((*scratch)[:0], name...)
+	for k, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[k] = c + 'a' - 'A'
+		}
+	}
+	*scratch = b
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// Ext returns the lowercased extension of a name without the dot, or "".
+func Ext(name string) string {
 	dot := strings.LastIndexByte(name, '.')
 	if dot <= 0 {
 		return ""
 	}
-	return name[dot+1:]
+	return Lower(name[dot+1:])
 }
 
 // Stats counts live files and directories.
 func (ix *Index) Stats() (files, dirs int) {
-	for i := range ix.Entries {
-		e := &ix.Entries[i]
-		if e.Parent == Tombstone {
+	for i := range uint32(ix.Count()) {
+		if !ix.Live(i) {
 			continue
 		}
-		if e.IsDir {
+		if ix.IsDir(i) {
 			dirs++
 		} else {
 			files++
@@ -146,85 +263,20 @@ func (ix *Index) Stats() (files, dirs int) {
 	return files, dirs
 }
 
-// Compact drops tombstoned entries and everything below them, renumbering
-// parent references. Entry indices are not stable across a Compact.
-func (ix *Index) Compact() {
-	if ix.tombstones == 0 {
-		return
-	}
-	remap := make([]uint32, len(ix.Entries))
-	kept := make([]Entry, 0, len(ix.Entries)-ix.tombstones)
-	lower := make([]string, 0, len(ix.Entries)-ix.tombstones)
-	for i, e := range ix.Entries {
-		dead := e.Parent == Tombstone || (e.Parent != NoParent && remap[e.Parent] == Tombstone)
-		if dead {
-			remap[i] = Tombstone
-			continue
-		}
-		if e.Parent != NoParent {
-			e.Parent = remap[e.Parent]
-		}
-		remap[i] = uint32(len(kept))
-		kept = append(kept, e)
-		lower = append(lower, ix.Lower[i])
-	}
-	ix.Entries = kept
-	ix.Lower = lower
-	ix.tombstones = 0
-}
-
 var ErrNotFound = errors.New("index file not found")
 
-func Load(path string) (*Index, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, ErrNotFound
-		}
-		return nil, err
-	}
-	ix, err := decode(data)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	ix.fillLower()
-	return ix, nil
+// bitset grows as bits are set; reading past its end reports false.
+type bitset []uint64
+
+func (b bitset) has(i uint32) bool {
+	w := int(i / 64)
+	return w < len(b) && b[w]&(1<<(i%64)) != 0
 }
 
-func (ix *Index) fillLower() {
-	ix.Lower = make([]string, len(ix.Entries))
-	workers := runtime.GOMAXPROCS(0)
-	chunk := (len(ix.Entries) + workers - 1) / workers
-	var wg sync.WaitGroup
-	for lo := 0; lo < len(ix.Entries); lo += chunk {
-		hi := min(lo+chunk, len(ix.Entries))
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			for i := lo; i < hi; i++ {
-				ix.Lower[i] = strings.ToLower(ix.Entries[i].Name)
-			}
-		}(lo, hi)
+func (b *bitset) set(i uint32) {
+	w := int(i / 64)
+	if w >= len(*b) {
+		*b = append(*b, make([]uint64, w+1-len(*b))...)
 	}
-	wg.Wait()
-}
-
-// Save compacts the index and writes it atomically.
-func (ix *Index) Save(path string) error {
-	ix.Compact()
-	if err := os.MkdirAll(dirOf(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, encode(ix), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func dirOf(path string) string {
-	if i := strings.LastIndexByte(path, os.PathSeparator); i > 0 {
-		return path[:i]
-	}
-	return "."
+	(*b)[w] |= 1 << (i % 64)
 }

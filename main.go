@@ -426,7 +426,7 @@ func buildIndex(cfg config.Config, indexPath string) (*index.Index, error) {
 	errorsSeen := 0
 	progress := func(int) {}
 	if stderrIsTerminal() {
-		progress = func(added int) { fmt.Fprintf(os.Stderr, "\r  %s entries...", commas(len(ix.Entries))) }
+		progress = func(added int) { fmt.Fprintf(os.Stderr, "\r  %s entries...", commas(ix.Count())) }
 	}
 	for _, root := range cfg.Roots {
 		abs, err := filepath.Abs(root)

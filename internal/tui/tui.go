@@ -304,7 +304,7 @@ func (v *view) draw() {
 }
 
 func (v *view) drawRow(y, width int, hit uint32, selected bool) {
-	e := &v.ix.Entries[hit]
+	e := v.ix.Entry(hit)
 	style := tcell.StyleDefault
 	if selected {
 		style = style.Reverse(true)
@@ -317,7 +317,7 @@ func (v *view) drawRow(y, width int, hit uint32, selected bool) {
 	if e.Parent != index.NoParent {
 		dir = v.ix.Path(e.Parent)
 	}
-	meta := formatMeta(e)
+	meta := formatMeta(&e)
 	metaWidth := len(meta) + 1
 	if selected {
 		putString(v.screen, 0, y, strings.Repeat(" ", width), style)

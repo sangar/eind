@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
+	"slices"
 	"strconv"
 	"time"
 
@@ -33,16 +35,24 @@ type Options struct {
 
 const timeLayout = "2006-01-02 15:04"
 
+// Write prints hits from a local index, building each record only as it is
+// printed.
 func Write(w io.Writer, ix *index.Index, hits []uint32, o Options) error {
-	records := make([]Record, 0, len(hits))
-	for _, h := range hits {
-		records = append(records, RecordOf(ix, h))
-	}
-	return WriteRecords(w, records, o)
+	return write(w, func(yield func(Record) bool) {
+		for _, h := range hits {
+			if !yield(RecordOf(ix, h)) {
+				return
+			}
+		}
+	}, o)
 }
 
 // WriteRecords prints hits that came from the daemon rather than a local index.
 func WriteRecords(w io.Writer, records []Record, o Options) error {
+	return write(w, slices.Values(records), o)
+}
+
+func write(w io.Writer, records iter.Seq[Record], o Options) error {
 	bw := bufio.NewWriterSize(w, 64<<10)
 	var err error
 	switch o.Format {
@@ -59,12 +69,12 @@ func WriteRecords(w io.Writer, records []Record, o Options) error {
 	return bw.Flush()
 }
 
-func writePlain(w *bufio.Writer, records []Record, o Options) error {
+func writePlain(w *bufio.Writer, records iter.Seq[Record], o Options) error {
 	terminator := byte('\n')
 	if o.NullSep {
 		terminator = 0
 	}
-	for _, r := range records {
+	for r := range records {
 		isDir := r.Type == "dir"
 		if o.ShowSize {
 			if isDir {
@@ -118,7 +128,7 @@ type Record struct {
 }
 
 func RecordOf(ix *index.Index, h uint32) Record {
-	e := &ix.Entries[h]
+	e := ix.Entry(h)
 	r := Record{
 		Path:     ix.Path(h),
 		Name:     e.Name,
@@ -135,12 +145,14 @@ func RecordOf(ix *index.Index, h uint32) Record {
 	return r
 }
 
-func writeJSON(w *bufio.Writer, records []Record) error {
+func writeJSON(w *bufio.Writer, records iter.Seq[Record]) error {
 	w.WriteString("[")
-	for i, r := range records {
-		if i > 0 {
+	n := 0
+	for r := range records {
+		if n > 0 {
 			w.WriteString(",")
 		}
+		n++
 		w.WriteString("\n  ")
 		buf, err := json.Marshal(r)
 		if err != nil {
@@ -150,19 +162,19 @@ func writeJSON(w *bufio.Writer, records []Record) error {
 			return err
 		}
 	}
-	if len(records) > 0 {
+	if n > 0 {
 		w.WriteString("\n")
 	}
 	_, err := w.WriteString("]\n")
 	return err
 }
 
-func writeCSV(w *bufio.Writer, records []Record) error {
+func writeCSV(w *bufio.Writer, records iter.Seq[Record]) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write([]string{"path", "name", "type", "size", "modified", "created"}); err != nil {
 		return err
 	}
-	for _, r := range records {
+	for r := range records {
 		if err := cw.Write([]string{r.Path, r.Name, r.Type, strconv.FormatInt(r.Size, 10), r.Modified, r.Created}); err != nil {
 			return err
 		}

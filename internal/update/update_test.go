@@ -24,9 +24,9 @@ func setup(t *testing.T) (dir string, ix *index.Index, u *Updater) {
 
 func livePaths(ix *index.Index) map[string]index.Entry {
 	out := map[string]index.Entry{}
-	for i := range ix.Entries {
-		if ix.Live(uint32(i)) {
-			out[ix.Path(uint32(i))] = ix.Entries[i]
+	for i := range uint32(ix.Count()) {
+		if ix.Live(i) {
+			out[ix.Path(i)] = ix.Entry(i)
 		}
 	}
 	return out
@@ -118,11 +118,13 @@ func TestDeepPathBeforeParentIsKnown(t *testing.T) {
 	}
 }
 
-func TestSurvivesCompaction(t *testing.T) {
+func TestSurvivesSave(t *testing.T) {
 	dir, ix, u := setup(t)
 	os.Remove(filepath.Join(dir, "top.txt"))
 	u.Reconcile(filepath.Join(dir, "top.txt"))
-	ix.Compact()
+	if err := ix.Save(filepath.Join(t.TempDir(), "index.bin")); err != nil {
+		t.Fatal(err)
+	}
 	u.Rebuild()
 	added := filepath.Join(dir, "docs", "sub", "c.txt")
 	write(t, added, 1)

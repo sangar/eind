@@ -30,7 +30,7 @@ type dirResult struct {
 // while entries are appended by a single collector so that parents always
 // precede their children.
 func (ix *Index) AddTree(root string, parent uint32, ex *Excludes, progress func(added int)) (ScanResult, error) {
-	res := ScanResult{Start: uint32(len(ix.Entries))}
+	res := ScanResult{Start: uint32(ix.Count())}
 	info, err := os.Lstat(root)
 	if err != nil {
 		return res, err
@@ -40,7 +40,7 @@ func (ix *Index) AddTree(root string, parent uint32, ex *Excludes, progress func
 		name = filepath.Base(root)
 	}
 	rootIdx := ix.Add(entryFromInfo(name, parent, info))
-	res.End = uint32(len(ix.Entries))
+	res.End = uint32(ix.Count())
 	if !info.IsDir() {
 		return res, nil
 	}
@@ -84,7 +84,7 @@ func (ix *Index) AddTree(root string, parent uint32, ex *Excludes, progress func
 					pending = append(pending, dirJob{path: filepath.Join(r.path, child.Name), idx: idx})
 				}
 			}
-			added := len(ix.Entries) - int(res.Start)
+			added := ix.Count() - int(res.Start)
 			if progress != nil && added-lastReported >= 10000 {
 				lastReported = added
 				progress(added)
@@ -93,7 +93,7 @@ func (ix *Index) AddTree(root string, parent uint32, ex *Excludes, progress func
 	}
 	close(jobs)
 	wg.Wait()
-	res.End = uint32(len(ix.Entries))
+	res.End = uint32(ix.Count())
 	return res, nil
 }
 

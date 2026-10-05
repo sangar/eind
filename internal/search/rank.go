@@ -25,18 +25,18 @@ func Rank(ix *index.Index, hits []uint32, n query.Node, keep int) []uint32 {
 	}
 	terms := plainTerms(n)
 	rows := make([]ranked, len(hits))
+	scores := newScoreCache(ix, terms)
 	for k, h := range hits {
 		rows[k] = ranked{hit: h}
 		if len(terms) > 0 {
-			rows[k].score, rows[k].depth = score(ix.Lower[h], terms), depth(ix, h)
+			rows[k].score, rows[k].depth = scores.of(h), depth(ix, h)
 		}
 	}
 	better := func(a, b ranked) int {
 		return cmp.Or(
 			cmp.Compare(b.score, a.score),
 			cmp.Compare(a.depth, b.depth),
-			strings.Compare(ix.Lower[a.hit], ix.Lower[b.hit]),
-			cmp.Compare(a.hit, b.hit),
+			compareNames(ix, a.hit, b.hit),
 		)
 	}
 	if keep*4 > len(rows) {
@@ -50,6 +50,36 @@ func Rank(ix *index.Index, hits []uint32, n query.Node, keep int) []uint32 {
 		out[k] = rows[k].hit
 	}
 	return out
+}
+
+// scoreCache scores each distinct base name once; a million hits often
+// share a few hundred thousand names.
+type scoreCache struct {
+	ix     *index.Index
+	terms  []string
+	scores []int16 // -1 until computed
+}
+
+func newScoreCache(ix *index.Index, terms []string) *scoreCache {
+	c := &scoreCache{ix: ix, terms: terms}
+	if len(terms) > 0 {
+		c.scores = make([]int16, ix.DistinctNames())
+		for k := range c.scores {
+			c.scores[k] = -1
+		}
+	}
+	return c
+}
+
+func (c *scoreCache) of(i uint32) int {
+	id, ok := c.ix.NameID(i)
+	if !ok {
+		return score(index.Lower(c.ix.Name(i)), c.terms)
+	}
+	if c.scores[id] < 0 {
+		c.scores[id] = int16(score(index.Lower(c.ix.DistinctName(id)), c.terms))
+	}
+	return int(c.scores[id])
 }
 
 type ranked struct {
@@ -134,7 +164,7 @@ func startsWordIn(hay, needle string) bool {
 
 func depth(ix *index.Index, i uint32) int {
 	d := 0
-	for p := ix.Entries[i].Parent; p != index.NoParent; p = ix.Entries[p].Parent {
+	for p := ix.Parent(i); p != index.NoParent; p = ix.Parent(p) {
 		d++
 	}
 	return d

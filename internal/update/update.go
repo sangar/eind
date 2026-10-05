@@ -31,19 +31,18 @@ func New(ix *index.Index, ex *index.Excludes) *Updater {
 func (u *Updater) Rebuild() {
 	u.dirs = make(map[string]uint32)
 	u.children = make(map[uint32][]uint32)
-	u.absorb(0, uint32(len(u.ix.Entries)))
+	u.absorb(0, uint32(u.ix.Count()))
 }
 
 func (u *Updater) absorb(start, end uint32) {
 	for i := start; i < end; i++ {
-		e := &u.ix.Entries[i]
-		if e.Parent == index.Tombstone {
+		if !u.ix.Live(i) {
 			continue
 		}
-		if e.Parent != index.NoParent {
-			u.children[e.Parent] = append(u.children[e.Parent], i)
+		if p := u.ix.Parent(i); p != index.NoParent {
+			u.children[p] = append(u.children[p], i)
 		}
-		if e.IsDir {
+		if u.ix.IsDir(i) {
 			u.dirs[u.ix.Path(i)] = i
 		}
 	}
@@ -92,7 +91,7 @@ func (u *Updater) lookup(path string) (uint32, bool) {
 
 func (u *Updater) findChild(parent uint32, name string) (uint32, bool) {
 	for _, c := range u.children[parent] {
-		if u.ix.Entries[c].Name == name {
+		if u.ix.Name(c) == name {
 			return c, true
 		}
 	}
@@ -101,7 +100,7 @@ func (u *Updater) findChild(parent uint32, name string) (uint32, bool) {
 
 func (u *Updater) upsert(path string, info os.FileInfo) bool {
 	if i, ok := u.lookup(path); ok {
-		if u.ix.Entries[i].IsDir == info.IsDir() {
+		if u.ix.IsDir(i) == info.IsDir() {
 			return u.refresh(i, info)
 		}
 		u.remove(i)
@@ -127,11 +126,11 @@ func (u *Updater) upsert(path string, info os.FileInfo) bool {
 }
 
 func (u *Updater) refresh(i uint32, info os.FileInfo) bool {
-	fresh := index.EntryFromInfo(u.ix.Entries[i].Name, u.ix.Entries[i].Parent, info)
-	if fresh == u.ix.Entries[i] {
+	fresh := index.EntryFromInfo(u.ix.Name(i), u.ix.Parent(i), info)
+	if fresh == u.ix.Entry(i) {
 		return false
 	}
-	u.ix.Entries[i] = fresh
+	u.ix.Update(i, fresh.Size, fresh.Modified, fresh.Created)
 	return true
 }
 
@@ -147,7 +146,7 @@ func (u *Updater) removePath(path string) bool {
 // remove tombstones an entry and all its descendants and forgets them in the
 // lookup tables.
 func (u *Updater) remove(i uint32) {
-	parent := u.ix.Entries[i].Parent
+	parent := u.ix.Parent(i)
 	if kids, ok := u.children[parent]; ok {
 		for k, c := range kids {
 			if c == i {
@@ -164,7 +163,7 @@ func (u *Updater) remove(i uint32) {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
 		subtree = append(subtree, cur)
-		if u.ix.Entries[cur].IsDir {
+		if u.ix.IsDir(cur) {
 			delete(u.dirs, u.ix.Path(cur))
 			stack = append(stack, u.children[cur]...)
 			delete(u.children, cur)

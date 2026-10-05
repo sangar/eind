@@ -53,69 +53,79 @@ func Sort(ix *index.Index, hits []uint32, key SortKey, descending bool) {
 }
 
 // Top returns the first keep hits in sort order. Selecting a few hundred out
-// of a million is far cheaper than sorting them all, and for paths it avoids
-// building a path string per hit; keep < 0 sorts and returns everything.
+// of a million is far cheaper than sorting them all, except by path, which
+// costs almost nothing; keep < 0 sorts and returns everything.
 func Top(ix *index.Index, hits []uint32, key SortKey, descending bool, keep int) []uint32 {
 	if keep < 0 || keep >= len(hits) {
 		Sort(ix, hits, key, descending)
 		return hits
 	}
-	if keep*4 > len(hits) {
+	if keep*4 > len(hits) || key == SortPath {
 		Sort(ix, hits, key, descending)
 		return hits[:keep]
 	}
 	return topK(hits, keep, comparator(ix, key, descending))
 }
 
-// sortByPath builds each hit's lowercased path once, which beats comparing
-// parent chains when every hit has to be placed.
+// sortByPath relies on the base storing entries in path order, so base hits
+// sort by id; only entries added since need their paths compared, and they
+// are merged in.
 func sortByPath(ix *index.Index, hits []uint32, descending bool) {
-	type keyed struct {
-		path string
-		hit  uint32
+	slices.Sort(hits)
+	split, _ := slices.BinarySearch(hits, uint32(ix.BaseCount()))
+	base, added := hits[:split], slices.Clone(hits[split:])
+	if len(added) > 0 {
+		less := func(a, b uint32) int { return cmp.Or(comparePaths(ix, a, b), compareNames(ix, a, b)) }
+		slices.SortFunc(added, less)
+		merged := make([]uint32, 0, len(hits))
+		for _, a := range added {
+			at, _ := slices.BinarySearchFunc(base, a, less)
+			merged = append(append(merged, base[:at]...), a)
+			base = base[at:]
+		}
+		copy(hits, append(merged, base...))
 	}
-	rows := make([]keyed, len(hits))
-	for i, h := range hits {
-		rows[i] = keyed{strings.ToLower(ix.Path(h)), h}
-	}
-	byName := nameComparator(ix)
-	less := func(a, b keyed) int { return cmp.Or(strings.Compare(a.path, b.path), byName(a.hit, b.hit)) }
 	if descending {
-		slices.SortFunc(rows, func(a, b keyed) int { return less(b, a) })
-	} else {
-		slices.SortFunc(rows, less)
-	}
-	for i := range rows {
-		hits[i] = rows[i].hit
+		slices.Reverse(hits)
 	}
 }
 
 func nameComparator(ix *index.Index) func(a, b uint32) int {
-	return func(a, b uint32) int {
-		return cmp.Or(strings.Compare(ix.Lower[a], ix.Lower[b]), strings.Compare(ix.Entries[a].Name, ix.Entries[b].Name), cmp.Compare(a, b))
+	return func(a, b uint32) int { return compareNames(ix, a, b) }
+}
+
+// compareNames orders by lowercased name, then name, then id. Base names are
+// numbered in that order, so comparing two base entries needs no strings.
+func compareNames(ix *index.Index, a, b uint32) int {
+	na, okA := ix.NameID(a)
+	nb, okB := ix.NameID(b)
+	if okA && okB {
+		return cmp.Or(cmp.Compare(na, nb), cmp.Compare(a, b))
 	}
+	x, y := ix.Name(a), ix.Name(b)
+	return cmp.Or(strings.Compare(index.Lower(x), index.Lower(y)), strings.Compare(x, y), cmp.Compare(a, b))
 }
 
 func comparator(ix *index.Index, key SortKey, descending bool) func(a, b uint32) int {
 	byName := nameComparator(ix)
 	var less func(a, b uint32) int
 	switch key {
-	case SortPath:
-		less = func(a, b uint32) int { return cmp.Or(comparePaths(ix, a, b), byName(a, b)) }
 	case SortSize:
 		less = func(a, b uint32) int {
-			return cmp.Or(cmp.Compare(ix.Entries[a].Size, ix.Entries[b].Size), byName(a, b))
+			return cmp.Or(cmp.Compare(ix.Size(a), ix.Size(b)), byName(a, b))
 		}
 	case SortModified:
 		less = func(a, b uint32) int {
-			return cmp.Or(cmp.Compare(ix.Entries[a].Modified, ix.Entries[b].Modified), byName(a, b))
+			return cmp.Or(cmp.Compare(ix.Modified(a), ix.Modified(b)), byName(a, b))
 		}
 	case SortCreated:
 		less = func(a, b uint32) int {
-			return cmp.Or(cmp.Compare(ix.Entries[a].Created, ix.Entries[b].Created), byName(a, b))
+			return cmp.Or(cmp.Compare(ix.Created(a), ix.Created(b)), byName(a, b))
 		}
 	case SortExt:
-		less = func(a, b uint32) int { return cmp.Or(strings.Compare(ix.Ext(a), ix.Ext(b)), byName(a, b)) }
+		less = func(a, b uint32) int {
+			return cmp.Or(strings.Compare(index.Ext(ix.Name(a)), index.Ext(ix.Name(b))), byName(a, b))
+		}
 	default:
 		less = byName
 	}
@@ -162,7 +172,7 @@ func chain(ix *index.Index, i uint32, buf *[64]uint32) ([]uint32, bool) {
 		}
 		buf[n] = i
 		n++
-		p := ix.Entries[i].Parent
+		p := ix.Parent(i)
 		if p == index.NoParent {
 			break
 		}
@@ -184,10 +194,10 @@ type pathCursor struct {
 
 func (c *pathCursor) next() (byte, bool) {
 	for c.ci < len(c.comps) {
-		name := c.ix.Lower[c.comps[c.ci]]
+		name := index.Lower(c.ix.Name(c.comps[c.ci]))
 		if c.ci > 0 && !c.joined {
 			c.joined = true
-			if !strings.HasSuffix(c.ix.Lower[c.comps[c.ci-1]], string(os.PathSeparator)) {
+			if !strings.HasSuffix(c.ix.Name(c.comps[c.ci-1]), string(os.PathSeparator)) {
 				return os.PathSeparator, true
 			}
 		}
