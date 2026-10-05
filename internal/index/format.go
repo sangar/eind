@@ -1,15 +1,18 @@
 package index
 
 import (
+	"bufio"
 	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -230,14 +233,15 @@ func (ix *Index) Save(path string) error {
 		return err
 	}
 	generation := uint64(time.Now().UnixNano())
-	data := encode(entries, ix.Roots, ix.BuiltAt, generation)
 	// The new journal goes in first and the new base last: a reader that
 	// sees a journal from another generation ignores it, and a journal is
 	// always folded into any base newer than it.
 	if err := writeFileAtomic(journalPath(path), journalHeader(generation)); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(path, data); err != nil {
+	if err := writeFileWith(path, func(w io.Writer) error {
+		return encode(w, entries, ix.Roots, ix.BuiltAt, generation)
+	}); err != nil {
 		return err
 	}
 	fresh, err := loadBase(path)
@@ -283,58 +287,122 @@ func (ix *Index) liveEntries() []Entry {
 }
 
 func writeFileAtomic(path string, data []byte) error {
+	return writeFileWith(path, func(w io.Writer) error {
+		_, err := w.Write(data)
+		return err
+	})
+}
+
+// writeFileWith writes a file through a temporary one and renames it into
+// place, so readers see either the old file or the whole new one.
+func writeFileWith(path string, write func(io.Writer) error) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriterSize(f, 1<<20)
+	err = write(w)
+	if err == nil {
+		err = w.Flush()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)
 }
 
-func encode(entries []Entry, roots []string, builtAt time.Time, generation uint64) []byte {
+// encode writes the file one section at a time, building each column just
+// before it is written, so that only one is in memory at once.
+func encode(w io.Writer, entries []Entry, roots []string, builtAt time.Time, generation uint64) error {
 	order, newID := pathOrder(entries)
 	names, nameOff, nameIDs, unicode := distinctNames(entries)
 	n := len(entries)
-	ids := make([]uint32, n)
-	parent := make([]uint32, n)
-	size := make([]int64, n)
-	modified, created := make([]uint32, n), make([]uint32, n)
-	dir := make(bitset, (n+63)/64)
-	for i, old := range order {
-		e := &entries[old]
-		ids[i], size[i] = nameIDs[old], e.Size
-		parent[i] = NoParent
-		if e.Parent != NoParent {
-			parent[i] = newID[e.Parent]
-		}
-		modified[i], created[i] = clampTime(e.Modified), clampTime(e.Created)
-		if e.IsDir {
-			dir.set(uint32(i))
-		}
-	}
 	var rootBytes []byte
 	for _, r := range roots {
 		rootBytes = append(append(rootBytes, r...), 0)
 	}
-	sections := [sectionCount][]byte{rootBytes, names, bytesOf(nameOff), bytesOf(ids), bytesOf(parent), bytesOf(size), bytesOf(modified), bytesOf(created), bytesOf(dir), bytesOf(unicode)}
+	column32 := func(value func(e *Entry, old uint32) uint32) []byte {
+		col := make([]uint32, n)
+		for i, old := range order {
+			col[i] = value(&entries[old], old)
+		}
+		return bytesOf(col)
+	}
+	sections := [sectionCount]struct {
+		length int
+		build  func() []byte
+	}{
+		{len(rootBytes), func() []byte { return rootBytes }},
+		{len(names), func() []byte { return names }},
+		{4 * len(nameOff), func() []byte { return bytesOf(nameOff) }},
+		{4 * n, func() []byte { return column32(func(_ *Entry, old uint32) uint32 { return nameIDs[old] }) }},
+		{4 * n, func() []byte {
+			return column32(func(e *Entry, _ uint32) uint32 {
+				if e.Parent == NoParent {
+					return NoParent
+				}
+				return newID[e.Parent]
+			})
+		}},
+		{8 * n, func() []byte {
+			col := make([]int64, n)
+			for i, old := range order {
+				col[i] = entries[old].Size
+			}
+			return bytesOf(col)
+		}},
+		{4 * n, func() []byte { return column32(func(e *Entry, _ uint32) uint32 { return clampTime(e.Modified) }) }},
+		{4 * n, func() []byte { return column32(func(e *Entry, _ uint32) uint32 { return clampTime(e.Created) }) }},
+		{8 * ((n + 63) / 64), func() []byte {
+			dir := make(bitset, (n+63)/64)
+			for i, old := range order {
+				if entries[old].IsDir {
+					dir.set(uint32(i))
+				}
+			}
+			return bytesOf(dir)
+		}},
+		{8 * len(unicode), func() []byte { return bytesOf(unicode) }},
+	}
 
 	le := binary.LittleEndian
-	out := make([]byte, headerSize)
-	copy(out, magic)
-	le.PutUint32(out[4:], formatVersion)
-	le.PutUint64(out[8:], generation)
-	le.PutUint64(out[16:], uint64(builtAt.Unix()))
-	le.PutUint32(out[24:], uint32(n))
-	le.PutUint32(out[28:], uint32(len(nameOff)))
-	for k, s := range sections {
-		for len(out)%8 != 0 {
-			out = append(out, 0)
-		}
-		le.PutUint64(out[32+16*k:], uint64(len(out)))
-		le.PutUint64(out[40+16*k:], uint64(len(s)))
-		out = append(out, s...)
+	header := make([]byte, headerSize)
+	copy(header, magic)
+	le.PutUint32(header[4:], formatVersion)
+	le.PutUint64(header[8:], generation)
+	le.PutUint64(header[16:], uint64(builtAt.Unix()))
+	le.PutUint32(header[24:], uint32(n))
+	le.PutUint32(header[28:], uint32(len(nameOff)))
+	offset := headerSize
+	for k, sec := range sections {
+		offset = align8(offset)
+		le.PutUint64(header[32+16*k:], uint64(offset))
+		le.PutUint64(header[40+16*k:], uint64(sec.length))
+		offset += sec.length
 	}
-	return out
+	if _, err := w.Write(header); err != nil {
+		return err
+	}
+	written := headerSize
+	var padding [8]byte
+	for _, sec := range sections {
+		if _, err := w.Write(padding[:align8(written)-written]); err != nil {
+			return err
+		}
+		if _, err := w.Write(sec.build()); err != nil {
+			return err
+		}
+		written = align8(written) + sec.length
+	}
+	return nil
 }
+
+func align8(n int) int { return (n + 7) &^ 7 }
 
 // clampTime fits unix seconds in 32 bits, which holds dates from 1970 to 2106.
 func clampTime(t int64) uint32 {
@@ -346,72 +414,102 @@ func bytesOf[T any](s []T) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(s))), len(s)*int(unsafe.Sizeof(zero)))
 }
 
+// compareFold orders names as comparing their lowercased forms would,
+// without allocating them unless a name has non-ASCII letters. With a tail,
+// a name compares as if followed by a separator.
+func compareFold(a string, aTail bool, b string, bTail bool) int {
+	sep := byte(os.PathSeparator)
+	at := func(s string, tail bool, k int) (byte, bool) {
+		switch {
+		case k < len(s):
+			return s[k], true
+		case tail && k == len(s):
+			return sep, true
+		}
+		return 0, false
+	}
+	for k := 0; ; k++ {
+		x, okA := at(a, aTail, k)
+		y, okB := at(b, bTail, k)
+		switch {
+		case !okA || !okB:
+			return cmp.Compare(boolInt(okA), boolInt(okB))
+		case x >= utf8.RuneSelf || y >= utf8.RuneSelf:
+			return strings.Compare(withTail(Lower(a), aTail), withTail(Lower(b), bTail))
+		}
+		if c := cmp.Compare(foldASCII(x), foldASCII(y)); c != 0 {
+			return c
+		}
+	}
+}
+
+func withTail(s string, tail bool) string {
+	if tail {
+		return s + string(os.PathSeparator)
+	}
+	return s
+}
+
+func foldASCII(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // distinctNames stores every name once, numbered in name order: lowercased,
 // then as written. It returns each entry's name id, indexed like entries.
+// Sorting the entries by name finds the duplicates side by side, which takes
+// far less memory than a map of a million names.
 func distinctNames(entries []Entry) (names []byte, offsets, ids []uint32, unicode bitset) {
-	idOf := make(map[string]uint32, len(entries)/2)
-	var distinct []string
-	ids = make([]uint32, len(entries))
-	for i, e := range entries {
-		id, ok := idOf[e.Name]
-		if !ok {
-			id = uint32(len(distinct))
-			idOf[e.Name] = id
-			distinct = append(distinct, e.Name)
-		}
-		ids[i] = id
-	}
-	lower := make([]string, len(distinct))
-	for k, name := range distinct {
-		lower[k] = Lower(name)
-	}
-	byName := make([]uint32, len(distinct))
-	for k := range byName {
-		byName[k] = uint32(k)
+	byName := make([]uint32, len(entries))
+	for i := range byName {
+		byName[i] = uint32(i)
 	}
 	slices.SortFunc(byName, func(a, b uint32) int {
-		return cmp.Or(strings.Compare(lower[a], lower[b]), strings.Compare(distinct[a], distinct[b]))
+		x, y := entries[a].Name, entries[b].Name
+		return cmp.Or(compareFold(x, false, y, false), strings.Compare(x, y))
 	})
-	rank := make([]uint32, len(distinct))
-	offsets = make([]uint32, len(distinct))
-	unicode = make(bitset, (len(distinct)+63)/64)
-	for id, k := range byName {
-		name := distinct[k]
-		rank[k] = uint32(id)
-		offsets[id] = uint32(len(names))
-		names = append(append(names, name...), 0)
-		if foldsBeyondASCII(name) {
-			unicode.set(uint32(id))
+	ids = make([]uint32, len(entries))
+	for k, i := range byName {
+		name := entries[i].Name
+		if k == 0 || name != entries[byName[k-1]].Name {
+			if foldsBeyondASCII(name) {
+				unicode.set(uint32(len(offsets)))
+			}
+			offsets = append(offsets, uint32(len(names)))
+			names = append(append(names, name...), 0)
 		}
+		ids[i] = uint32(len(offsets) - 1)
 	}
-	for i, k := range ids {
-		ids[i] = rank[k]
+	if len(unicode) < (len(offsets)+63)/64 {
+		unicode = append(unicode, make(bitset, (len(offsets)+63)/64-len(unicode))...)
 	}
 	return names, offsets, ids, unicode
 }
 
 // pathOrder orders entries by lowercased path, then name, as SortPath does,
-// keeping parents before children. It returns the entries in that order and
+// keeping parents before children. It returns the old ids in that order and
 // each entry's new position. It walks the tree with each directory's children
 // sorted by name, where a directory appears twice: once as itself, keyed by
 // its name, and once as the subtree below it, keyed by its name and a
 // separator. That places "a.txt" between "a" and "a/b", as comparing whole
-// paths would.
+// paths would. An item is an entry id shifted left, with the low bit set for
+// a subtree.
 func pathOrder(entries []Entry) (order, newID []uint32) {
-	type item struct {
-		key     string
-		entry   uint32
-		subtree bool
-	}
-	// Children of each directory, grouped in one array; the roots are listed
-	// under a virtual directory numbered len(entries).
 	n := len(entries)
+	// Children of each directory, grouped in one array; the roots are listed
+	// under a virtual directory numbered n.
 	start := make([]uint32, n+2)
 	for _, e := range entries {
-		p := e.Parent
-		if p == NoParent {
-			p = uint32(n)
-		}
+		p := min(e.Parent, uint32(n))
 		start[p+1]++
 		if e.IsDir {
 			start[p+1]++
@@ -420,55 +518,51 @@ func pathOrder(entries []Entry) (order, newID []uint32) {
 	for k := 1; k < len(start); k++ {
 		start[k] += start[k-1]
 	}
-	items := make([]item, start[n+1])
+	items := make([]uint32, start[n+1])
 	fill := slices.Clone(start)
-	sep := string(os.PathSeparator)
 	for i, e := range entries {
-		p := e.Parent
-		if p == NoParent {
-			p = uint32(n)
-		}
-		key := Lower(e.Name)
-		items[fill[p]] = item{key: key, entry: uint32(i)}
+		p := min(e.Parent, uint32(n))
+		items[fill[p]] = uint32(i) << 1
 		fill[p]++
 		if e.IsDir {
-			items[fill[p]] = item{key: strings.TrimSuffix(key, sep) + sep, entry: uint32(i), subtree: true}
+			items[fill[p]] = uint32(i)<<1 | 1
 			fill[p]++
 		}
 	}
+	fill = nil
+	sep := string(os.PathSeparator)
+	key := func(item uint32) (string, bool) {
+		name := entries[item>>1].Name
+		if item&1 == 0 {
+			return name, false
+		}
+		return strings.TrimSuffix(name, sep), true
+	}
 	for p := range n + 1 {
-		slices.SortFunc(items[start[p]:start[p+1]], func(a, b item) int {
-			return cmp.Or(strings.Compare(a.key, b.key), strings.Compare(entries[a.entry].Name, entries[b.entry].Name),
-				cmp.Compare(a.entry, b.entry), compareBool(a.subtree, b.subtree))
+		slices.SortFunc(items[start[p]:start[p+1]], func(a, b uint32) int {
+			ka, ta := key(a)
+			kb, tb := key(b)
+			return cmp.Or(compareFold(ka, ta, kb, tb), strings.Compare(entries[a>>1].Name, entries[b>>1].Name), cmp.Compare(a, b))
 		})
 	}
 	order = make([]uint32, 0, n)
 	newID = make([]uint32, n)
-	stack := []item{{entry: uint32(n), subtree: true}}
+	stack := []uint32{uint32(n)<<1 | 1}
 	for len(stack) > 0 {
 		it := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if !it.subtree {
-			newID[it.entry] = uint32(len(order))
-			order = append(order, it.entry)
+		if it&1 == 0 {
+			newID[it>>1] = uint32(len(order))
+			order = append(order, it>>1)
 			continue
 		}
-		kids := items[start[it.entry]:start[it.entry+1]]
+		dir := it >> 1
+		kids := items[start[dir]:start[dir+1]]
 		for k := len(kids) - 1; k >= 0; k-- {
 			stack = append(stack, kids[k])
 		}
 	}
 	return order, newID
-}
-
-func compareBool(a, b bool) int {
-	switch {
-	case a == b:
-		return 0
-	case a:
-		return 1
-	}
-	return -1
 }
 
 func dirOf(path string) string {
