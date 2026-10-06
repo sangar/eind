@@ -46,12 +46,12 @@ import Testing
 
 @Suite struct DaemonLauncherTests {
     @Test func locatesBinaryFromOverridePathAndKnownDirectories() {
-        let existing: Set<String> = ["/opt/homebrew/bin/eind", "/Users/me/go/bin/eind"]
+        let existing: Set<String> = ["/opt/homebrew/bin/eind", "/Users/me/.local/bin/eind"]
         let isExecutable = { existing.contains($0) }
 
         #expect(DaemonLauncher.locateBinary(environment: ["EIND_BINARY": "/x/eind"], isExecutable: isExecutable) == "/x/eind")
         #expect(DaemonLauncher.locateBinary(environment: ["PATH": "/usr/bin:/opt/homebrew/bin", "HOME": "/Users/me"], isExecutable: isExecutable) == "/opt/homebrew/bin/eind")
-        #expect(DaemonLauncher.locateBinary(environment: ["PATH": "/usr/bin", "HOME": "/Users/me"], isExecutable: isExecutable) == "/Users/me/go/bin/eind")
+        #expect(DaemonLauncher.locateBinary(environment: ["PATH": "/usr/bin", "HOME": "/Users/me"], isExecutable: isExecutable) == "/Users/me/.local/bin/eind")
         #expect(DaemonLauncher.locateBinary(environment: ["PATH": "/usr/bin", "HOME": "/Users/me"], isExecutable: { _ in false }) == nil)
     }
 }
