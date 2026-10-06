@@ -14,14 +14,15 @@ away on save.
 
 `eind serve` loads the index, subscribes to change notifications for every
 root (FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows),
-saves the updated index every ten seconds while changes accumulate, and
-answers queries over the socket. Renames, moves and newly created folders are
-picked up in full. `eind watch` does the same without the socket.
+and answers queries over the socket. Renames, moves and newly created folders
+are picked up in full. `eind watch` does the same without the socket.
 
-When `eind serve` is running and serves the same index file, command line
-searches are answered by it instead of loading the index from disk. Listings
-of more than 100,000 results still come from the local index, because they
-are cheaper to produce there than to transfer as JSON.
+Every change is appended at once to a journal next to the index file
+(`index.bin.journal`). Command line searches load the index file and replay
+its journal, so they see the daemon's changes immediately without talking to
+it. Every ten seconds the daemon checks whether the journal has grown past
+10,000 changes or 1% of the index, and if so folds it into a new index file
+and starts an empty journal; it does so once more when it stops.
 
 
 ## Default excludes

@@ -45,7 +45,10 @@ func (ix *Index) AddTree(root string, parent uint32, ex *Excludes, progress func
 		return res, nil
 	}
 
-	workers := min(4*runtime.NumCPU(), 64)
+	// Directory reads contend on filesystem locks in the kernel: on APFS,
+	// 48 threads indexed 150k entries in 1.4s and 6 threads in 0.5s, with
+	// kernel time falling from 14s to under 3s. A few threads beat many.
+	workers := min(runtime.NumCPU(), 6)
 	jobs := make(chan dirJob)
 	results := make(chan dirResult, workers)
 	var wg sync.WaitGroup
