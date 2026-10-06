@@ -1,25 +1,33 @@
 # Socket protocol
 
-`eind serve` is what a launcher or GUI talks to. It loads the index once,
-keeps it fresh from filesystem events exactly like `eind watch`, and answers
-queries from memory over a Unix socket in a few milliseconds. On a 2.2 million
-entry index a typical query round-trips in about 10 ms.
+`eind serve` answers launchers and GUIs over a Unix socket from the index it
+keeps in memory. Code: `src/app/server.c`.
 
 ```sh
 eind serve                          # socket at $XDG_RUNTIME_DIR/eind.sock
-eind serve --socket /run/user/1000/eind.sock
+eind serve --socket /tmp/eind.sock
 eind status                         # shows whether a daemon is running
 ```
 
-The default socket is `$XDG_RUNTIME_DIR/eind.sock`, falling back to
-`eind-<uid>.sock` in the temp directory; `EIND_SOCKET` or `--socket` override
-it. The socket is created with mode 0600. Unix socket paths are limited to
-about 100 bytes.
+The socket path is `--socket`, else `$EIND_SOCKET`, else
+`$XDG_RUNTIME_DIR/eind.sock`, else `eind-<uid>.sock` in `$TMPDIR` (or `/tmp`).
+It is created with mode 0600 and must be shorter than 104 bytes. A stale
+socket file from a dead daemon is replaced; a live one makes `serve` fail.
 
-The protocol is JSON lines: send one JSON object per line, receive one JSON
-object per request. Any `id` you send is echoed back unchanged.
+## Framing
 
-Search request, all fields except `query` optional:
+JSON lines: send one JSON object per line, receive one JSON object per
+request. Lines are limited to 1 MiB. Any `id` you send is echoed back
+unchanged; without one, the response has none.
+
+A new request on a connection cancels the one still running on it, which
+then answers `{"id": ..., "cancelled": true}`. Send a request per keystroke
+and render whichever response carries the latest id. Connections are
+independent; open as many as you like.
+
+## Search
+
+Request (all fields except `query` optional):
 
 ```json
 {"id": 1, "query": "report ext:pdf", "limit": 50, "offset": 0,
@@ -28,16 +36,18 @@ Search request, all fields except `query` optional:
  "path": "/home/me/Documents", "files": false, "dirs": false}
 ```
 
-`limit` defaults to 100; `-1` returns everything and `0` returns only the
-`total`, without sorting. `path` restricts results to one folder and its
-descendants; `files` and `dirs` keep only files or only folders. `sort` is `relevance`
-(default), `path`, `name`, `size`, `dm`, `dc` or `ext`. Relevance puts names
-equal to a search term first, then names starting with it, then names
-containing it at a word boundary, then plain substring matches, with shallower
-paths winning ties; it is also available on the command line as
-`-s relevance`.
+| Field | Meaning |
+|---|---|
+| `query` | the query, in the syntax of the command line |
+| `limit` | results to return; default 100, `-1` for all, `0` for only `total` |
+| `offset` | results to skip |
+| `sort` | `relevance` (default), `path`, `name`, `size`, `dm`, `dc` or `ext` |
+| `descending` | reverse the sort (not for relevance) |
+| `regex`, `case`, `whole_word`, `match_path` | defaults for plain words, like `-r -i -w -p` |
+| `path` | only results inside this folder (absolute) |
+| `files`, `dirs` | only files, only folders |
 
-Search response:
+Response:
 
 ```json
 {"id": 1, "total": 132, "elapsed_ms": 2.1, "results": [
@@ -47,14 +57,14 @@ Search response:
 ]}
 ```
 
-`total` is the number of matches before `offset` and `limit`; `type` is
-`file` or `dir`; `created` is omitted where the platform does not report it.
+`total` counts all matches before `offset` and `limit`. `type` is `file` or
+`dir`. Times are RFC 3339 in local time; `created` is omitted when unknown.
 
-Sending a new request on a connection cancels the one still running, which
-answers `{"id": 1, "cancelled": true}`. Send a request per keystroke and
-render whichever response arrives with the latest id.
+Relevance puts names equal to a search term first, then names starting with
+it, then names containing it at a word boundary, then other matches, with
+shallower paths winning ties.
 
-Status request and response:
+## Status
 
 ```json
 {"op": "status"}
@@ -62,8 +72,10 @@ Status request and response:
  "built": "2024-03-13T09:00:00+01:00", "index": "/home/me/.local/share/eind/index.bin"}
 ```
 
-Errors come back as `{"id": 1, "error": "size: expected a size such as 10mb, got \"huge!\""}`.
-Connections are independent; open as many as you like.
+## Errors
+
+`{"id": 1, "error": "size: expected a size such as 10mb, got \"huge!\""}` for
+a bad query, sort key, unknown `op` or a line that is not JSON.
 
 Try it from a shell:
 

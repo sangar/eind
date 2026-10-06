@@ -21,8 +21,8 @@ final class DaemonLauncher {
         return FileManager.default.fileExists(atPath: agent.path)
     }
 
-    /// EIND_BINARY, then PATH, then the places `go install` and Homebrew put
-    /// binaries, because an app launched from Finder gets a minimal PATH.
+    /// EIND_BINARY, then PATH, then the places `make` and Homebrew put binaries,
+    /// because an app launched from Finder gets a minimal PATH.
     nonisolated static func locateBinary(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
@@ -32,7 +32,7 @@ final class DaemonLauncher {
         }
         let home = environment["HOME"] ?? NSHomeDirectory()
         var directories = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
-        directories += [home + "/go/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+        directories += [home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
         return directories.map { $0 + "/eind" }.first(where: isExecutable)
     }
 

@@ -1,26 +1,44 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS  = -s -w -X main.version=$(VERSION)
-GORELEASER = go run github.com/goreleaser/goreleaser/v2@latest
-STATICCHECK = go run honnef.co/go/tools/cmd/staticcheck@latest
+CC      ?= cc
+CFLAGS  ?= -O2 -g
+CFLAGS  += -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Wshadow -Wno-unused-parameter \
+           -pthread -DEIND_VERSION='"$(VERSION)"'
+LDLIBS  += -pthread
 
-.PHONY: build test snapshot release clean
+ifeq ($(shell uname -s),Darwin)
+LDLIBS  += -framework CoreServices
+endif
 
-# The watcher needs cgo for FSEvents on macOS; elsewhere the binary is static.
-CGO = $(if $(filter Darwin,$(shell uname -s)),1,0)
+LIB_SRC  = $(wildcard src/core/*.c src/index/*.c src/fs/*.c src/app/*.c)
+LIB_OBJ  = $(LIB_SRC:src/%.c=build/%.o)
+TEST_OBJ = build/tests/test_eind.o
 
-build:
-	CGO_ENABLED=$(CGO) go build -ldflags '$(LDFLAGS)' -o eind .
+.PHONY: all test sanitize clean
 
-test:
-	go vet ./...
-	$(STATICCHECK) ./...
-	go test -race ./...
+all: eind
 
-snapshot:
-	$(GORELEASER) release --snapshot --clean
+eind: $(LIB_OBJ) build/main.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-release:
-	$(GORELEASER) release --clean
+build/test_eind: $(LIB_OBJ) $(TEST_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+build/%.o: src/%.c $(wildcard src/*/*.h)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+build/tests/%.o: tests/%.c $(wildcard src/*/*.h)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc -c -o $@ $<
+
+test: build/test_eind
+	./build/test_eind
+
+# Rebuilds everything with AddressSanitizer and UndefinedBehaviorSanitizer and runs the tests.
+sanitize:
+	$(MAKE) clean
+	$(MAKE) test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+	$(MAKE) clean
 
 clean:
-	rm -rf eind dist
+	rm -rf build eind

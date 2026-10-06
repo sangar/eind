@@ -8,11 +8,11 @@ reveals a result in Finder or copies its path. It connects to the same default
 socket as the daemon (`EIND_SOCKET` overrides it). When the login service from
 `eind service enable` is installed, the app waits for it. Otherwise, when no
 daemon answers, the app starts `eind serve` itself and stops it again when it
-quits; it looks for the binary at `EIND_BINARY`, on `PATH`, and in `~/go/bin`,
+quits; it looks for the binary at `EIND_BINARY`, on `PATH`, and in `~/.local/bin`,
 `/opt/homebrew/bin` and `/usr/local/bin`.
 
 ```sh
-go install .
+make && cp eind ~/.local/bin/
 cd macos && swift run
 ```
 

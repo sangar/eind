@@ -1,45 +1,37 @@
 # eind
 
-Instant file search for the terminal and for launchers.
+Instant file search for the terminal and for launchers, written in C.
 
 `eind` indexes the names of every file and folder under your roots once, then
-answers searches from that index in milliseconds, with a small query language:
-`report ext:pdf size:>1mb dm:thisweek !draft`. A daemon keeps the index
-current from filesystem events and answers launchers over a Unix socket.
+answers searches from that index in milliseconds, with a small query
+language: `report ext:pdf size:>1mb dm:thisweek !draft`. A daemon keeps the
+index current from filesystem events and answers launchers over a Unix
+socket.
 
-Linux is the primary target; macOS is fully supported, and FreeBSD and Windows
-build too.
+Runs on macOS and Linux. No dependencies beyond a C11 compiler, `make` and
+pthreads.
 
-## Install
-
-Linux: install the `.deb`, `.rpm`, `.apk` or `.pkg.tar.zst` from the releases
-page. The package enables the daemon for every user from their next login;
-`systemctl --user start eind` starts it now.
-
-macOS:
+## Build
 
 ```sh
-brew install OWNER/tap/eind
-eind service enable
+make            # ./eind
+make test       # unit and integration tests
+make sanitize   # the tests under AddressSanitizer and UndefinedBehaviorSanitizer
+cp eind ~/.local/bin/      # or anywhere on your PATH
 ```
 
-From source, with Go 1.26 or newer (on macOS also the Xcode Command Line
-Tools, as the watcher uses FSEvents through cgo):
-
-```sh
-go install .
-eind service enable
-```
+A small SwiftUI client of the daemon for macOS lives in [macos/](macos/README.md).
 
 ## Quick start
 
 ```sh
 eind index                    # index your home directory
 eind invoice 2024             # names containing "invoice" and "2024"
-eind ext:go size:>100kb       # large Go files
+eind ext:go 'size:>100kb'     # large Go files
 eind "*.psd" dm:lastmonth     # wildcards match the whole name
 eind                          # interactive view; Enter prints the chosen path
 cd "$(eind folder: project)"  # use it from the shell
+eind service enable           # keep the index fresh from login
 ```
 
 Searching with no index builds one first.
@@ -57,27 +49,30 @@ Searching with no index builds one first.
 | `ext:pdf;docx` | extension is one of the list |
 | `size:>10mb`, `size:1mb..5mb`, `size:large` | size; units kb mb gb tb, names empty tiny small medium large huge gigantic |
 | `dm:today`, `dm:lastweek`, `dm:2024-03`, `dm:>2023`, `dm:last30days` | date modified |
-| `dc:...` | date created (macOS, BSD, Windows) |
+| `dc:...` | date created |
 | `len:>40`, `depth:3` | name length, path depth |
 | `file:`, `folder:` | only files, only folders (`folder:src` = folders named src) |
 | `path:src/main` | match against the full path |
 | `parent:~/Documents` | direct children of a folder |
 | `infolder:~/Projects` | anything below a folder |
 | `case:Readme` | match case |
-| `regex:^draft_\d+` | regular expression |
+| `regex:^draft_\d+` | regular expression (POSIX extended, plus `\d` `\w` `\s`) |
 | `ww:log` | whole word (underscores separate words) |
 | `wfn:Makefile` | whole file name |
 
-Modifiers can be chained: `folder:case:regex:^Src$`.
+Modifiers can be chained: `folder:case:regex:^Src$`. Ranges accept `>`, `>=`,
+`<`, `<=`, `=` and `a..b`. Dates may be `today`, `yesterday`, `thisweek`,
+`lastweek`, `thismonth`, `lastmonth`, `thisyear`, `lastyear`,
+`last<N>days`/`weeks`/`months`/`years`, `YYYY`, `YYYY-MM` or `YYYY-MM-DD`.
 
-## Usage
+## Commands
 
 ```
 eind [options] [query...]     search; with no query, open the interactive view
 eind index [--root DIR]...    build the index from the configured roots
 eind watch                    keep the index up to date from filesystem events
 eind serve                    watch, and answer queries over a Unix socket
-eind service enable|disable   run eind serve at login
+eind service enable|disable   run eind serve at login (launchd agent or systemd user unit)
 eind status                   show where the index and config live, and their size
 eind config [--init]          show the effective config, or write a default file
 eind config edit              open the config in $VISUAL or $EDITOR, then check it
@@ -85,74 +80,70 @@ eind tui                      open the interactive view
 eind version                  show the version
 ```
 
-Common options: `-r` regex, `-i` match case, `-n N` max results,
-`-s KEY` sort (`path`, `name`, `size`, `dm`, `dc`, `ext`, `relevance`),
-`--files`, `--dirs`, `--json`, `--csv`, `-0` for `xargs -0`, `--count`.
-Options may appear anywhere; use `--` when a search word is also a command
-name (`eind -- index`). `eind --help` lists everything.
+Search options: `-r` regex, `-i` match case, `-w` whole words, `-p` match the
+full path, `-n N` at most N results, `-o N` skip N, `-s KEY` sort by `path`
+(default), `name`, `size`, `dm`, `dc`, `ext` or `relevance`, `-d` descending,
+`--path DIR`, `--files`, `--dirs`.
 
-The interactive view filters as you type. Enter prints the selection, Ctrl-O
-opens it, Esc quits, so `vim "$(eind)"` works.
+Output options: `--json`, `--csv`, `-0` (NUL-separated), `--name-only`,
+`--size`, `--dm`, `--dc`, `--count`, `--color auto|always|never`.
 
-## Configuration
+Options may appear anywhere on the line; everything after `--` is query text.
+`eind --help` lists them all.
 
-`~/.config/eind/config` (`$XDG_CONFIG_HOME` is respected, `%AppData%` on
-Windows); the index lives at `~/.local/share/eind/index.bin`. `--config`,
-`--index`, `EIND_CONFIG` and `EIND_INDEX` override them.
+## Files
 
-```sh
-eind config edit              # write the defaults if needed and open them in $EDITOR
-```
+| | Default | Override |
+|---|---|---|
+| config | `~/.config/eind/config` | `--config`, `$EIND_CONFIG` |
+| index | `~/.local/share/eind/index.bin` (and `index.bin.journal`) | `--index`, `$EIND_INDEX` |
+| socket | `$XDG_RUNTIME_DIR/eind.sock`, else `$TMPDIR/eind-<uid>.sock` | `--socket`, `$EIND_SOCKET` |
+
+`$XDG_CONFIG_HOME` and `$XDG_DATA_HOME` move the config and index
+directories.
+
+The config file is a list of `key = value` lines:
 
 ```
 root = ~
-root = /Volumes/Data
-
 exclude = node_modules
 exclude = ~/Library/Caches
-exclude = *.tmp
+exclude = **/build
 ```
 
-`root` may be repeated. An `exclude` without a slash matches file names; with
-a slash it matches the full path and everything below it. Run `eind index`
-after editing.
+`root` may repeat. An `exclude` without a slash matches names; one with a
+slash matches the full path and everything below it; `**` spans folders. A
+file without any `exclude` lines uses the defaults: `node_modules`, `.git`,
+`.cache`, the platform's cache directory and trash, and its virtual
+filesystems (`/proc`, `/sys`, `/dev`, `/run` on Linux; `/dev`, `/Volumes`,
+`/System/Volumes`, `/private/var/vm` and the sandboxed app data in
+`~/Library/Containers` on macOS). `eind config --init` writes them out for
+editing. Run `eind index` after changing the config.
 
-The defaults leave out dependency trees, `.git`, caches, the trash and
-virtual filesystems for the platform eind runs on. Exclude lines in the file
-replace the defaults, so `eind config --init` writes them out for editing.
+## The daemon
 
-## Running in the background
+`eind serve` (or `eind watch`, without the socket) loads the index, watches
+every root (FSEvents on macOS, inotify on Linux), appends each change to the
+journal next to the index file, and folds the journal into a new index file
+when it grows large. Every command reads the journal, so searches see changes
+at once. `eind service enable` installs it as a login service.
 
-```sh
-eind service enable           # start now and at every login
-eind service disable          # stop and remove it
-eind status                   # shows whether the daemon and the service are set up
-```
+Launchers talk to it over the socket in JSON lines; see
+[docs/protocol.md](docs/protocol.md).
 
-On macOS this installs a launchd agent logging to `~/Library/Logs/eind.log`;
-on Linux a systemd user unit. It starts the `eind` on your `PATH`, so
-upgrading the binary is enough. The Linux packages ship their own unit; use
-one or the other, not both.
+## Limitations
 
-On Linux, inotify needs one watch per directory. The packages raise the limit;
-otherwise run `sudo sysctl fs.inotify.max_user_watches=1048576`.
+- Case-insensitive matching folds ASCII only; `É` and `é` are different letters.
+- Regular expressions are POSIX extended with `\d`, `\w` and `\s` added;
+  non-greedy matching and lookaround are not supported.
+- A folder's own modified time is not refreshed by the watcher; changes below
+  it are.
+- Windows and FreeBSD are not supported.
 
-## More
+## Documentation
 
-- [docs/benchmarks.md](docs/benchmarks.md): eind against `find` and `fd`;
-  typical searches take about 20 ms where `fd` takes seconds
-- [docs/protocol.md](docs/protocol.md): the JSON socket protocol for launchers and GUIs
-- [docs/design.md](docs/design.md): the index format and how it stays fresh
-- [macos/README.md](macos/README.md): the SwiftUI reference client
-
-## Development
-
-```sh
-make test          # go vet + go test -race ./...
-make snapshot      # archives, Linux packages and the Homebrew cask in dist/
-make release       # the same for a tagged commit, published as a GitHub release
-```
-
-## License
-
-MIT, see [LICENSE](LICENSE).
+- [AGENTS.md](AGENTS.md): how to work on the code (start here)
+- [docs/architecture.md](docs/architecture.md): how it works
+- [docs/file-format.md](docs/file-format.md): the index file and journal
+- [docs/protocol.md](docs/protocol.md): the socket protocol
+- [docs/benchmarks.md](docs/benchmarks.md): how to measure, and the baseline
