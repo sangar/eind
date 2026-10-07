@@ -138,7 +138,7 @@ bool parse_range(const char *s, ValueParser parse, time_t now, Range *out, Err *
     return true;
 }
 
-bool parse_int_value(const char *s, time_t now, Range *out, Err *err) {
+static bool parse_int_value(const char *s, time_t now, Range *out, Err *err) {
     (void)now;
     int64_t n;
     if (!parse_int64(s, &n)) {
@@ -179,7 +179,7 @@ bool parse_size_value(const char *s, time_t now, Range *out, Err *err) {
     };
     char buf[128];
     s = trim(buf, sizeof buf, s, true);
-    for (size_t i = 0; i < ARRAY_LEN(named); i++) {
+    for (size_t i = 0; i < countof(named); i++) {
         if (strcmp(s, named[i].name) == 0) {
             *out = named[i].range;
             return true;
@@ -202,7 +202,7 @@ bool parse_size_value(const char *s, time_t now, Range *out, Err *err) {
         return false;
     }
     (void)number_end;
-    for (size_t i = 0; i < ARRAY_LEN(units); i++) {
+    for (size_t i = 0; i < countof(units); i++) {
         if (strcmp(unit, units[i].unit) == 0) {
             int64_t n = (int64_t)(strtod(s, NULL) * (double)units[i].factor);
             *out = (Range){n, n};
@@ -235,12 +235,12 @@ static bool parse_relative(const char *s, time_t now, Range *out) {
     int n = 0;
     while (isdigit((unsigned char)*p)) n = n * 10 + (*p++ - '0');
     static const char *units[] = {"day", "week", "month", "year"};
-    size_t unit = ARRAY_LEN(units);
-    for (size_t i = 0; i < ARRAY_LEN(units); i++) {
+    size_t unit = countof(units);
+    for (size_t i = 0; i < countof(units); i++) {
         size_t len = strlen(units[i]);
         if (strncmp(p, units[i], len) == 0 && (strcmp(p + len, "") == 0 || strcmp(p + len, "s") == 0)) unit = i;
     }
-    if (unit == ARRAY_LEN(units)) return false;
+    if (unit == countof(units)) return false;
     struct tm tm;
     localtime_r(&now, &tm);
     int y = tm.tm_year + 1900, m = tm.tm_mon + 1, d = tm.tm_mday;
@@ -269,7 +269,7 @@ static bool parse_absolute_date(const char *s, Range *out, Err *err) {
         const char *start = p;
         while (*p && *p != '-' && *p != '/' && *p != '.') p++;
         char part[32];
-        size_t len = MIN((size_t)(p - start), sizeof part - 1);
+        size_t len = min_size((size_t)(p - start), sizeof part - 1);
         memcpy(part, start, len);
         part[len] = '\0';
         int64_t v;
@@ -385,6 +385,9 @@ static QueryNode *pair(Parser *p, QueryNode *a, QueryNode *b) {
     return nodes_finish(p, &l, Q_AND);
 }
 
+/* with_filter pairs a node with the file: or folder: filter that preceded it in the same word. */
+static QueryNode *with_filter(Parser *p, QueryNode *filter, QueryNode *n) { return filter ? pair(p, filter, n) : n; }
+
 static const Token *peek(Parser *p) { return p->pos < p->count ? &p->toks[p->pos] : NULL; }
 
 static QueryNode *parse_or(Parser *p);
@@ -450,7 +453,6 @@ static QueryNode *parse_word(Parser *p, const char *w) {
     QueryNode *type_filter = NULL;
     bool mode_set = false, no_wildcards = false;
     const char *rest = w;
-#define WRAP(n) (type_filter ? pair(p, type_filter, (n)) : (n))
     for (;;) {
         const char *colon = strchr(rest, ':');
         if (!colon) break;
@@ -484,29 +486,28 @@ static QueryNode *parse_word(Parser *p, const char *w) {
             type_filter = node_new(p, Q_ISDIR);
             type_filter->dir = true;
         } else if (strcmp(key, "ext") == 0) {
-            return WRAP(ext_node(p, arg));
+            return with_filter(p, type_filter, ext_node(p, arg));
         } else if (strcmp(key, "size") == 0) {
-            return WRAP(range_node(p, Q_SIZE, key, arg, parse_size_value));
+            return with_filter(p, type_filter, range_node(p, Q_SIZE, key, arg, parse_size_value));
         } else if (!strcmp(key, "dm") || !strcmp(key, "datemodified")) {
-            return WRAP(range_node(p, Q_MODIFIED, key, arg, parse_date_value));
+            return with_filter(p, type_filter, range_node(p, Q_MODIFIED, key, arg, parse_date_value));
         } else if (!strcmp(key, "dc") || !strcmp(key, "datecreated")) {
-            return WRAP(range_node(p, Q_CREATED, key, arg, parse_date_value));
+            return with_filter(p, type_filter, range_node(p, Q_CREATED, key, arg, parse_date_value));
         } else if (strcmp(key, "len") == 0) {
-            return WRAP(range_node(p, Q_NAMELEN, key, arg, parse_int_value));
+            return with_filter(p, type_filter, range_node(p, Q_NAMELEN, key, arg, parse_int_value));
         } else if (!strcmp(key, "depth") || !strcmp(key, "parents")) {
-            return WRAP(range_node(p, Q_DEPTH, key, arg, parse_int_value));
+            return with_filter(p, type_filter, range_node(p, Q_DEPTH, key, arg, parse_int_value));
         } else if (!strcmp(key, "parent") || !strcmp(key, "infolder")) {
             QueryNode *n = node_new(p, key[0] == 'p' ? Q_PARENT : Q_INFOLDER);
             n->path = arena_strdup(p->arena, arg);
-            return WRAP(n);
+            return with_filter(p, type_filter, n);
         } else {
             break;
         }
         rest = arg;
     }
     if (!*rest) return type_filter ? type_filter : match_all(p);
-    return WRAP(text_node(p, t, rest, mode_set, no_wildcards));
-#undef WRAP
+    return with_filter(p, type_filter, text_node(p, t, rest, mode_set, no_wildcards));
 }
 
 static QueryNode *parse_unary(Parser *p) {
@@ -576,5 +577,3 @@ QueryNode *query_restrict(Arena *arena, QueryNode *node, const char *path, bool 
     }
     return nodes_finish(&p, &kids, Q_AND);
 }
-
-bool query_is_match_all(const QueryNode *node) { return node->kind == Q_AND && node->kid_count == 0; }

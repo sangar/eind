@@ -83,8 +83,8 @@ static void free_scan(DirScan *d) {
     free(d);
 }
 
-bool scan_tree(SegmentBuilder *b, const char *root, uint32_t parent, const Excludes *ex, ScanProgress progress,
-               void *progress_ctx, ScanResult *result, Err *err) {
+bool scan_tree(ThreadPool *pool, SegmentBuilder *b, const char *root, uint32_t parent, const Excludes *ex,
+               ScanProgress progress, void *progress_ctx, ScanResult *result, Err *err) {
     *result = (ScanResult){.first_id = b->base_id + b->count};
     struct stat st;
     if (lstat(root, &st) != 0) {
@@ -98,7 +98,6 @@ bool scan_tree(SegmentBuilder *b, const char *root, uint32_t parent, const Exclu
         return true;
     }
 
-    ThreadPool *pool = threadpool_io();
     Queue results;
     queue_init(&results);
     threadpool_submit(pool, read_directory, new_scan(xstrdup(root), root_id, ex, &results));

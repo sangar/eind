@@ -1,7 +1,8 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 CC      ?= cc
 CFLAGS  ?= -O2 -g
-CFLAGS  += -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Wshadow -Wno-unused-parameter \
+CFLAGS  += -std=c23 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Werror -Wshadow -Wconversion -Wvla -Wstrict-prototypes \
+           -Wimplicit-fallthrough -Wno-unused-parameter \
            -pthread -DEIND_VERSION='"$(VERSION)"'
 LDLIBS  += -pthread
 

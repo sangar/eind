@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../core/arena.h"
+#include "../core/threadpool.h"
 #include "../index/search.h"
 
 /* How long the input must be idle before a search starts. */
@@ -23,7 +24,7 @@
 
 extern char **environ;
 
-static volatile sig_atomic_t resized;
+static volatile sig_atomic_t resized; // a signal handler can only set a flag; modern-c: allow global-mutable
 
 static void on_winch(int sig) {
     (void)sig;
@@ -39,6 +40,7 @@ static void on_winch(int sig) {
  */
 typedef struct {
     Snapshot *s;
+    ThreadPool *cpu;
     char *input;
     QueryDefaults defaults;
     atomic_int cancel;
@@ -55,7 +57,7 @@ static void *run_search(void *arg) {
     Arena arena;
     arena_init(&arena, 4096);
     QueryNode *node = query_parse(&arena, job->input, job->defaults, &job->err);
-    job->status = node ? search_run(job->s, node, &job->cancel, &job->hits, &job->err) : SEARCH_ERROR;
+    job->status = node ? search_run(job->cpu, job->s, node, &job->cancel, &job->hits, &job->err) : SEARCH_ERROR;
     bool blank = strspn(job->input, " \t") == strlen(job->input);
     /* A blank query lists the whole index; leaving it in index order keeps that instant even for millions. */
     if (job->status == SEARCH_OK && !blank && !atomic_load(&job->cancel))
@@ -79,6 +81,7 @@ static void free_search(Search *job) {
 typedef struct {
     Snapshot *s;
     QueryDefaults defaults;
+    ThreadPool *cpu;
     int tty;
     int wake[2];
     int width, height;
@@ -116,6 +119,7 @@ static void start_search(View *v) {
     cancel_search(v);
     Search *job = xcalloc(1, sizeof *job);
     job->s = v->s;
+    job->cpu = v->cpu;
     job->input = xstrdup(sb_cstr(&v->input));
     job->defaults = v->defaults;
     job->wake_fd = v->wake[1];
@@ -287,13 +291,13 @@ static void draw(View *v) {
         const char *help = "Enter print path  Ctrl-O open  Esc quit ";
         int help_width = (int)strlen(help);
         sb_puts(&frame, "\r\n\x1b[0;7m");
-        int x = put(&frame, status, MAX(v->width - help_width, 0));
+        int x = put(&frame, status, max_int(v->width - help_width, 0));
         pad(&frame, v->width - help_width - x);
-        put(&frame, help, v->width - MAX(x, v->width - help_width));
+        put(&frame, help, v->width - max_int(x, v->width - help_width));
         sb_puts(&frame, "\x1b[0m");
     }
     int cursor = 3 + utf8_count(v->input.data ? v->input.data : "", v->input.len);
-    sb_printf(&frame, "\x1b[1;%dH\x1b[?25h", MIN(cursor, v->width));
+    sb_printf(&frame, "\x1b[1;%dH\x1b[?25h", min_int(cursor, v->width));
     if (write(v->tty, frame.data, frame.len) < 0) {
         /* nothing useful to do when the terminal is gone */
     }
@@ -314,7 +318,7 @@ static int wait_readable(int a, int b, int timeout_ms, bool *a_ready, bool *b_re
     FD_SET(a, &set);
     if (b >= 0) FD_SET(b, &set);
     struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
-    int rc = select(MAX(a, b) + 1, &set, NULL, NULL, timeout_ms < 0 ? NULL : &tv);
+    int rc = select(max_int(a, b) + 1, &set, NULL, NULL, timeout_ms < 0 ? NULL : &tv);
     *a_ready = rc > 0 && FD_ISSET(a, &set);
     if (b_ready) *b_ready = rc > 0 && b >= 0 && FD_ISSET(b, &set);
     return rc;
@@ -365,7 +369,7 @@ static Action escape_sequence(View *v) {
         if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~') break;
     }
     seq[n] = '\0';
-    int page = MAX(v->height - 3, 1);
+    int page = max_int(v->height - 3, 1);
     if (seq[0] == '<') {
         int button, x, y;
         char kind;
@@ -472,6 +476,7 @@ bool tui_run(Snapshot *s, QueryDefaults defaults, char **chosen, Err *err) {
     sigaction(SIGWINCH, &sa, &old_sa);
     query_size(&v);
     sb_cstr(&v.input);
+    v.cpu = threadpool_create(cpu_count());
     start_search(&v);
 
     bool accepted = false;
@@ -482,7 +487,7 @@ bool tui_run(Snapshot *s, QueryDefaults defaults, char **chosen, Err *err) {
         }
         draw(&v);
         int timeout = -1;
-        if (v.settle_at) timeout = (int)MAX(v.settle_at - monotonic_ms(), 0);
+        if (v.settle_at) timeout = (int)max_i64(v.settle_at - monotonic_ms(), 0);
         bool key_ready, search_done;
         if (wait_readable(v.tty, v.wake[0], timeout, &key_ready, &search_done) < 0) continue; /* EINTR from a resize */
         if (v.settle_at && monotonic_ms() >= v.settle_at) {
@@ -530,10 +535,11 @@ bool tui_run(Snapshot *s, QueryDefaults defaults, char **chosen, Err *err) {
     sigaction(SIGWINCH, &old_sa, NULL);
     close(v.tty);
     collect_searches(&v);
-    /* A search still running keeps its snapshot reference and the pipe it reports to; the process is about to exit. */
+    /* A search still running keeps its snapshot, its pool and the pipe it reports to; the process is about to exit. */
     if (v.outstanding == 0) {
         close(v.wake[0]);
         close(v.wake[1]);
+        threadpool_destroy(v.cpu);
     }
     sb_free(&v.input);
     u32vec_free(&v.hits);

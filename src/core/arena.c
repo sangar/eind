@@ -26,7 +26,7 @@ void *arena_alloc(Arena *a, size_t size) {
     size = (size + ARENA_ALIGN - 1) & ~(size_t)(ARENA_ALIGN - 1);
     ArenaBlock *b = a->head;
     if (!b || b->offset + size > b->capacity) {
-        b = new_block(MAX(a->block_size, size));
+        b = new_block(max_size(a->block_size, size));
         b->next = a->head;
         a->head = b;
     }
@@ -61,18 +61,6 @@ char *arena_printf(Arena *a, const char *fmt, ...) {
     vsnprintf(p, (size_t)n + 1, fmt, ap);
     va_end(ap);
     return p;
-}
-
-void arena_reset(Arena *a) {
-    if (!a->head) return;
-    ArenaBlock *b = a->head->next;
-    while (b) {
-        ArenaBlock *next = b->next;
-        free(b);
-        b = next;
-    }
-    a->head->next = NULL;
-    a->head->offset = 0;
 }
 
 void arena_free(Arena *a) {

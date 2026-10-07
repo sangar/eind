@@ -7,10 +7,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../core/threadpool.h"
 #include "../fs/fs.h"
 #include "../fs/scanner.h"
 
-bool stderr_is_terminal(void) { return isatty(STDERR_FILENO); }
+static bool stderr_is_terminal(void) { return isatty(STDERR_FILENO); }
 
 const char *format_duration(double ms, char buf[32]) {
     if (ms < 1000) {
@@ -41,11 +42,12 @@ Snapshot *build_index(const Config *cfg, const char *index_path, Err *err) {
     StrList roots = {0};
     uint32_t unreadable = 0;
     bool tty = stderr_is_terminal();
+    ThreadPool *io = threadpool_create(io_thread_count());
     for (size_t i = 0; i < cfg->roots.len; i++) {
         char *abs = path_abs(cfg->roots.items[i]);
         ScanResult res;
         Err why;
-        if (!scan_tree(&b, abs, NO_PARENT, &ex, tty ? show_progress : NULL, &b, &res, &why)) {
+        if (!scan_tree(io, &b, abs, NO_PARENT, &ex, tty ? show_progress : NULL, &b, &res, &why)) {
             fprintf(stderr, "skipping %s: %s\n", abs, why.msg);
             free(abs);
             continue;
@@ -53,6 +55,7 @@ Snapshot *build_index(const Config *cfg, const char *index_path, Err *err) {
         strlist_push_owned(&roots, abs);
         unreadable += res.errors;
     }
+    threadpool_destroy(io);
     excludes_free(&ex);
     if (roots.len == 0) {
         err_set(err, "none of the configured roots could be read");

@@ -8,8 +8,25 @@ language: `report ext:pdf size:>1mb dm:thisweek !draft`. A daemon keeps the
 index current from filesystem events and answers launchers over a Unix
 socket.
 
-Runs on macOS and Linux. No dependencies beyond a C11 compiler, `make` and
+Runs on macOS and Linux. No dependencies beyond a C23 compiler, `make` and
 pthreads.
+
+## Profile
+
+Modern C Level 1. The language is C23; the compilers are clang 18 or newer
+(primary) and gcc 14 or newer; the targets are macOS on arm64 and x86_64 and
+Linux on x86_64 and aarch64. The build runs with `-Werror` and
+`-Wall -Wextra -Wshadow -Wconversion -Wvla -Wstrict-prototypes
+-Wimplicit-fallthrough`; `make sanitize` runs the tests under AddressSanitizer
+and UndefinedBehaviorSanitizer. The only approved extension is
+`__attribute__((format))`.
+
+Deliberate departures from the profile: POSIX is treated as portable, so OS
+headers and `errno` appear throughout and only the file-event sources are
+isolated in `src/fs/fs_*.c`; errors travel as `bool` plus an `Err` message
+rather than an error enum; the growable containers own heap memory
+individually rather than living in arenas; and two `sig_atomic_t` flags are
+set from signal handlers.
 
 ## Build
 

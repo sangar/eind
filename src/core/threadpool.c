@@ -45,8 +45,6 @@ void threadpool_destroy(ThreadPool *pool) {
     free(pool);
 }
 
-int threadpool_size(const ThreadPool *pool) { return pool->size; }
-
 void threadpool_submit(ThreadPool *pool, void (*fn)(void *arg), void *arg) {
     Task *task = xmalloc(sizeof *task);
     task->fn = fn;
@@ -59,27 +57,12 @@ int cpu_count(void) {
     return n > 0 ? (int)n : 1;
 }
 
-static ThreadPool *cpu_pool, *io_pool;
-static pthread_once_t cpu_once = PTHREAD_ONCE_INIT, io_once = PTHREAD_ONCE_INIT;
-
-static void make_cpu_pool(void) { cpu_pool = threadpool_create(cpu_count()); }
-
 /*
  * Directory reads contend on filesystem locks in the kernel: indexing 150k
  * entries on APFS took 1.0s with 64 threads but 0.37s with 5 or 6, while
  * kernel time fell from 10s to 1.3s. A few threads beat many.
  */
-static void make_io_pool(void) { io_pool = threadpool_create(MIN(cpu_count(), 6)); }
-
-ThreadPool *threadpool_cpu(void) {
-    pthread_once(&cpu_once, make_cpu_pool);
-    return cpu_pool;
-}
-
-ThreadPool *threadpool_io(void) {
-    pthread_once(&io_once, make_io_pool);
-    return io_pool;
-}
+int io_thread_count(void) { return min_int(cpu_count(), 6); }
 
 ParallelPlan parallel_plan(const ThreadPool *pool, size_t n, size_t min_chunk) {
     size_t workers = (size_t)pool->size;
@@ -124,7 +107,7 @@ void threadpool_run_chunks(ThreadPool *pool, ParallelPlan plan,
     ChunkTask *tasks = xmalloc(plan.chunks * sizeof *tasks);
     for (size_t c = 0; c < plan.chunks; c++) {
         size_t lo = c * plan.chunk_size;
-        tasks[c] = (ChunkTask){.batch = &batch, .lo = lo, .hi = MIN(lo + plan.chunk_size, plan.n), .chunk = c};
+        tasks[c] = (ChunkTask){.batch = &batch, .lo = lo, .hi = min_size(lo + plan.chunk_size, plan.n), .chunk = c};
         threadpool_submit(pool, run_chunk, &tasks[c]);
     }
     pthread_mutex_lock(&batch.mu);

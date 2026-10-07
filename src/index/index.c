@@ -5,7 +5,7 @@
 
 #include "journal.h"
 
-Snapshot *snapshot_new(Segment *base, const StrList *roots, int64_t built_at) {
+static Snapshot *snapshot_new(Segment *base, const StrList *roots, int64_t built_at) {
     Snapshot *s = xcalloc(1, sizeof *s);
     atomic_init(&s->refs, 1);
     s->segs = xmalloc(sizeof *s->segs);
@@ -53,7 +53,7 @@ void snapshot_release(Snapshot *s) {
 void snap_path(const Snapshot *s, uint32_t id, StrBuf *sb) {
     uint32_t stack_buf[64];
     uint32_t *chain = stack_buf;
-    size_t n = 0, cap = ARRAY_LEN(stack_buf);
+    size_t n = 0, cap = countof(stack_buf);
     for (uint32_t cur = id;;) {
         if (n == cap) {
             uint32_t *bigger = xmalloc(cap * 2 * sizeof *bigger);

@@ -8,7 +8,7 @@
 static void merge_pass(char *src, char *dst, size_t n, size_t size, size_t width, CompareFn cmp,
                        const void *ctx) {
     for (size_t lo = 0; lo < n; lo += 2 * width) {
-        size_t mid = MIN(lo + width, n), hi = MIN(lo + 2 * width, n);
+        size_t mid = min_size(lo + width, n), hi = min_size(lo + 2 * width, n);
         size_t i = lo, j = mid, k = lo;
         while (i < mid && j < hi) {
             if (cmp(ctx, src + j * size, src + i * size) < 0) {
@@ -40,7 +40,7 @@ void sort_stable(void *base, size_t n, size_t size, CompareFn cmp, const void *c
     enum { RUN = 16 };
     char *a = base;
     char *tmp = xmalloc(size);
-    for (size_t lo = 0; lo < n; lo += RUN) insertion_sort(a + lo * size, MIN(RUN, n - lo), size, cmp, ctx, tmp);
+    for (size_t lo = 0; lo < n; lo += RUN) insertion_sort(a + lo * size, min_size(RUN, n - lo), size, cmp, ctx, tmp);
     free(tmp);
     if (n <= RUN) return;
     char *buf = xmalloc(n * size);
@@ -72,7 +72,7 @@ static void sift_down(char *heap, size_t n, size_t i, size_t size, CompareFn cmp
 size_t sort_top(void *base, size_t n, size_t size, size_t k, CompareFn cmp, const void *ctx) {
     if (k >= n || k * 4 > n) {
         sort_stable(base, n, size, cmp, ctx);
-        return MIN(k, n);
+        return min_size(k, n);
     }
     if (k == 0) return 0;
     char *a = base;

@@ -14,15 +14,16 @@
 #include "core/arena.h"
 #include "core/json.h"
 #include "core/sort.h"
+#include "core/threadpool.h"
 #include "fs/fs.h"
 #include "fs/updater.h"
 #include "index/journal.h"
 #include "index/query.h"
 #include "index/search.h"
 
-static int failures, checks;
+static int failures, checks; // the harness totals; modern-c: allow global-mutable
 
-#define CHECK(cond)                                                                   \
+#define CHECK(cond) /* records the failing line and expression; modern-c: allow function-macro */ \
     do {                                                                              \
         checks++;                                                                     \
         if (!(cond)) {                                                                \
@@ -31,7 +32,7 @@ static int failures, checks;
         }                                                                             \
     } while (0)
 
-#define CHECK_STR(got, want)                                                                     \
+#define CHECK_STR(got, want) /* modern-c: allow function-macro */ \
     do {                                                                                         \
         checks++;                                                                                \
         const char *g_ = (got), *w_ = (want);                                                    \
@@ -90,7 +91,7 @@ static const char *parsed(Arena *a, const char *query, QueryDefaults d) {
     return out;
 }
 
-static char scratch[1024];
+static char scratch[1024]; // the fixture directory; modern-c: allow global-mutable
 
 static void make_file(const char *rel, size_t size) {
     char *path = path_join(scratch, rel);
@@ -116,12 +117,12 @@ static void remove_tree(const char *path) {
 }
 
 /* search_names runs a query and returns the matching base names, sorted by path and joined with spaces. */
-static const char *search_names(Arena *a, const Snapshot *s, const char *query) {
+static const char *search_names(Arena *a, ThreadPool *cpu, const Snapshot *s, const char *query) {
     Err err;
     QueryNode *n = query_parse(a, query, (QueryDefaults){0}, &err);
     if (!n) return arena_printf(a, "error: %s", err.msg);
     U32Vec hits = {0};
-    if (search_run(s, n, NULL, &hits, &err) != SEARCH_OK) return arena_printf(a, "error: %s", err.msg);
+    if (search_run(cpu, s, n, NULL, &hits, &err) != SEARCH_OK) return arena_printf(a, "error: %s", err.msg);
     search_top(s, hits.data, hits.len, SORT_PATH, false, -1);
     StrBuf sb = {0};
     for (size_t i = 0; i < hits.len; i++) sb_printf(&sb, "%s%s", i ? " " : "", path_base(snap_name(s, hits.data[i])));
@@ -205,7 +206,7 @@ static void test_values(void) {
         {"lastyear", 1672531200, 1704067199},  {"last7days", 1709737200, 1710342000},
         {"2023-11", 1698796800, 1701388799},   {"2023/11/05", 1699142400, 1699228799},
     };
-    for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+    for (size_t i = 0; i < countof(cases); i++) {
         bool ok = parse_date_value(cases[i].in, now, &r, &err);
         if (!ok || r.lo != cases[i].lo || r.hi != cases[i].hi)
             fprintf(stderr, "date %s: got [%lld,%lld]\n", cases[i].in, (long long)r.lo, (long long)r.hi);
@@ -281,33 +282,34 @@ static void test_index_search(void) {
     if (!s) return;
     Arena a;
     arena_init(&a, 4096);
-    CHECK_STR(search_names(&a, s, "main"), "main.go main_test.go");
-    CHECK_STR(search_names(&a, s, "ww:main"), "main.go main_test.go");
-    CHECK_STR(search_names(&a, s, "file: ww:test"), "main_test.go");
-    CHECK_STR(search_names(&a, s, "*.go"), "main.go main_test.go");
-    CHECK_STR(search_names(&a, s, "*_????.JPG"), "IMG_0001.JPG");
-    CHECK_STR(search_names(&a, s, "ext:pdf;md"), "Readme.md report_2024.PDF");
-    CHECK_STR(search_names(&a, s, "case:readme"), "");
-    CHECK_STR(search_names(&a, s, "wfn:readme.md"), "Readme.md");
-    CHECK_STR(search_names(&a, s, "regex:_\\d+\\.pdf$"), "report_2024.PDF");
-    CHECK_STR(search_names(&a, s, "size:>1kb"), "main_test.go report_2024.PDF");
-    CHECK_STR(search_names(&a, s, "folder:"), "root docs empty src");
-    CHECK_STR(search_names(&a, s, "main !test"), "main.go");
-    CHECK_STR(search_names(&a, s, "<readme|img> ext:md"), "Readme.md");
-    CHECK_STR(search_names(&a, s, "node_modules"), "");
-    CHECK_STR(search_names(&a, s, "nothing-like-this"), "");
-    CHECK_STR(search_names(&a, s, "path:src/main"), "main.go main_test.go");
-    CHECK_STR(search_names(&a, s, "len:<8"), "docs empty src main.go");
+    ThreadPool *cpu = threadpool_create(cpu_count());
+    CHECK_STR(search_names(&a, cpu,s, "main"), "main.go main_test.go");
+    CHECK_STR(search_names(&a, cpu,s, "ww:main"), "main.go main_test.go");
+    CHECK_STR(search_names(&a, cpu,s, "file: ww:test"), "main_test.go");
+    CHECK_STR(search_names(&a, cpu,s, "*.go"), "main.go main_test.go");
+    CHECK_STR(search_names(&a, cpu,s, "*_????.JPG"), "IMG_0001.JPG");
+    CHECK_STR(search_names(&a, cpu,s, "ext:pdf;md"), "Readme.md report_2024.PDF");
+    CHECK_STR(search_names(&a, cpu,s, "case:readme"), "");
+    CHECK_STR(search_names(&a, cpu,s, "wfn:readme.md"), "Readme.md");
+    CHECK_STR(search_names(&a, cpu,s, "regex:_\\d+\\.pdf$"), "report_2024.PDF");
+    CHECK_STR(search_names(&a, cpu,s, "size:>1kb"), "main_test.go report_2024.PDF");
+    CHECK_STR(search_names(&a, cpu,s, "folder:"), "root docs empty src");
+    CHECK_STR(search_names(&a, cpu,s, "main !test"), "main.go");
+    CHECK_STR(search_names(&a, cpu,s, "<readme|img> ext:md"), "Readme.md");
+    CHECK_STR(search_names(&a, cpu,s, "node_modules"), "");
+    CHECK_STR(search_names(&a, cpu,s, "nothing-like-this"), "");
+    CHECK_STR(search_names(&a, cpu,s, "path:src/main"), "main.go main_test.go");
+    CHECK_STR(search_names(&a, cpu,s, "len:<8"), "docs empty src main.go");
 
     char *docs = path_join(scratch, "root/docs");
-    CHECK_STR(search_names(&a, s, arena_printf(&a, "infolder:%s", docs)), "IMG_0001.JPG Readme.md");
-    CHECK_STR(search_names(&a, s, arena_printf(&a, "parent:%s file:", docs)), "IMG_0001.JPG Readme.md");
+    CHECK_STR(search_names(&a, cpu,s, arena_printf(&a, "infolder:%s", docs)), "IMG_0001.JPG Readme.md");
+    CHECK_STR(search_names(&a, cpu,s, arena_printf(&a, "parent:%s file:", docs)), "IMG_0001.JPG Readme.md");
 
     /* ranking: an exact stem beats a prefix, which beats a word start */
     Err err;
     QueryNode *n = query_parse(&a, "main", (QueryDefaults){0}, &err);
     U32Vec hits = {0};
-    search_run(s, n, NULL, &hits, &err);
+    search_run(cpu, s, n, NULL, &hits, &err);
     size_t kept = search_rank(s, hits.data, hits.len, n, 1);
     CHECK(kept == 1);
     CHECK_STR(snap_name(s, hits.data[0]), "main.go");
@@ -315,10 +317,10 @@ static void test_index_search(void) {
 
     /* keeping a few of many hits by path places the same ones a full sort would */
     n = query_parse(&a, "file:", (QueryDefaults){0}, &err);
-    search_run(s, n, NULL, &hits, &err);
+    search_run(cpu, s, n, NULL, &hits, &err);
     CHECK(search_top(s, hits.data, hits.len, SORT_PATH, false, 1) == 1);
     CHECK_STR(snap_name(s, hits.data[0]), "IMG_0001.JPG");
-    search_run(s, n, NULL, &hits, &err);
+    search_run(cpu, s, n, NULL, &hits, &err);
     search_top(s, hits.data, hits.len, SORT_PATH, true, 1);
     CHECK_STR(snap_name(s, hits.data[0]), "report_2024.PDF");
     u32vec_free(&hits);
@@ -327,9 +329,10 @@ static void test_index_search(void) {
     bool missing;
     Snapshot *loaded = index_load(index_file, &missing, &err);
     CHECK(loaded && loaded->total == s->total);
-    if (loaded) CHECK_STR(search_names(&a, loaded, "report"), "report_2024.PDF");
+    if (loaded) CHECK_STR(search_names(&a, cpu,loaded, "report"), "report_2024.PDF");
     snapshot_release(loaded);
     snapshot_release(s);
+    threadpool_destroy(cpu);
     free(docs);
     free(index_file);
     arena_free(&a);
@@ -347,7 +350,8 @@ static void test_updater_and_compaction(void) {
     Excludes ex;
     Err err;
     excludes_init(&ex, &patterns, &err);
-    Updater *u = updater_new(&ix, &ex);
+    ThreadPool *cpu = threadpool_create(cpu_count()), *io = threadpool_create(io_thread_count());
+    Updater *u = updater_new(io, &ix, &ex);
     Arena a;
     arena_init(&a, 4096);
 
@@ -367,11 +371,11 @@ static void test_updater_and_compaction(void) {
     CHECK(new_dirs.len == 2);
 
     Snapshot *after = index_acquire(&ix);
-    CHECK_STR(search_names(&a, after, "fresh"), "fresh.txt");
-    CHECK_STR(search_names(&a, after, "ext:md;jpg"), "");
-    CHECK_STR(search_names(&a, after, "size:99"), "main.go");
-    CHECK_STR(search_names(&a, after, "folder:"), "root empty new deep src");
-    CHECK_STR(search_names(&a, before, "ext:md;jpg"), "IMG_0001.JPG Readme.md");
+    CHECK_STR(search_names(&a, cpu,after, "fresh"), "fresh.txt");
+    CHECK_STR(search_names(&a, cpu,after, "ext:md;jpg"), "");
+    CHECK_STR(search_names(&a, cpu,after, "size:99"), "main.go");
+    CHECK_STR(search_names(&a, cpu,after, "folder:"), "root empty new deep src");
+    CHECK_STR(search_names(&a, cpu,before, "ext:md;jpg"), "IMG_0001.JPG Readme.md");
 
     /* reconciling an unchanged path changes nothing */
     strlist_clear(&changed);
@@ -382,8 +386,8 @@ static void test_updater_and_compaction(void) {
     Snapshot *merged = index_compact(after, index_file, &err);
     CHECK(merged && merged->seg_count == 1 && merged->dead_count == 0 && merged->total == snap_live_count(after));
     if (merged) {
-        CHECK_STR(search_names(&a, merged, "fresh"), "fresh.txt");
-        CHECK_STR(search_names(&a, merged, "folder:"), "root empty new deep src");
+        CHECK_STR(search_names(&a, cpu,merged, "fresh"), "fresh.txt");
+        CHECK_STR(search_names(&a, cpu,merged, "folder:"), "root empty new deep src");
         snapshot_retain(merged);
         index_publish(&ix, merged);
         updater_reset(u, merged);
@@ -393,7 +397,7 @@ static void test_updater_and_compaction(void) {
         strlist_push(&changed, gone);
         CHECK(updater_apply(u, &changed, NULL));
         Snapshot *latest = index_acquire(&ix);
-        CHECK_STR(search_names(&a, latest, "fresh"), "");
+        CHECK_STR(search_names(&a, cpu,latest, "fresh"), "");
         snapshot_release(latest);
         free(gone);
     }
@@ -406,6 +410,8 @@ static void test_updater_and_compaction(void) {
     free(p2);
     free(docs);
     updater_free(u);
+    threadpool_destroy(cpu);
+    threadpool_destroy(io);
     index_destroy(&ix);
     excludes_free(&ex);
     strlist_free(&patterns);
@@ -460,7 +466,8 @@ static void test_journal(void) {
     Journal *j = journal_open(index_file, s, &err);
     CHECK(j != NULL);
     Excludes ex = {0};
-    Updater *u = updater_new(&ix, &ex);
+    ThreadPool *cpu = threadpool_create(cpu_count()), *io = threadpool_create(io_thread_count());
+    Updater *u = updater_new(io, &ix, &ex);
     Arena a;
     arena_init(&a, 4096);
 
@@ -484,9 +491,9 @@ static void test_journal(void) {
     Snapshot *loaded = index_load(index_file, &missing, &err);
     CHECK(loaded != NULL);
     if (loaded) {
-        CHECK_STR(search_names(&a, loaded, "journaled"), "journaled.txt");
-        CHECK_STR(search_names(&a, loaded, "size:42"), "main.go");
-        CHECK_STR(search_names(&a, loaded, "ext:md;jpg"), "");
+        CHECK_STR(search_names(&a, cpu,loaded, "journaled"), "journaled.txt");
+        CHECK_STR(search_names(&a, cpu,loaded, "size:42"), "main.go");
+        CHECK_STR(search_names(&a, cpu,loaded, "ext:md;jpg"), "");
         CHECK(snap_live_count(loaded) == snap_live_count(updater_snapshot(u)));
         snapshot_release(loaded);
     }
@@ -500,7 +507,7 @@ static void test_journal(void) {
     loaded = index_load(index_file, &missing, &err);
     CHECK(loaded != NULL);
     if (loaded) {
-        CHECK_STR(search_names(&a, loaded, "journaled"), "journaled.txt");
+        CHECK_STR(search_names(&a, cpu,loaded, "journaled"), "journaled.txt");
         Journal *again = journal_open(index_file, loaded, &err);
         CHECK(again && journal_entries(again) == journal_entries(j));
         journal_free(again);
@@ -532,6 +539,8 @@ static void test_journal(void) {
     free(jpath);
     journal_free(j);
     updater_free(u);
+    threadpool_destroy(cpu);
+    threadpool_destroy(io);
     index_destroy(&ix);
     arena_free(&a);
     free(index_file);
@@ -547,7 +556,8 @@ static void test_server(void) {
     char socket_path[64];
     snprintf(socket_path, sizeof socket_path, "/tmp/eind-test-%d.sock", (int)getpid());
     Err err;
-    Server *srv = server_start(&ix, socket_path, index_file, &err);
+    ThreadPool *cpu = threadpool_create(cpu_count());
+    Server *srv = server_start(cpu, &ix, socket_path, index_file, &err);
     CHECK(srv != NULL);
     CHECK(server_running(socket_path));
     Client c;
@@ -572,6 +582,7 @@ static void test_server(void) {
     client_close(&c);
     server_stop(srv);
     CHECK(!server_running(socket_path));
+    threadpool_destroy(cpu);
     index_destroy(&ix);
     free(index_file);
     arena_free(&a);

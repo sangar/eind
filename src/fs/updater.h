@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 
+#include "../core/threadpool.h"
 #include "../core/util.h"
 #include "../index/index.h"
 #include "fs.h"
@@ -17,7 +18,8 @@
 typedef struct Updater Updater;
 
 /* updater_new starts from the index's current snapshot. */
-Updater *updater_new(Index *ix, const Excludes *ex);
+/* updater_new scans directories that appear under the roots on io. */
+Updater *updater_new(ThreadPool *io, Index *ix, const Excludes *ex);
 void updater_free(Updater *u);
 /* updater_reset starts over from a snapshot, as needed after a compaction renumbers ids. */
 void updater_reset(Updater *u, Snapshot *s);

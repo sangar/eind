@@ -8,13 +8,11 @@ typedef struct ThreadPool ThreadPool;
 
 ThreadPool *threadpool_create(int threads);
 void threadpool_destroy(ThreadPool *pool);
-int threadpool_size(const ThreadPool *pool);
 void threadpool_submit(ThreadPool *pool, void (*fn)(void *arg), void *arg);
 
-/* One pool per CPU for searching, and a wider one for blocking filesystem reads. */
-ThreadPool *threadpool_cpu(void);
-ThreadPool *threadpool_io(void);
+/* cpu_count sizes a search pool; io_thread_count caps a scanning pool, since directory reads contend in the kernel. */
 int cpu_count(void);
+int io_thread_count(void);
 
 /*
  * A ParallelPlan splits n items into chunks of at least min_chunk; callers

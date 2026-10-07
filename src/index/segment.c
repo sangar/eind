@@ -127,7 +127,7 @@ static int compare_fold(const char *a, size_t alen, bool atail, const char *b, s
 }
 
 static int compare_raw(const char *a, size_t alen, const char *b, size_t blen) {
-    int c = memcmp(a, b, MIN(alen, blen));
+    int c = memcmp(a, b, min_size(alen, blen));
     return c ? c : (alen > blen) - (alen < blen);
 }
 
@@ -163,15 +163,15 @@ static void path_order(const SegmentBuilder *b, uint32_t *order, uint32_t *new_i
     uint32_t n = b->count;
     uint32_t *start = xcalloc((size_t)n + 2, sizeof *start);
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t p = MIN(b->recs[i].parent, n);
-        start[p + 1] += 1 + (b->recs[i].flags & RECORD_DIR ? 1 : 0);
+        uint32_t p = min_u32(b->recs[i].parent, n);
+        start[p + 1] += (b->recs[i].flags & RECORD_DIR) ? 2u : 1u;
     }
     for (uint32_t k = 1; k < n + 2; k++) start[k] += start[k - 1];
     uint32_t *items = xmalloc(((size_t)start[n + 1] + 1) * sizeof *items);
     uint32_t *fill = xmalloc(((size_t)n + 2) * sizeof *fill);
     memcpy(fill, start, ((size_t)n + 2) * sizeof *fill);
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t p = MIN(b->recs[i].parent, n);
+        uint32_t p = min_u32(b->recs[i].parent, n);
         items[fill[p]++] = i << 1;
         if (b->recs[i].flags & RECORD_DIR) items[fill[p]++] = i << 1 | 1;
     }
@@ -212,6 +212,24 @@ static void put_u32(StrBuf *sb, uint32_t v) { sb_append(sb, (const char *)&v, 4)
 static void pad8(StrBuf *sb) {
     static const char zeros[8] = {0};
     if (sb->len % 8) sb_append(sb, zeros, 8 - sb->len % 8);
+}
+
+/* Sections are laid out one after another; beginning one ends the one before it. */
+typedef struct {
+    uint64_t offs[SECTION_COUNT], lens[SECTION_COUNT];
+    int open; /* the section being written, or -1 */
+} Sections;
+
+static void end_sections(const StrBuf *out, Sections *s) {
+    if (s->open >= 0) s->lens[s->open] = out->len - s->offs[s->open];
+    s->open = -1;
+}
+
+static void begin_section(StrBuf *out, Sections *s, int k) {
+    end_sections(out, s);
+    pad8(out);
+    s->offs[k] = out->len;
+    s->open = k;
 }
 
 static uint32_t clamp_time(int64_t t) { return t < 0 ? 0 : t > UINT32_MAX ? UINT32_MAX : (uint32_t)t; }
@@ -258,34 +276,35 @@ bool segment_write(const char *path, const SegmentBuilder *b, const StrList *roo
     sb_grow(&out, HEADER_SIZE + names.len + (size_t)n * 32 + (size_t)distinct * 4 + 4096);
     out.len = HEADER_SIZE;
     memset(out.data, 0, HEADER_SIZE);
-    uint64_t offs[SECTION_COUNT], lens[SECTION_COUNT];
-#define SECTION(k, code)                       \
-    do {                                       \
-        pad8(&out);                            \
-        offs[k] = out.len;                     \
-        code;                                  \
-        lens[k] = out.len - offs[k];           \
-    } while (0)
-    SECTION(SEC_ROOTS, for (size_t i = 0; i < roots->len; i++) sb_append(&out, roots->items[i], strlen(roots->items[i]) + 1));
-    SECTION(SEC_NAMES, sb_append(&out, names.data ? names.data : "", names.len));
-    SECTION(SEC_NAME_OFF, sb_append(&out, (const char *)name_off.data, (size_t)distinct * 4));
-    SECTION(SEC_NAME_ID, for (uint32_t i = 0; i < n; i++) put_u32(&out, name_id[order[i]]));
-    SECTION(SEC_PARENT, for (uint32_t i = 0; i < n; i++) {
+    Sections sec = {.open = -1};
+    begin_section(&out, &sec, SEC_ROOTS);
+    for (size_t i = 0; i < roots->len; i++) sb_append(&out, roots->items[i], strlen(roots->items[i]) + 1);
+    begin_section(&out, &sec, SEC_NAMES);
+    sb_append(&out, names.data ? names.data : "", names.len);
+    begin_section(&out, &sec, SEC_NAME_OFF);
+    sb_append(&out, (const char *)name_off.data, (size_t)distinct * 4);
+    begin_section(&out, &sec, SEC_NAME_ID);
+    for (uint32_t i = 0; i < n; i++) put_u32(&out, name_id[order[i]]);
+    begin_section(&out, &sec, SEC_PARENT);
+    for (uint32_t i = 0; i < n; i++) {
         uint32_t p = b->recs[order[i]].parent;
         put_u32(&out, p == NO_PARENT ? NO_PARENT : new_id[p]);
-    });
-    SECTION(SEC_SIZE, for (uint32_t i = 0; i < n; i++) sb_append(&out, (const char *)&b->recs[order[i]].size, 8));
-    SECTION(SEC_MODIFIED, for (uint32_t i = 0; i < n; i++) put_u32(&out, clamp_time(b->recs[order[i]].mtime)));
-    SECTION(SEC_CREATED, for (uint32_t i = 0; i < n; i++) put_u32(&out, clamp_time(b->recs[order[i]].ctime)));
-    SECTION(SEC_DIRS, {
-        uint64_t *dirs = xcalloc(bitmap_words(n) + 1, sizeof *dirs);
-        for (uint32_t i = 0; i < n; i++)
-            if (b->recs[order[i]].flags & RECORD_DIR) bit_set(dirs, i);
-        sb_append(&out, (const char *)dirs, bitmap_words(n) * 8);
-        free(dirs);
-    });
-    SECTION(SEC_UNICODE, sb_append(&out, (const char *)unicode, bitmap_words(distinct) * 8));
-#undef SECTION
+    }
+    begin_section(&out, &sec, SEC_SIZE);
+    for (uint32_t i = 0; i < n; i++) sb_append(&out, (const char *)&b->recs[order[i]].size, 8);
+    begin_section(&out, &sec, SEC_MODIFIED);
+    for (uint32_t i = 0; i < n; i++) put_u32(&out, clamp_time(b->recs[order[i]].mtime));
+    begin_section(&out, &sec, SEC_CREATED);
+    for (uint32_t i = 0; i < n; i++) put_u32(&out, clamp_time(b->recs[order[i]].ctime));
+    begin_section(&out, &sec, SEC_DIRS);
+    uint64_t *dirs = xcalloc(bitmap_words(n) + 1, sizeof *dirs);
+    for (uint32_t i = 0; i < n; i++)
+        if (b->recs[order[i]].flags & RECORD_DIR) bit_set(dirs, i);
+    sb_append(&out, (const char *)dirs, bitmap_words(n) * 8);
+    free(dirs);
+    begin_section(&out, &sec, SEC_UNICODE);
+    sb_append(&out, (const char *)unicode, bitmap_words(distinct) * 8);
+    end_sections(&out, &sec);
 
     uint64_t generation = new_generation();
     uint32_t version = SEGMENT_VERSION;
@@ -297,8 +316,8 @@ bool segment_write(const char *path, const SegmentBuilder *b, const StrList *roo
     memcpy(h + 24, &n, 4);
     memcpy(h + 28, &distinct, 4);
     for (int k = 0; k < SECTION_COUNT; k++) {
-        memcpy(h + 32 + 16 * k, &offs[k], 8);
-        memcpy(h + 40 + 16 * k, &lens[k], 8);
+        memcpy(h + 32 + 16 * k, &sec.offs[k], 8);
+        memcpy(h + 40 + 16 * k, &sec.lens[k], 8);
     }
     free(name_id);
     free(order);

@@ -10,6 +10,7 @@
 
 struct Updater {
     Index *ix;
+    ThreadPool *io;
     const Excludes *ex;
     Snapshot *snap;
     IdTable by_parent_name; /* every live record, keyed by (parent id, name) */
@@ -52,7 +53,7 @@ static bool is_dead(const Updater *u, uint32_t id) { return bitmap_test(u->dead,
 static void ensure_dead_capacity(Updater *u) {
     size_t need = bitmap_words(view_total(u)) + 1;
     if (need <= u->dead_words) return;
-    size_t words = MAX(need, u->dead_words * 2);
+    size_t words = max_size(need, u->dead_words * 2);
     u->dead = xrealloc(u->dead, words * sizeof *u->dead);
     memset(u->dead + u->dead_words, 0, (words - u->dead_words) * sizeof *u->dead);
     u->dead_words = words;
@@ -102,9 +103,10 @@ static void build_table(Updater *u) {
 
 /* ---- lifecycle ---- */
 
-Updater *updater_new(Index *ix, const Excludes *ex) {
+Updater *updater_new(ThreadPool *io, Index *ix, const Excludes *ex) {
     Updater *u = xcalloc(1, sizeof *u);
     u->ix = ix;
+    u->io = io;
     u->ex = ex;
     updater_reset(u, index_acquire(ix));
     return u;
@@ -223,7 +225,7 @@ static bool upsert(Updater *u, const char *path, const struct stat *st) {
     if (S_ISDIR(st->st_mode)) {
         ScanResult res;
         Err err;
-        if (!scan_tree(&u->delta, path, parent, u->ex, NULL, NULL, &res, &err)) return false;
+        if (!scan_tree(u->io, &u->delta, path, parent, u->ex, NULL, NULL, &res, &err)) return false;
         absorb(u, res.first_id, res.end_id);
         return res.end_id > res.first_id;
     }

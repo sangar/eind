@@ -23,7 +23,7 @@ bool sort_key_parse(const char *s, SortKey *out, Err *err) {
         {"ext", SORT_EXT},            {"extension", SORT_EXT},      {"relevance", SORT_RELEVANCE},
         {"rank", SORT_RELEVANCE},
     };
-    for (size_t i = 0; i < ARRAY_LEN(keys); i++) {
+    for (size_t i = 0; i < countof(keys); i++) {
         if (strcasecmp(s, keys[i].name) == 0) {
             *out = keys[i].key;
             return true;
@@ -301,6 +301,8 @@ static char *lowered(Arena *a, const char *s, size_t n, bool keep_case) {
 }
 
 static Matcher *compile(Compiled *cc, const Snapshot *s, const QueryNode *n, Err *err);
+/* search_resolve_dir finds the directory record for a path, ignoring case. */
+static bool search_resolve_dir(const Snapshot *s, const char *path, uint32_t *out);
 
 static Matcher *compile_text(Compiled *cc, Matcher *m, const QueryNode *n, Err *err) {
     m->kind = M_TEXT;
@@ -411,9 +413,8 @@ static void scan_chunk(void *arg, size_t lo, size_t hi, size_t chunk) {
     sb_free(&c.path_lower);
 }
 
-static void scan(ScanJob job, size_t n, U32Vec *hits) {
+static void scan(ThreadPool *pool, ScanJob job, size_t n, U32Vec *hits) {
     if (n == 0) return;
-    ThreadPool *pool = threadpool_cpu();
     ParallelPlan plan = parallel_plan(pool, n, MIN_CHUNK);
     job.parts = xcalloc(plan.chunks, sizeof *job.parts);
     threadpool_run_chunks(pool, plan, scan_chunk, &job);
@@ -424,7 +425,8 @@ static void scan(ScanJob job, size_t n, U32Vec *hits) {
     free(job.parts);
 }
 
-SearchStatus search_run(const Snapshot *s, const QueryNode *query, const atomic_int *cancel, U32Vec *hits, Err *err) {
+SearchStatus search_run(ThreadPool *pool, const Snapshot *s, const QueryNode *query, const atomic_int *cancel, U32Vec *hits,
+                        Err *err) {
     Compiled cc = {0};
     arena_init(&cc.arena, 4096);
     cc.root = compile(&cc, s, query, err);
@@ -434,7 +436,7 @@ SearchStatus search_run(const Snapshot *s, const QueryNode *query, const atomic_
     }
     hits->len = 0;
     ScanJob job = {.s = s, .root = cc.root, .cancel = cancel};
-    scan(job, s->total, hits);
+    scan(pool, job, s->total, hits);
     compiled_free(&cc);
     return cancel && atomic_load(cancel) ? SEARCH_CANCELLED : SEARCH_OK;
 }
@@ -625,7 +627,7 @@ static bool find_child_dir(const Snapshot *s, uint32_t parent, const char *lower
     return false;
 }
 
-bool search_resolve_dir(const Snapshot *s, const char *path, uint32_t *out) {
+static bool search_resolve_dir(const Snapshot *s, const char *path, uint32_t *out) {
     char *target = path_abs(path);
     ascii_lower(target, target, strlen(target));
     bool found = false;

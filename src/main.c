@@ -17,6 +17,7 @@
 #include "app/service.h"
 #include "app/tui.h"
 #include "core/arena.h"
+#include "core/threadpool.h"
 #include "index/search.h"
 
 #ifndef EIND_VERSION
@@ -171,13 +172,23 @@ static bool set_flag(const Flag *f, const char *value, bool has_value, char *err
     return false;
 }
 
+/* Globals are the options every command accepts: where the config, index and socket live. */
+typedef struct {
+    const char *config_path, *index_path, *socket_path;
+    char *owned[3];
+} Globals;
+
 /*
- * parse_flags reads flags the way Go's flag package does: -name, --name,
- * -name=value, or -name value for flags that take one; it stops at the first
- * argument that is not a flag and collects the rest as positional.
- * It returns 0 on success, or the exit status to stop with.
+ * parse_flags reads the global flags and the command's own the way Go's
+ * flag package does: -name, --name, -name=value, or -name value for flags
+ * that take one; it stops at the first argument that is not a flag and
+ * collects the rest as positional. It returns 0 on success, or the exit
+ * status to stop with.
  */
-static int parse_flags(const Flag *flags, size_t count, int argc, char **argv, StrList *positional) {
+static int parse_flags(Globals *g, const Flag *flags, size_t count, int argc, char **argv, StrList *positional) {
+    const Flag global[] = {{"config", FLAG_STRING, &g->config_path},
+                           {"index", FLAG_STRING, &g->index_path},
+                           {"socket", FLAG_STRING, &g->socket_path}};
     int i = 0;
     for (; i < argc; i++) {
         const char *a = argv[i];
@@ -193,7 +204,8 @@ static int parse_flags(const Flag *flags, size_t count, int argc, char **argv, S
             print_usage(stdout);
             exit(EXIT_SUCCESS);
         }
-        const Flag *f = find_flag(flags, count, name, len);
+        const Flag *f = find_flag(global, countof(global), name, len);
+        if (!f) f = find_flag(flags, count, name, len);
         char err[300];
         if (!f) {
             snprintf(err, sizeof err, "flag provided but not defined: -%.*s (see eind --help)", (int)len, name);
@@ -220,7 +232,7 @@ static int parse_flags(const Flag *flags, size_t count, int argc, char **argv, S
 static bool takes_value(const char *name) {
     static const char *names[] = {"n", "max-results", "o", "offset", "s", "sort", "path", "color",
                                   "config", "index", "root", "save-interval", "socket"};
-    for (size_t i = 0; i < ARRAY_LEN(names); i++)
+    for (size_t i = 0; i < countof(names); i++)
         if (!strcmp(names[i], name)) return true;
     return false;
 }
@@ -258,11 +270,6 @@ static void split_args(int argc, char **argv, StrList *positional, StrList *flag
     }
 }
 
-typedef struct {
-    const char *config_path, *index_path, *socket_path;
-    char *owned[3];
-} Globals;
-
 static void globals_init(Globals *g) {
     g->owned[0] = config_path();
     g->owned[1] = index_path();
@@ -273,12 +280,8 @@ static void globals_init(Globals *g) {
 }
 
 static void globals_free(Globals *g) {
-    for (size_t i = 0; i < ARRAY_LEN(g->owned); i++) free(g->owned[i]);
+    for (size_t i = 0; i < countof(g->owned); i++) free(g->owned[i]);
 }
-
-#define GLOBAL_FLAGS(g)                                                                                   \
-    {"config", FLAG_STRING, &(g).config_path}, {"index", FLAG_STRING, &(g).index_path},                \
-        {"socket", FLAG_STRING, &(g).socket_path}
 
 /* ---- search ---- */
 
@@ -329,7 +332,6 @@ static int cmd_search(StrList *flag_args, StrList *terms, bool force_tui) {
     globals_init(&g);
     SearchFlags f = {.sort = "path", .color = "auto"};
     const Flag flags[] = {
-        GLOBAL_FLAGS(g),
         {"r", FLAG_BOOL, &f.regex},          {"regex", FLAG_BOOL, &f.regex},
         {"i", FLAG_BOOL, &f.case_sensitive}, {"case", FLAG_BOOL, &f.case_sensitive},
         {"w", FLAG_BOOL, &f.whole_word},     {"whole-word", FLAG_BOOL, &f.whole_word},
@@ -347,7 +349,7 @@ static int cmd_search(StrList *flag_args, StrList *terms, bool force_tui) {
         {"color", FLAG_STRING, &f.color},    {"version", FLAG_BOOL, &f.show_version},
     };
     StrList extra = {0};
-    int rc = parse_flags(flags, ARRAY_LEN(flags), (int)flag_args->len, flag_args->items, &extra);
+    int rc = parse_flags(&g, flags, countof(flags), (int)flag_args->len, flag_args->items, &extra);
     strlist_free(&extra);
     if (rc) {
         globals_free(&g);
@@ -388,8 +390,9 @@ static int cmd_search(StrList *flag_args, StrList *terms, bool force_tui) {
         arena_init(&arena, 4096);
         QueryNode *node = query_parse(&arena, query, defaults, &err);
         U32Vec hits = {0};
-        if (!node || search_run(s, query_restrict(&arena, node, f.path, f.files_only, f.dirs_only), NULL, &hits, &err) !=
-                         SEARCH_OK) {
+        ThreadPool *cpu = threadpool_create(cpu_count());
+        if (!node || search_run(cpu, s, query_restrict(&arena, node, f.path, f.files_only, f.dirs_only), NULL, &hits,
+                                &err) != SEARCH_OK) {
             rc = fail(err.msg);
         } else if (f.count) {
             printf("%zu\n", hits.len);
@@ -397,13 +400,14 @@ static int cmd_search(StrList *flag_args, StrList *terms, bool force_tui) {
             long keep = f.max_results > 0 ? f.offset + f.max_results : -1;
             size_t kept = sort == SORT_RELEVANCE ? search_rank(s, hits.data, hits.len, node, keep)
                                                  : search_top(s, hits.data, hits.len, sort, f.descending, keep);
-            size_t from = MIN((size_t)MAX(f.offset, 0), kept);
+            size_t from = min_size(f.offset > 0 ? (size_t)f.offset : 0, kept);
             size_t count = kept - from;
             if (f.max_results > 0 && (size_t)f.max_results < count) count = (size_t)f.max_results;
             OutputOptions o = output_options(&f);
             if (!output_write_hits(stdout, s, hits.data + from, count, &o) && errno != EPIPE)
                 rc = fail(strerror(errno));
         }
+        threadpool_destroy(cpu);
         u32vec_free(&hits);
         arena_free(&arena);
     }
@@ -419,9 +423,9 @@ static int cmd_index(StrList *args) {
     Globals g;
     globals_init(&g);
     StrList roots = {0};
-    const Flag flags[] = {GLOBAL_FLAGS(g), {"root", FLAG_LIST, &roots}};
+    const Flag flags[] = {{"root", FLAG_LIST, &roots}};
     StrList extra = {0};
-    int rc = parse_flags(flags, ARRAY_LEN(flags), (int)args->len, args->items, &extra);
+    int rc = parse_flags(&g, flags, countof(flags), (int)args->len, args->items, &extra);
     Config cfg;
     Err err;
     if (!rc && !config_load(g.config_path, &cfg, &err)) rc = fail(err.msg);
@@ -445,9 +449,9 @@ static int cmd_daemon(StrList *args, bool serve) {
     Globals g;
     globals_init(&g);
     int interval = 10000;
-    const Flag flags[] = {GLOBAL_FLAGS(g), {"save-interval", FLAG_DURATION, &interval}};
+    const Flag flags[] = {{"save-interval", FLAG_DURATION, &interval}};
     StrList extra = {0};
-    int rc = parse_flags(flags, ARRAY_LEN(flags), (int)args->len, args->items, &extra);
+    int rc = parse_flags(&g, flags, countof(flags), (int)args->len, args->items, &extra);
     if (!rc) {
         DaemonOptions o = {.config_path = g.config_path,
                            .index_path = g.index_path,
@@ -485,9 +489,8 @@ static int cmd_service(StrList *args) {
 static int cmd_status(StrList *args) {
     Globals g;
     globals_init(&g);
-    const Flag flags[] = {GLOBAL_FLAGS(g)};
     StrList extra = {0};
-    int rc = parse_flags(flags, ARRAY_LEN(flags), (int)args->len, args->items, &extra);
+    int rc = parse_flags(&g, NULL, 0, (int)args->len, args->items, &extra);
     strlist_free(&extra);
     if (rc) {
         globals_free(&g);
@@ -562,9 +565,9 @@ static int cmd_config(StrList *args) {
     Globals g;
     globals_init(&g);
     bool initialize = false;
-    const Flag flags[] = {GLOBAL_FLAGS(g), {"init", FLAG_BOOL, &initialize}};
+    const Flag flags[] = {{"init", FLAG_BOOL, &initialize}};
     StrList rest = {0};
-    int rc = parse_flags(flags, ARRAY_LEN(flags), (int)args->len, args->items, &rest);
+    int rc = parse_flags(&g, flags, countof(flags), (int)args->len, args->items, &rest);
     Err err;
     bool created;
     if (rc) {

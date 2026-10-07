@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "../core/threadpool.h"
 #include "../fs/fs.h"
 #include "../fs/updater.h"
 #include "../fs/watcher.h"
@@ -17,7 +18,7 @@
 
 #define POLL_MS 500
 
-static volatile sig_atomic_t stop_requested;
+static volatile sig_atomic_t stop_requested; // a signal handler can only set a flag; modern-c: allow global-mutable
 
 static void on_stop(int sig) {
     (void)sig;
@@ -96,7 +97,7 @@ static bool reload(Index *ix, Updater *u, Journal **j, const char *index_path, E
  * writing. Each command that loads the index replays the journal, which costs
  * about a millisecond per ten thousand changes.
  */
-static size_t compact_after(const Snapshot *s) { return MAX(10000, snap_live_count(s) / 100); }
+static size_t compact_after(const Snapshot *s) { return max_size(10000, snap_live_count(s) / 100); }
 
 bool daemon_run(const DaemonOptions *o, Err *err) {
     Config cfg;
@@ -118,10 +119,13 @@ bool daemon_run(const DaemonOptions *o, Err *err) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    ThreadPool *cpu = NULL;
     Server *srv = NULL;
     if (o->serve) {
-        srv = server_start(&ix, o->socket_path, o->index_path, err);
+        cpu = threadpool_create(cpu_count());
+        srv = server_start(cpu, &ix, o->socket_path, o->index_path, err);
         if (!srv) {
+            threadpool_destroy(cpu);
             index_destroy(&ix);
             excludes_free(&ex);
             return false;
@@ -132,7 +136,8 @@ bool daemon_run(const DaemonOptions *o, Err *err) {
 
     Watcher *w = watcher_open(&initial->roots, err);
     Journal *j = w ? journal_open(o->index_path, initial, err) : NULL;
-    Updater *u = j ? updater_new(&ix, &ex) : NULL;
+    ThreadPool *io = threadpool_create(io_thread_count());
+    Updater *u = j ? updater_new(io, &ix, &ex) : NULL;
     if (w) {
         for (size_t i = 0; i < initial->roots.len; i++) fprintf(stderr, "watching %s\n", initial->roots.items[i]);
         if (watcher_needs_dirs()) watch_dirs(w, initial);
@@ -141,7 +146,7 @@ bool daemon_run(const DaemonOptions *o, Err *err) {
     int64_t next_save = monotonic_ms() + o->save_interval_ms;
     StrList changed = {0}, new_dirs = {0};
     while (ok && !stop_requested) {
-        int wait = (int)MIN(POLL_MS, MAX(next_save - monotonic_ms(), 0));
+        int wait = (int)min_i64(POLL_MS, max_i64(next_save - monotonic_ms(), 0));
         int n = watcher_collect(w, wait, &changed, err);
         if (n < 0) {
             ok = false;
@@ -171,6 +176,8 @@ bool daemon_run(const DaemonOptions *o, Err *err) {
     strlist_free(&new_dirs);
     if (srv) server_stop(srv);
     if (u) updater_free(u);
+    if (cpu) threadpool_destroy(cpu);
+    threadpool_destroy(io);
     journal_free(j);
     watcher_close(w);
     index_destroy(&ix);

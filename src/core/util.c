@@ -34,9 +34,11 @@ void *xrealloc(void *ptr, size_t size) {
     return p;
 }
 
+static char *xstrndup(const char *s, size_t n);
+
 char *xstrdup(const char *s) { return xstrndup(s, strlen(s)); }
 
-char *xstrndup(const char *s, size_t n) {
+static char *xstrndup(const char *s, size_t n) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = '\0';
@@ -137,12 +139,6 @@ void strlist_free(StrList *l) {
 
 void strlist_copy(StrList *dst, const StrList *src) {
     for (size_t i = 0; i < src->len; i++) strlist_push(dst, src->items[i]);
-}
-
-bool strlist_contains(const StrList *l, const char *s) {
-    for (size_t i = 0; i < l->len; i++)
-        if (strcmp(l->items[i], s) == 0) return true;
-    return false;
 }
 
 int64_t monotonic_us(void) {
@@ -357,7 +353,7 @@ const char *human_size(int64_t n, char buf[32]) {
     }
     static const char *suffixes[] = {"KB", "MB", "GB", "TB", "PB"};
     double f = (double)n;
-    for (size_t i = 0; i < ARRAY_LEN(suffixes); i++) {
+    for (size_t i = 0; i < countof(suffixes); i++) {
         f /= 1024;
         if (f < 1024) {
             snprintf(buf, 32, f < 10 ? "%.1f %s" : "%.0f %s", f, suffixes[i]);

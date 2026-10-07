@@ -13,6 +13,5 @@ Snapshot *build_index(const Config *cfg, const char *index_path, Err *err);
 Snapshot *load_or_build(const char *config_path, const char *index_path, Err *err);
 
 const char *format_duration(double ms, char buf[32]);
-bool stderr_is_terminal(void);
 
 #endif

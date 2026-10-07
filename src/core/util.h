@@ -7,19 +7,20 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
-#ifndef MAX
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#endif
+#define countof(a) (sizeof(a) / sizeof((a)[0]))
+
+static inline size_t min_size(size_t a, size_t b) { return a < b ? a : b; }
+static inline size_t max_size(size_t a, size_t b) { return a > b ? a : b; }
+static inline uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
+static inline int min_int(int a, int b) { return a < b ? a : b; }
+static inline int max_int(int a, int b) { return a > b ? a : b; }
+static inline int64_t min_i64(int64_t a, int64_t b) { return a < b ? a : b; }
+static inline int64_t max_i64(int64_t a, int64_t b) { return a > b ? a : b; }
 
 void *xmalloc(size_t size);
 void *xcalloc(size_t count, size_t size);
 void *xrealloc(void *ptr, size_t size);
 char *xstrdup(const char *s);
-char *xstrndup(const char *s, size_t n);
 
 /* Err carries a human readable message up to whoever can report it. */
 typedef struct {
@@ -61,7 +62,6 @@ void strlist_push_owned(StrList *l, char *s);
 void strlist_clear(StrList *l);
 void strlist_free(StrList *l);
 void strlist_copy(StrList *dst, const StrList *src);
-bool strlist_contains(const StrList *l, const char *s);
 
 int64_t monotonic_ms(void);
 double elapsed_ms_since(int64_t start_us);

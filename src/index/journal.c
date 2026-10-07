@@ -83,7 +83,7 @@ static bool read_journal(const char *path, StrBuf *out, Err *err) {
 
 static void set_dead(uint64_t **dead, size_t *words, uint32_t id, uint32_t *dead_count) {
     if (id / 64 >= *words) {
-        size_t grown = MAX(*words * 2, id / 64 + 1);
+        size_t grown = max_size(*words * 2, id / 64 + 1);
         *dead = xrealloc(*dead, grown * sizeof **dead);
         memset(*dead + *words, 0, (grown - *words) * sizeof **dead);
         *words = grown;

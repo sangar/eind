@@ -35,8 +35,11 @@ Run `make test` after every change and `make sanitize` before finishing any
 change that touches memory, threads or the file formats. A full rebuild takes
 about 2 s and an incremental one well under a second, so build often.
 
-Warnings are on (`-Wall -Wextra -Wshadow`) and the build must stay
-warning-free.
+The code is C23 and builds with `-Werror` under `-Wall -Wextra -Wshadow
+-Wconversion -Wvla -Wstrict-prototypes -Wimplicit-fallthrough`, with clang
+as the primary compiler and gcc 14 or newer also supported. The README's
+Profile section states the rules the project follows and the departures it
+has chosen; keep both true.
 
 Never run a manual test against the user's real index. Isolate every run with
 environment variables:
@@ -121,10 +124,14 @@ The code follows a performance-oriented, explicit-ownership style. Match it.
 - **Errors** travel as `bool` or `NULL` plus an `Err *err` filled with
   `err_set` (a message for the user). Allocation failure aborts
   (`xmalloc`, `xcalloc`, `xrealloc`, `xstrdup`).
-- **Threads.** Two pools in `core/threadpool.c`: the CPU pool (one per core)
-  for searches, and the I/O pool (at most 6) for scanning, because directory
-  reads contend on kernel locks (64 threads were 3x slower than 6 on APFS).
-  Cancellation is an `atomic_int` checked every few thousand records.
+- **Threads.** `core/threadpool.c` provides pools; whoever owns the work
+  creates them and passes them down, there are no globals. Searches run on
+  a pool of `cpu_count()` threads and scans on one of `io_thread_count()`,
+  at most 6, because directory reads contend on kernel locks (64 threads
+  were 3x slower than 6 on APFS). `build_index` makes an I/O pool for the
+  build, `daemon_run` makes both for its lifetime, and `tui_run` and the
+  search command make a CPU pool. Cancellation is an `atomic_int` checked
+  every few thousand records.
 - **Hot loops stay simple.** The search scans every record in parallel chunks;
   matchers are compiled once per query. Measure before optimising
   (see [docs/benchmarks.md](docs/benchmarks.md)).

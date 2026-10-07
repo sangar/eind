@@ -24,7 +24,7 @@ static char *home_relative(const char *p) {
  * sandboxed app data, because reading ~/Library/Containers makes macOS ask
  * for permission to "access data from other apps" on every rebuild.
  */
-void config_default_excludes(StrList *out) {
+static void config_default_excludes(StrList *out) {
     strlist_push(out, "node_modules");
     strlist_push(out, ".git");
     strlist_push(out, ".cache");
@@ -41,10 +41,10 @@ void config_default_excludes(StrList *out) {
 #else
     static const char *platform[] = {"~/.local/share/Trash", "/proc", "/dev"};
 #endif
-    for (size_t i = 0; i < ARRAY_LEN(platform); i++) strlist_push(out, platform[i]);
+    for (size_t i = 0; i < countof(platform); i++) strlist_push(out, platform[i]);
 }
 
-void config_default(Config *cfg) {
+static void config_default(Config *cfg) {
     *cfg = (Config){0};
     strlist_push(&cfg->roots, home_dir());
     config_default_excludes(&cfg->excludes);

@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 
+#include "../core/threadpool.h"
 #include "../index/segment.h"
 #include "fs.h"
 
@@ -22,8 +23,8 @@ typedef void (*ScanProgress)(void *ctx, uint32_t added);
  * parallel on the I/O pool; records are appended by this thread alone, so
  * parents always precede their children.
  */
-bool scan_tree(SegmentBuilder *b, const char *root, uint32_t parent, const Excludes *ex, ScanProgress progress,
-               void *progress_ctx, ScanResult *result, Err *err);
+bool scan_tree(ThreadPool *pool, SegmentBuilder *b, const char *root, uint32_t parent, const Excludes *ex,
+               ScanProgress progress, void *progress_ctx, ScanResult *result, Err *err);
 
 /* scan_add_record appends one record for a stat result. */
 uint32_t scan_add_record(SegmentBuilder *b, const char *name, size_t len, uint32_t parent, const struct stat *st);

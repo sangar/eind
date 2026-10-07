@@ -27,8 +27,6 @@ typedef struct Snapshot {
     StrList roots;
 } Snapshot;
 
-/* snapshot_new takes the caller's reference to base. */
-Snapshot *snapshot_new(Segment *base, const StrList *roots, int64_t built_at);
 /* snapshot_derive adds an optional delta segment (taking its reference) and replaces the tombstones. */
 Snapshot *snapshot_derive(const Snapshot *from, Segment *delta, uint64_t *dead, uint32_t dead_count);
 void snapshot_retain(Snapshot *s);

@@ -67,12 +67,10 @@ typedef struct {
 QueryNode *query_parse(Arena *arena, const char *s, QueryDefaults defaults, Err *err);
 /* query_restrict narrows a query to a folder and to files or folders, like --path, --files, --dirs. */
 QueryNode *query_restrict(Arena *arena, QueryNode *node, const char *path, bool files_only, bool dirs_only);
-bool query_is_match_all(const QueryNode *node);
 
 typedef bool (*ValueParser)(const char *s, time_t now, Range *out, Err *err);
 bool parse_range(const char *s, ValueParser parse, time_t now, Range *out, Err *err);
 bool parse_size_value(const char *s, time_t now, Range *out, Err *err);
 bool parse_date_value(const char *s, time_t now, Range *out, Err *err);
-bool parse_int_value(const char *s, time_t now, Range *out, Err *err);
 
 #endif

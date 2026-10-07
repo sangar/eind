@@ -76,7 +76,7 @@ static bool match_from(const char *pattern, const char *p, const char *s) {
             break;
         case '\\':
             if (p[1]) p++;
-            /* fall through */
+            [[fallthrough]];
         default:
             if (*p != *s) return false;
             p++, s++;

@@ -17,8 +17,6 @@ typedef struct {
     StrList excludes;
 } Config;
 
-void config_default(Config *cfg);
-void config_default_excludes(StrList *out);
 void config_free(Config *cfg);
 /* config_load falls back to the defaults when the file does not exist. */
 bool config_load(const char *path, Config *cfg, Err *err);

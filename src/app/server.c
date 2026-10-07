@@ -24,6 +24,7 @@ typedef struct Conn Conn;
 
 struct Server {
     Index *ix;
+    ThreadPool *cpu;
     char *index_path;
     char *socket_path;
     int listen_fd;
@@ -180,7 +181,7 @@ static void handle_search(Request *r) {
 
     Snapshot *s = index_acquire(r->conn->srv->ix);
     U32Vec hits = {0};
-    SearchStatus status = search_run(s, node, &r->cancel, &hits, &err);
+    SearchStatus status = search_run(r->conn->srv->cpu, s, node, &r->cancel, &hits, &err);
     if (status == SEARCH_CANCELLED) {
         send_cancelled(r->conn, body);
     } else if (status == SEARCH_ERROR) {
@@ -188,7 +189,7 @@ static void handle_search(Request *r) {
     } else {
         size_t total = hits.len;
         double offset_value = json_number(body, "offset", 0);
-        size_t offset = offset_value > 0 ? MIN((size_t)offset_value, total) : 0;
+        size_t offset = offset_value > 0 ? min_size((size_t)offset_value, total) : 0;
         long limit = (long)json_number(body, "limit", DEFAULT_LIMIT);
         size_t kept = 0;
         if (limit != 0) {
@@ -196,7 +197,7 @@ static void handle_search(Request *r) {
             kept = sort == SORT_RELEVANCE ? search_rank(s, hits.data, total, node, keep)
                                           : search_top(s, hits.data, total, sort, json_bool(body, "descending"), keep);
         }
-        size_t from = MIN(offset, kept);
+        size_t from = min_size(offset, kept);
         size_t count = kept - from;
         if (limit >= 0 && (size_t)limit < count) count = (size_t)limit;
         if (atomic_load(&r->cancel)) {
@@ -377,11 +378,12 @@ static int listen_unix(const char *path, Err *err) {
     return fd;
 }
 
-Server *server_start(Index *ix, const char *socket_path, const char *index_path, Err *err) {
+Server *server_start(ThreadPool *cpu, Index *ix, const char *socket_path, const char *index_path, Err *err) {
     int fd = listen_unix(socket_path, err);
     if (fd < 0) return NULL;
     Server *srv = xcalloc(1, sizeof *srv);
     srv->ix = ix;
+    srv->cpu = cpu;
     srv->index_path = xstrdup(index_path);
     srv->socket_path = xstrdup(socket_path);
     srv->listen_fd = fd;
