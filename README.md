@@ -21,6 +21,7 @@ cp eind ~/.local/bin/      # or anywhere on your PATH
 ```
 
 A small SwiftUI client of the daemon for macOS lives in [macos/](macos/README.md).
+Coming from the Go version? See [docs/migration.md](docs/migration.md).
 
 ## Quick start
 
