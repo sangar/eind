@@ -68,6 +68,8 @@ double elapsed_ms_since(int64_t start_us);
 int64_t monotonic_us(void);
 
 void ascii_lower(char *dst, const char *src, size_t n);
+/* ascii_casecmp orders two strings as comparing their ASCII-lowercased bytes would. */
+int ascii_casecmp(const char *a, size_t alen, const char *b, size_t blen);
 bool has_prefix(const char *s, const char *prefix);
 bool has_suffix(const char *s, const char *suffix);
 bool parse_int64(const char *s, int64_t *out);

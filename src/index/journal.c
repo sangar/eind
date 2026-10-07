@@ -110,8 +110,7 @@ Snapshot *journal_replay(Snapshot *s, const char *path, Err *err) {
         sb_free(&data);
         return s;
     }
-    Segment *base = s->segs[0];
-    FileRecord *base_recs = base->owned_recs; /* decoded on load, so a fresh snapshot may still change them */
+    Segment *base = s->segs[0]; /* unpublished, so the journal may still change its records */
     SegmentBuilder added;
     builder_init(&added, s->total);
     size_t words = bitmap_words(s->total) + 1;
@@ -142,10 +141,15 @@ Snapshot *journal_replay(Snapshot *s, const char *path, Err *err) {
             set_dead(&dead, &words, id, &dead_count);
             continue;
         }
-        FileRecord *r = id < base->count ? &base_recs[id] : &added.recs[id - added.base_id];
-        r->size = get_i64(e + 5);
-        r->mtime = get_i64(e + 13);
-        r->ctime = get_i64(e + 21);
+        int64_t size = get_i64(e + 5), mtime = get_i64(e + 13), ctime = get_i64(e + 21);
+        if (id < base->count) {
+            segment_set_times(base, id, size, mtime, ctime);
+        } else {
+            FileRecord *r = &added.recs[id - added.base_id];
+            r->size = size;
+            r->mtime = mtime;
+            r->ctime = ctime;
+        }
     }
     sb_free(&data);
     if (corrupt) {
@@ -210,14 +214,14 @@ static void put_i64(StrBuf *sb, int64_t v) { sb_append(sb, (const char *)&v, 8);
  */
 void journal_record(Journal *j, const Snapshot *before, const Snapshot *after) {
     for (uint32_t id = before->total; id < after->total; id++) {
-        const FileRecord *r = snap_record(after, id);
+        FileRecord r = snap_record(after, id);
         sb_putc(&j->pending, OP_ADD);
-        put_u32(&j->pending, r->parent);
-        put_i64(&j->pending, r->size);
-        put_i64(&j->pending, r->mtime);
-        put_i64(&j->pending, r->ctime);
-        sb_putc(&j->pending, record_is_dir(r) ? 1 : 0);
-        uint16_t len = (uint16_t)r->name_len;
+        put_u32(&j->pending, r.parent);
+        put_i64(&j->pending, r.size);
+        put_i64(&j->pending, r.mtime);
+        put_i64(&j->pending, r.ctime);
+        sb_putc(&j->pending, record_is_dir(&r) ? 1 : 0);
+        uint16_t len = (uint16_t)r.name_len;
         sb_append(&j->pending, (const char *)&len, 2);
         sb_append(&j->pending, snap_name(after, id), len);
         j->entries++;

@@ -101,8 +101,12 @@ change.
 6. **Only one daemon writes.** The daemon appends to the journal; every command
    only reads. Commands never talk to the daemon; they load the file and
    replay the journal.
-7. **The base segment's records are decoded copies**, owned by the segment;
-   names stay in the read-only mapping. Never write to the mapping.
+7. **The base segment reads the mapping in place.** Its columns and names
+   point into the read-only mapping of the file and are read through the
+   `snap_*` accessors; nothing is decoded on load, so a command pays only
+   for the pages its query touches. Never write to the mapping. The one
+   mutable part is the overlay of sizes and times that `journal_replay`
+   sets through `segment_set_times` before the segment is published.
 
 ## Conventions
 

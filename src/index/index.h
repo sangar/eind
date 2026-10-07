@@ -39,19 +39,54 @@ static inline const Segment *snap_segment(const Snapshot *s, uint32_t id) {
     return s->segs[0];
 }
 
-static inline const FileRecord *snap_record(const Snapshot *s, uint32_t id) {
-    const Segment *seg = snap_segment(s, id);
-    return &seg->recs[id - seg->base_id];
-}
-
+/* One field at a time, so a query touches only the columns it reads. */
 static inline const char *snap_name(const Snapshot *s, uint32_t id) {
     const Segment *seg = snap_segment(s, id);
-    return seg->names + seg->recs[id - seg->base_id].name_off;
+    return seg_name(seg, id - seg->base_id);
 }
 
-static inline const char *snap_lower(const Snapshot *s, uint32_t id) {
+static inline uint32_t snap_name_len(const Snapshot *s, uint32_t id) {
     const Segment *seg = snap_segment(s, id);
-    return seg->lower + seg->recs[id - seg->base_id].name_off;
+    return seg_name_len(seg, id - seg->base_id);
+}
+
+static inline uint32_t snap_parent(const Snapshot *s, uint32_t id) {
+    const Segment *seg = snap_segment(s, id);
+    return seg_parent(seg, id - seg->base_id);
+}
+
+static inline bool snap_is_dir(const Snapshot *s, uint32_t id) {
+    const Segment *seg = snap_segment(s, id);
+    return seg_is_dir(seg, id - seg->base_id);
+}
+
+static inline int64_t snap_size(const Snapshot *s, uint32_t id) {
+    const Segment *seg = snap_segment(s, id);
+    return seg_size(seg, id - seg->base_id);
+}
+
+static inline int64_t snap_mtime(const Snapshot *s, uint32_t id) {
+    const Segment *seg = snap_segment(s, id);
+    return seg_mtime(seg, id - seg->base_id);
+}
+
+static inline int64_t snap_ctime(const Snapshot *s, uint32_t id) {
+    const Segment *seg = snap_segment(s, id);
+    return seg_ctime(seg, id - seg->base_id);
+}
+
+/* snap_record assembles the whole record, for callers that print or copy it. */
+static inline FileRecord snap_record(const Snapshot *s, uint32_t id) {
+    const Segment *seg = snap_segment(s, id);
+    uint32_t i = id - seg->base_id;
+    if (seg->recs) return seg->recs[i];
+    return (FileRecord){.parent = seg_parent(seg, i),
+                        .name_off = seg->col.name_off[seg->col.name_id[i]],
+                        .name_len = seg_name_len(seg, i),
+                        .flags = seg_is_dir(seg, i) ? RECORD_DIR : 0,
+                        .size = seg_size(seg, i),
+                        .mtime = seg_mtime(seg, i),
+                        .ctime = seg_ctime(seg, i)};
 }
 
 static inline bool bitmap_test(const uint64_t *bits, uint32_t id) { return bits[id >> 6] >> (id & 63) & 1; }
@@ -63,7 +98,7 @@ static inline bool record_is_dir(const FileRecord *r) { return r->flags & RECORD
 
 /* snap_path writes the absolute path of id into sb, replacing its contents. */
 void snap_path(const Snapshot *s, uint32_t id, StrBuf *sb);
-/* snap_ext returns the lowercased extension without the dot, or "". */
+/* snap_ext returns the extension as written, without the dot, or ""; compare it ignoring ASCII case. */
 const char *snap_ext(const Snapshot *s, uint32_t id, size_t *len);
 void snap_stats(const Snapshot *s, int64_t *files, int64_t *dirs);
 uint32_t snap_live_count(const Snapshot *s);

@@ -11,12 +11,14 @@ size, modified and created times. A record's id is its position. Parents
 always have smaller ids than their children, so a full path is rebuilt by
 walking up the parents (`index.c: snap_path`) and is never stored.
 
-**Segments.** A `Segment` is an immutable array of records plus their names
-and the same names ASCII-lowercased. Two kinds exist:
+**Segments.** A `Segment` is an immutable set of records plus their names,
+read one field at a time through the `snap_*` accessors in `index.h`. Two
+kinds exist:
 
 - the **base segment**, loaded from the index file (`segment.c: segment_open`):
-  its records are decoded from the file's columns into an owned array; its
-  names point into the read-only mapping of the file;
+  its columns and names are read in place from the read-only mapping of the
+  file, so a command faults in only the pages its query touches; sizes and
+  times the journal has replaced live in a small overlay beside them;
 - **delta segments**, built in memory from a `SegmentBuilder` by the daemon,
   one per batch of filesystem changes (`segment_from_builder`).
 

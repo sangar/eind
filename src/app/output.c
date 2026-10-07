@@ -5,14 +5,13 @@
 #include "../core/json.h"
 
 void record_of(const Snapshot *s, uint32_t id, OutRecord *rec, StrBuf *path) {
-    const FileRecord *r = snap_record(s, id);
     snap_path(s, id, path);
     *rec = (OutRecord){.path = path->data,
                        .name = snap_name(s, id),
-                       .dir = record_is_dir(r),
-                       .size = r->size,
-                       .mtime = r->mtime,
-                       .ctime = r->ctime};
+                       .dir = snap_is_dir(s, id),
+                       .size = snap_size(s, id),
+                       .mtime = snap_mtime(s, id),
+                       .ctime = snap_ctime(s, id)};
 }
 
 void record_json(StrBuf *sb, const OutRecord *r) {

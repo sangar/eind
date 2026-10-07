@@ -63,12 +63,22 @@ char *arena_printf(Arena *a, const char *fmt, ...) {
     return p;
 }
 
-void arena_free(Arena *a) {
-    ArenaBlock *b = a->head;
+static void free_blocks(ArenaBlock *b) {
     while (b) {
         ArenaBlock *next = b->next;
         free(b);
         b = next;
     }
+}
+
+void arena_reset(Arena *a) {
+    if (!a->head) return;
+    free_blocks(a->head->next);
+    a->head->next = NULL;
+    a->head->offset = 0;
+}
+
+void arena_free(Arena *a) {
+    free_blocks(a->head);
     a->head = NULL;
 }

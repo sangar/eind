@@ -13,14 +13,14 @@ Snapshot *index_compact(const Snapshot *s, const char *path, Err *err) {
     SegmentBuilder b;
     builder_init(&b, 0);
     for (uint32_t id = 0; id < s->total; id++) {
-        const FileRecord *r = snap_record(s, id);
-        bool dead = !snap_live(s, id) || (r->parent != NO_PARENT && remap[r->parent] == NO_PARENT);
+        FileRecord r = snap_record(s, id);
+        bool dead = !snap_live(s, id) || (r.parent != NO_PARENT && remap[r.parent] == NO_PARENT);
         if (dead) {
             remap[id] = NO_PARENT;
             continue;
         }
-        uint32_t parent = r->parent == NO_PARENT ? NO_PARENT : remap[r->parent];
-        remap[id] = builder_add(&b, snap_name(s, id), r->name_len, parent, r->size, r->mtime, r->ctime, r->flags);
+        uint32_t parent = r.parent == NO_PARENT ? NO_PARENT : remap[r.parent];
+        remap[id] = builder_add(&b, snap_name(s, id), r.name_len, parent, r.size, r.mtime, r.ctime, r.flags);
     }
     free(remap);
 

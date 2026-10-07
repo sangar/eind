@@ -6,7 +6,8 @@
 
 /*
  * An Arena hands out memory for objects that die together: a scanned
- * directory, a parsed query, a request. arena_free discards everything at once.
+ * directory, a parsed query, a request. arena_reset discards everything at
+ * once and keeps one block for reuse; arena_free returns it all.
  */
 typedef struct ArenaBlock {
     struct ArenaBlock *next;
@@ -26,6 +27,7 @@ void *arena_calloc(Arena *a, size_t count, size_t size);
 char *arena_strndup(Arena *a, const char *s, size_t n);
 char *arena_strdup(Arena *a, const char *s);
 char *arena_printf(Arena *a, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void arena_reset(Arena *a);
 void arena_free(Arena *a);
 
 #endif

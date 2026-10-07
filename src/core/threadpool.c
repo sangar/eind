@@ -7,11 +7,6 @@
 #include "queue.h"
 #include "util.h"
 
-typedef struct {
-    void (*fn)(void *arg);
-    void *arg;
-} Task;
-
 struct ThreadPool {
     Queue tasks;
     pthread_t *threads;
@@ -21,10 +16,7 @@ struct ThreadPool {
 static void *worker(void *arg) {
     ThreadPool *pool = arg;
     Task *task;
-    while ((task = queue_pop(&pool->tasks)) != NULL) {
-        task->fn(task->arg);
-        free(task);
-    }
+    while ((task = queue_pop(&pool->tasks)) != NULL) task->fn(task->arg);
     return NULL;
 }
 
@@ -45,12 +37,7 @@ void threadpool_destroy(ThreadPool *pool) {
     free(pool);
 }
 
-void threadpool_submit(ThreadPool *pool, void (*fn)(void *arg), void *arg) {
-    Task *task = xmalloc(sizeof *task);
-    task->fn = fn;
-    task->arg = arg;
-    queue_push(&pool->tasks, task);
-}
+void threadpool_submit(ThreadPool *pool, Task *task) { queue_push(&pool->tasks, task); }
 
 int cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -81,6 +68,7 @@ typedef struct {
 } Batch;
 
 typedef struct {
+    Task task;
     Batch *batch;
     size_t lo, hi, chunk;
 } ChunkTask;
@@ -107,8 +95,12 @@ void threadpool_run_chunks(ThreadPool *pool, ParallelPlan plan,
     ChunkTask *tasks = xmalloc(plan.chunks * sizeof *tasks);
     for (size_t c = 0; c < plan.chunks; c++) {
         size_t lo = c * plan.chunk_size;
-        tasks[c] = (ChunkTask){.batch = &batch, .lo = lo, .hi = min_size(lo + plan.chunk_size, plan.n), .chunk = c};
-        threadpool_submit(pool, run_chunk, &tasks[c]);
+        tasks[c] = (ChunkTask){.task = {run_chunk, &tasks[c]},
+                               .batch = &batch,
+                               .lo = lo,
+                               .hi = min_size(lo + plan.chunk_size, plan.n),
+                               .chunk = c};
+        threadpool_submit(pool, &tasks[c].task);
     }
     pthread_mutex_lock(&batch.mu);
     while (batch.remaining > 0) pthread_cond_wait(&batch.done, &batch.mu);

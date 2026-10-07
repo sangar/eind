@@ -223,21 +223,22 @@ static void pad(StrBuf *frame, int n) {
 }
 
 static void draw_row(View *v, StrBuf *frame, uint32_t id, bool selected) {
-    const FileRecord *r = snap_record(v->s, id);
+    bool is_dir = snap_is_dir(v->s, id);
     char size[32], when[32], meta[64];
-    format_short_time(r->mtime, when);
-    snprintf(meta, sizeof meta, "%9s  %s", record_is_dir(r) ? "" : human_size(r->size, size), when);
+    format_short_time(snap_mtime(v->s, id), when);
+    snprintf(meta, sizeof meta, "%9s  %s", is_dir ? "" : human_size(snap_size(v->s, id), size), when);
     int meta_width = (int)strlen(meta) + 1;
     const char *base = selected ? "\x1b[0;7m" : "\x1b[0m";
     sb_puts(frame, base);
-    if (record_is_dir(r)) sb_puts(frame, "\x1b[1;34m");
+    if (is_dir) sb_puts(frame, "\x1b[1;34m");
     int x = put(frame, " ", v->width);
     x += put(frame, snap_name(v->s, id), v->width - x);
     sb_puts(frame, base);
     int available = v->width - x - meta_width - 2;
-    if (r->parent != NO_PARENT && available > 4) {
+    uint32_t parent = snap_parent(v->s, id);
+    if (parent != NO_PARENT && available > 4) {
         StrBuf dir = {0};
-        snap_path(v->s, r->parent, &dir);
+        snap_path(v->s, parent, &dir);
         int len = utf8_count(dir.data, dir.len);
         sb_puts(frame, "\x1b[2m");
         x += put(frame, "  ", 2);

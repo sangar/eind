@@ -26,8 +26,13 @@ struct Updater {
 
 /* ---- a view over the snapshot plus the delta under construction ---- */
 
-static const FileRecord *view_record(const Updater *u, uint32_t id) {
-    return id < u->snap->total ? snap_record(u->snap, id) : &u->delta.recs[id - u->delta.base_id];
+static FileRecord view_record(const Updater *u, uint32_t id) {
+    return id < u->snap->total ? snap_record(u->snap, id) : u->delta.recs[id - u->delta.base_id];
+}
+
+static bool view_is_dir(const Updater *u, uint32_t id) {
+    FileRecord r = view_record(u, id);
+    return record_is_dir(&r);
 }
 
 static const char *view_name(const Updater *u, uint32_t id) {
@@ -38,7 +43,7 @@ static uint32_t view_total(const Updater *u) { return u->delta.base_id + u->delt
 
 static void view_path(const Updater *u, uint32_t id, StrBuf *out) {
     U32Vec chain = {0};
-    for (uint32_t cur = id; cur != NO_PARENT; cur = view_record(u, cur)->parent) u32vec_push(&chain, cur);
+    for (uint32_t cur = id; cur != NO_PARENT; cur = view_record(u, cur).parent) u32vec_push(&chain, cur);
     sb_clear(out);
     for (size_t k = chain.len; k-- > 0;) {
         if (out->len > 0 && out->data[out->len - 1] != '/') sb_putc(out, '/');
@@ -65,8 +70,8 @@ static uint64_t key_hash(uint32_t parent, const char *name, size_t len) { return
 
 static uint64_t rehash_record(void *ctx, uint32_t id) {
     const Updater *u = ctx;
-    const FileRecord *r = view_record(u, id);
-    return key_hash(r->parent, view_name(u, id), r->name_len);
+    FileRecord r = view_record(u, id);
+    return key_hash(r.parent, view_name(u, id), r.name_len);
 }
 
 typedef struct {
@@ -78,8 +83,8 @@ typedef struct {
 
 static bool key_equal(void *ctx, uint32_t id) {
     const Key *k = ctx;
-    const FileRecord *r = view_record(k->u, id);
-    return r->parent == k->parent && r->name_len == k->len && memcmp(view_name(k->u, id), k->name, k->len) == 0;
+    FileRecord r = view_record(k->u, id);
+    return r.parent == k->parent && r.name_len == k->len && memcmp(view_name(k->u, id), k->name, k->len) == 0;
 }
 
 static void table_insert(Updater *u, uint32_t id) { idtable_insert(&u->by_parent_name, rehash_record(u, id), id, rehash_record, u); }
@@ -167,7 +172,7 @@ static void tombstone(Updater *u, uint32_t id) {
     bitmap_set(u->dead, id);
     u->dead_count++;
     table_remove(u, id);
-    if (record_is_dir(view_record(u, id))) u->removed_dir = true;
+    if (view_is_dir(u, id)) u->removed_dir = true;
 }
 
 static bool remove_path(Updater *u, const char *path) {
@@ -186,7 +191,7 @@ static void absorb(Updater *u, uint32_t first, uint32_t end) {
     StrBuf path = {0};
     for (uint32_t id = first; id < end; id++) {
         table_insert(u, id);
-        if (u->new_dirs && record_is_dir(view_record(u, id))) {
+        if (u->new_dirs && view_is_dir(u, id)) {
             view_path(u, id, &path);
             strlist_push(u->new_dirs, path.data);
         }
@@ -199,11 +204,11 @@ static bool reconcile(Updater *u, const char *raw_path);
 static bool upsert(Updater *u, const char *path, const struct stat *st) {
     uint32_t id;
     if (lookup(u, path, &id)) {
-        const FileRecord *r = view_record(u, id);
-        if (record_is_dir(r) == S_ISDIR(st->st_mode)) {
+        FileRecord r = view_record(u, id);
+        if (record_is_dir(&r) == S_ISDIR(st->st_mode)) {
             /* A directory's own size and times are not tracked; its children report their changes. */
-            if (S_ISDIR(st->st_mode) || same_metadata(r, st)) return false;
-            uint32_t parent = r->parent;
+            if (S_ISDIR(st->st_mode) || same_metadata(&r, st)) return false;
+            uint32_t parent = r.parent;
             char *name = xstrdup(view_name(u, id));
             tombstone(u, id);
             uint32_t fresh = scan_add_record(&u->delta, name, strlen(name), parent, st);
@@ -259,7 +264,7 @@ static bool reconcile(Updater *u, const char *raw_path) {
 static void drop_orphans(Updater *u) {
     uint32_t total = view_total(u);
     for (uint32_t id = 0; id < total; id++) {
-        uint32_t parent = view_record(u, id)->parent;
+        uint32_t parent = view_record(u, id).parent;
         if (parent != NO_PARENT && !is_dead(u, id) && is_dead(u, parent)) tombstone(u, id);
     }
 }

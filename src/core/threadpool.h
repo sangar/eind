@@ -6,9 +6,16 @@
 /* ThreadPool runs tasks on a fixed set of worker threads. */
 typedef struct ThreadPool ThreadPool;
 
+/* A Task lives in the caller's memory, usually inside the work item it runs on. */
+typedef struct {
+    void (*fn)(void *arg);
+    void *arg;
+} Task;
+
 ThreadPool *threadpool_create(int threads);
 void threadpool_destroy(ThreadPool *pool);
-void threadpool_submit(ThreadPool *pool, void (*fn)(void *arg), void *arg);
+/* threadpool_submit queues a task; the caller keeps it alive until fn has run. */
+void threadpool_submit(ThreadPool *pool, Task *task);
 
 /* cpu_count sizes a search pool; io_thread_count caps a scanning pool, since directory reads contend in the kernel. */
 int cpu_count(void);

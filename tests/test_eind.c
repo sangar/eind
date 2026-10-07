@@ -498,8 +498,26 @@ static void test_journal(void) {
         snapshot_release(loaded);
     }
 
-    /* a half-written last entry is ignored, and the next writer cuts it off */
+    /* an update entry, which other implementations write, replaces a base record's size and times */
     char *jpath = path_join(scratch, "../index.bin.journal");
+    {
+        QueryNode *q = query_parse(&a, "wfn:main_test.go", (QueryDefaults){0}, &err);
+        U32Vec hits = {0};
+        search_run(cpu, updater_snapshot(u), q, NULL, &hits, &err);
+        CHECK(hits.len == 1 && hits.data[0] < updater_snapshot(u)->segs[0]->count);
+        char entry[29] = {'U'};
+        int64_t value = 77;
+        memcpy(entry + 1, &hits.data[0], 4);
+        memcpy(entry + 5, &value, 8);
+        memcpy(entry + 13, &value, 8);
+        memcpy(entry + 21, &value, 8);
+        FILE *uf = fopen(jpath, "ab");
+        fwrite(entry, 1, sizeof entry, uf);
+        fclose(uf);
+        u32vec_free(&hits);
+    }
+
+    /* a half-written last entry is ignored, and the next writer cuts it off */
     FILE *f = fopen(jpath, "ab");
     fputc('A', f);
     fputc(3, f);
@@ -507,9 +525,10 @@ static void test_journal(void) {
     loaded = index_load(index_file, &missing, &err);
     CHECK(loaded != NULL);
     if (loaded) {
-        CHECK_STR(search_names(&a, cpu,loaded, "journaled"), "journaled.txt");
+        CHECK_STR(search_names(&a, cpu, loaded, "journaled"), "journaled.txt");
+        CHECK_STR(search_names(&a, cpu, loaded, "size:77"), "main_test.go");
         Journal *again = journal_open(index_file, loaded, &err);
-        CHECK(again && journal_entries(again) == journal_entries(j));
+        CHECK(again && journal_entries(again) == journal_entries(j) + 1);
         journal_free(again);
         snapshot_release(loaded);
     }
@@ -518,6 +537,7 @@ static void test_journal(void) {
     loaded = index_load(index_file, &missing, &err);
     Snapshot *rewritten = loaded ? index_compact(loaded, index_file, &err) : NULL;
     CHECK(rewritten != NULL);
+    if (rewritten) CHECK_STR(search_names(&a, cpu, rewritten, "size:77"), "main_test.go");
     make_file("root/late.txt", 1);
     char *p3 = path_join(scratch, "root/late.txt");
     strlist_clear(&changed);

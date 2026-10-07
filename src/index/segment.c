@@ -80,23 +80,15 @@ uint32_t builder_add(SegmentBuilder *b, const char *name, size_t len, uint32_t p
     return b->base_id + b->count++;
 }
 
-static char *lowercase_table(const char *names, size_t len) {
-    char *lower = xmalloc(len ? len : 1);
-    ascii_lower(lower, names, len);
-    return lower;
-}
-
 Segment *segment_from_builder(SegmentBuilder *b) {
     Segment *s = xcalloc(1, sizeof *s);
     atomic_init(&s->refs, 1);
     s->base_id = b->base_id;
     s->count = b->count;
-    s->owned_recs = b->recs;
+    s->owned_recs = b->recs ? b->recs : xcalloc(1, sizeof(FileRecord));
     s->owned_names = b->names ? b->names : xcalloc(1, 1);
-    s->owned_lower = lowercase_table(s->owned_names, b->names_len);
     s->recs = s->owned_recs;
     s->names = s->owned_names;
-    s->lower = s->owned_lower;
     b->recs = NULL;
     b->names = NULL;
     builder_free(b);
@@ -353,11 +345,10 @@ static uint64_t le64(const char *p) {
     return v;
 }
 
-static bool test_bit(const uint64_t *bits, uint32_t i) { return bits[i >> 6] >> (i & 63) & 1; }
-
 /*
- * decode turns the columns of a mapped file into the records the search
- * works on; names stay in the mapping. It returns false for a damaged file.
+ * decode checks a mapped file and points the segment's columns into it,
+ * validating every reference an accessor will follow so that a damaged file
+ * is refused here rather than crashing a search. It returns false for one.
  */
 static bool decode(Segment *s, const char *base, size_t len, StrList *roots, int64_t *built_at) {
     if (len < HEADER_SIZE || memcmp(base, SEGMENT_MAGIC, 4) != 0) return false;
@@ -385,33 +376,24 @@ static bool decode(Segment *s, const char *base, size_t len, StrList *roots, int
     for (uint64_t k = 0; k < d; k++)
         if (name_off[k] >= names_len || (k > 0 && name_off[k] <= name_off[k - 1])) return false;
 
-    FileRecord *recs = xmalloc((n ? n : 1) * sizeof *recs);
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t id = name_id[i];
-        if (id >= d || (parent[i] != NO_PARENT && parent[i] >= i)) {
-            free(recs);
-            return false;
-        }
-        uint32_t end = id + 1 < d ? name_off[id + 1] - 1 : (uint32_t)names_len - 1;
-        recs[i] = (FileRecord){.parent = parent[i],
-                               .name_off = name_off[id],
-                               .name_len = end - name_off[id],
-                               .flags = test_bit(dirs, i) ? RECORD_DIR : 0,
-                               .size = size[i],
-                               .mtime = modified[i],
-                               .ctime = created[i]};
-    }
+    for (uint32_t i = 0; i < n; i++)
+        if (name_id[i] >= d || (parent[i] != NO_PARENT && parent[i] >= i)) return false;
     for (const char *p = sec[SEC_ROOTS], *e = p + sec_len[SEC_ROOTS]; p < e; p += strnlen(p, (size_t)(e - p)) + 1)
         if (*p) strlist_push(roots, p);
     *built_at = (int64_t)le64(base + 16);
     s->generation = le64(base + 8);
 
     s->count = (uint32_t)n;
-    s->owned_recs = recs;
-    s->recs = recs;
     s->names = names_len ? names : "";
-    s->owned_lower = lowercase_table(names, names_len);
-    s->lower = s->owned_lower;
+    s->col = (Columns){.name_off = name_off,
+                       .distinct = (uint32_t)d,
+                       .names_len = (size_t)names_len,
+                       .name_id = name_id,
+                       .parent = parent,
+                       .modified = modified,
+                       .created = created,
+                       .size = size,
+                       .dirs = dirs};
     return true;
 }
 
@@ -454,6 +436,19 @@ Segment *segment_open(const char *path, StrList *roots, int64_t *built_at, bool 
     return s;
 }
 
+void segment_set_times(Segment *s, uint32_t i, int64_t size, int64_t mtime, int64_t ctime) {
+    if (!s->updated) {
+        s->updated = xcalloc(bitmap_words(s->count) + 1, sizeof *s->updated);
+        s->updated_size = xmalloc((s->count + 1) * sizeof *s->updated_size);
+        s->updated_mtime = xmalloc((s->count + 1) * sizeof *s->updated_mtime);
+        s->updated_ctime = xmalloc((s->count + 1) * sizeof *s->updated_ctime);
+    }
+    bit_set(s->updated, i);
+    s->updated_size[i] = size;
+    s->updated_mtime[i] = mtime;
+    s->updated_ctime[i] = ctime;
+}
+
 void segment_retain(Segment *s) { atomic_fetch_add(&s->refs, 1); }
 
 void segment_release(Segment *s) {
@@ -461,6 +456,9 @@ void segment_release(Segment *s) {
     if (s->map) munmap(s->map, s->map_len);
     free(s->owned_recs);
     free(s->owned_names);
-    free(s->owned_lower);
+    free(s->updated);
+    free(s->updated_size);
+    free(s->updated_mtime);
+    free(s->updated_ctime);
     free(s);
 }

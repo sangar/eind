@@ -117,10 +117,31 @@ static bool is_word_byte(unsigned char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80;
 }
 
-static bool contains_word(const char *hay, const char *needle, size_t needle_len) {
+static unsigned char fold_byte(char c) { return (unsigned char)(c >= 'A' && c <= 'Z' ? c + 32 : c); }
+
+/*
+ * The name matchers fold case while they compare, so a scan reads each name
+ * once in place and copies nothing. The needle is already lowercase when
+ * fold is set.
+ */
+static bool fold_equal_at(const char *hay, const char *needle, size_t n, bool fold) {
+    for (size_t k = 0; k < n; k++)
+        if ((fold ? fold_byte(hay[k]) : (unsigned char)hay[k]) != (unsigned char)needle[k]) return false;
+    return true;
+}
+
+static const char *find_in(const char *hay, size_t hay_len, const char *needle, size_t needle_len, bool fold) {
+    if (needle_len == 0) return hay;
+    if (!fold) return needle_len > hay_len ? NULL : memmem(hay, hay_len, needle, needle_len);
+    unsigned char first = (unsigned char)needle[0];
+    for (size_t i = 0; i + needle_len <= hay_len; i++)
+        if (fold_byte(hay[i]) == first && fold_equal_at(hay + i + 1, needle + 1, needle_len - 1, true)) return hay + i;
+    return NULL;
+}
+
+static bool contains_word(const char *hay, size_t hay_len, const char *needle, size_t needle_len, bool fold) {
     if (needle_len == 0) return true;
-    size_t hay_len = strlen(hay);
-    for (const char *p = hay; (p = strstr(p, needle)) != NULL; p++) {
+    for (const char *p = hay; (p = find_in(p, hay_len - (size_t)(p - hay), needle, needle_len, fold)) != NULL; p++) {
         size_t start = (size_t)(p - hay), end = start + needle_len;
         bool before = start == 0 || !is_word_byte((unsigned char)hay[start - 1]);
         bool after = end >= hay_len || !is_word_byte((unsigned char)hay[end]);
@@ -128,6 +149,8 @@ static bool contains_word(const char *hay, const char *needle, size_t needle_len
     }
     return false;
 }
+
+static bool in_range(int64_t v, Range r) { return v >= r.lo && v <= r.hi; }
 
 static int64_t depth_of(const char *path) {
     size_t n = strlen(path);
@@ -140,30 +163,35 @@ static int64_t depth_of(const char *path) {
 
 static bool match_text(const Matcher *m, MatchCtx *c) {
     const char *hay;
+    size_t hay_len;
+    bool fold = !m->cased;
     if (m->re) {
         hay = m->path ? ctx_path(c) : snap_name(c->s, c->id);
         return regexec(m->re, hay, 0, NULL, 0) == 0;
     }
     if (m->path) {
         hay = m->cased ? ctx_path(c) : ctx_path_lower(c);
+        hay_len = c->path.len;
+        fold = false; /* the path copy is already lowercased */
     } else {
-        hay = m->cased ? snap_name(c->s, c->id) : snap_lower(c->s, c->id);
+        hay = snap_name(c->s, c->id);
+        hay_len = snap_name_len(c->s, c->id);
     }
+    size_t n = m->needle_len;
     switch (m->glob) {
-    case GLOB_SUFFIX: return has_suffix(hay, m->needle);
-    case GLOB_PREFIX: return strncmp(hay, m->needle, m->needle_len) == 0;
-    case GLOB_CONTAINS: return strstr(hay, m->needle) != NULL;
+    case GLOB_SUFFIX: return n <= hay_len && fold_equal_at(hay + hay_len - n, m->needle, n, fold);
+    case GLOB_PREFIX: return n <= hay_len && fold_equal_at(hay, m->needle, n, fold);
+    case GLOB_CONTAINS: return find_in(hay, hay_len, m->needle, n, fold) != NULL;
     case GLOB_NONE: break;
     }
     switch (m->mode) {
-    case TEXT_WHOLENAME: return strcmp(hay, m->needle) == 0;
-    case TEXT_WHOLEWORD: return contains_word(hay, m->needle, m->needle_len);
-    default: return strstr(hay, m->needle) != NULL;
+    case TEXT_WHOLENAME: return n == hay_len && fold_equal_at(hay, m->needle, n, fold);
+    case TEXT_WHOLEWORD: return contains_word(hay, hay_len, m->needle, n, fold);
+    default: return find_in(hay, hay_len, m->needle, n, fold) != NULL;
     }
 }
 
 static bool matches(const Matcher *m, MatchCtx *c) {
-    const FileRecord *r;
     switch (m->kind) {
     case M_ALL: return true;
     case M_NONE: return false;
@@ -181,25 +209,18 @@ static bool matches(const Matcher *m, MatchCtx *c) {
         size_t len;
         const char *ext = snap_ext(c->s, c->id, &len);
         for (uint32_t k = 0; k < m->ext_count; k++)
-            if (strcmp(m->exts[k], ext) == 0) return true;
+            if (ascii_casecmp(ext, len, m->exts[k], strlen(m->exts[k])) == 0) return true;
         return false;
     }
-    case M_SIZE: r = snap_record(c->s, c->id); return r->size >= m->range.lo && r->size <= m->range.hi;
-    case M_MODIFIED: r = snap_record(c->s, c->id); return r->mtime >= m->range.lo && r->mtime <= m->range.hi;
-    case M_CREATED: r = snap_record(c->s, c->id); return r->ctime >= m->range.lo && r->ctime <= m->range.hi;
-    case M_NAMELEN: {
-        r = snap_record(c->s, c->id);
-        int64_t len = utf8_count(snap_name(c->s, c->id), r->name_len);
-        return len >= m->range.lo && len <= m->range.hi;
-    }
-    case M_DEPTH: {
-        int64_t d = depth_of(ctx_path(c));
-        return d >= m->range.lo && d <= m->range.hi;
-    }
-    case M_ISDIR: return record_is_dir(snap_record(c->s, c->id)) == m->dir;
-    case M_PARENT: return snap_record(c->s, c->id)->parent == m->dir_id;
+    case M_SIZE: return in_range(snap_size(c->s, c->id), m->range);
+    case M_MODIFIED: return in_range(snap_mtime(c->s, c->id), m->range);
+    case M_CREATED: return in_range(snap_ctime(c->s, c->id), m->range);
+    case M_NAMELEN: return in_range(utf8_count(snap_name(c->s, c->id), snap_name_len(c->s, c->id)), m->range);
+    case M_DEPTH: return in_range(depth_of(ctx_path(c)), m->range);
+    case M_ISDIR: return snap_is_dir(c->s, c->id) == m->dir;
+    case M_PARENT: return snap_parent(c->s, c->id) == m->dir_id;
     case M_INFOLDER:
-        for (uint32_t p = snap_record(c->s, c->id)->parent; p != NO_PARENT; p = snap_record(c->s, p)->parent)
+        for (uint32_t p = snap_parent(c->s, c->id); p != NO_PARENT; p = snap_parent(c->s, p))
             if (p == m->dir_id) return true;
         return false;
     }
@@ -452,8 +473,9 @@ typedef struct {
 static int compare_i64(int64_t a, int64_t b) { return a < b ? -1 : a > b; }
 
 static int compare_names(const Snapshot *s, uint32_t a, uint32_t b) {
-    int c = strcmp(snap_lower(s, a), snap_lower(s, b));
-    if (!c) c = strcmp(snap_name(s, a), snap_name(s, b));
+    const char *na = snap_name(s, a), *nb = snap_name(s, b);
+    int c = ascii_casecmp(na, snap_name_len(s, a), nb, snap_name_len(s, b));
+    if (!c) c = strcmp(na, nb);
     return c ? c : compare_i64(a, b);
 }
 
@@ -468,12 +490,13 @@ static int compare_by_key(const void *ctx, const void *pa, const void *pb) {
     const Snapshot *s = sc->s;
     int c = 0;
     switch (sc->key) {
-    case SORT_SIZE: c = compare_i64(snap_record(s, a)->size, snap_record(s, b)->size); break;
-    case SORT_MODIFIED: c = compare_i64(snap_record(s, a)->mtime, snap_record(s, b)->mtime); break;
-    case SORT_CREATED: c = compare_i64(snap_record(s, a)->ctime, snap_record(s, b)->ctime); break;
+    case SORT_SIZE: c = compare_i64(snap_size(s, a), snap_size(s, b)); break;
+    case SORT_MODIFIED: c = compare_i64(snap_mtime(s, a), snap_mtime(s, b)); break;
+    case SORT_CREATED: c = compare_i64(snap_ctime(s, a), snap_ctime(s, b)); break;
     case SORT_EXT: {
         size_t la, lb;
-        c = strcmp(snap_ext(s, a, &la), snap_ext(s, b, &lb));
+        const char *ea = snap_ext(s, a, &la), *eb = snap_ext(s, b, &lb);
+        c = ascii_casecmp(ea, la, eb, lb);
         break;
     }
     default: break;
@@ -518,9 +541,34 @@ static size_t top_by_path(const Snapshot *s, uint32_t *hits, size_t n, size_t k,
     return k;
 }
 
+/*
+ * The index file stores its records in path order (docs/file-format.md), so
+ * hits that all come from the base segment, in id order as the scan leaves
+ * them, are already sorted by path.
+ */
+static bool in_path_order(const Snapshot *s, const uint32_t *hits, size_t n) {
+    if (n == 0) return true;
+    if (hits[n - 1] >= s->segs[0]->count) return false;
+    for (size_t i = 1; i < n; i++)
+        if (hits[i] <= hits[i - 1]) return false;
+    return true;
+}
+
+static void reverse(uint32_t *hits, size_t n) {
+    for (size_t i = 0, j = n; i + 1 < j; i++, j--) {
+        uint32_t t = hits[i];
+        hits[i] = hits[j - 1];
+        hits[j - 1] = t;
+    }
+}
+
 size_t search_top(const Snapshot *s, uint32_t *hits, size_t n, SortKey key, bool descending, long keep) {
     size_t k = keep < 0 || (size_t)keep > n ? n : (size_t)keep;
     if (key == SORT_RELEVANCE) key = SORT_NAME;
+    if (key == SORT_PATH && in_path_order(s, hits, n)) {
+        if (descending) reverse(hits, n);
+        return k;
+    }
     if (key == SORT_PATH) return top_by_path(s, hits, n, k, descending);
     SortCtx sc = {.s = s, .key = key, .descending = descending};
     return sort_top(hits, n, sizeof *hits, k, compare_by_key, &sc);
@@ -563,7 +611,7 @@ static int score(const char *lower_name, const char **terms, size_t term_count) 
 
 static int depth_in_tree(const Snapshot *s, uint32_t id) {
     int d = 0;
-    for (uint32_t p = snap_record(s, id)->parent; p != NO_PARENT; p = snap_record(s, p)->parent) d++;
+    for (uint32_t p = snap_parent(s, id); p != NO_PARENT; p = snap_parent(s, p)) d++;
     return d;
 }
 
@@ -586,7 +634,7 @@ static int compare_ranked(const void *ctx, const void *pa, const void *pb) {
     const Ranked *a = pa, *b = pb;
     if (a->score != b->score) return a->score > b->score ? -1 : 1;
     if (a->depth != b->depth) return a->depth < b->depth ? -1 : 1;
-    int c = strcmp(snap_lower(s, a->hit), snap_lower(s, b->hit));
+    int c = ascii_casecmp(snap_name(s, a->hit), snap_name_len(s, a->hit), snap_name(s, b->hit), snap_name_len(s, b->hit));
     return c ? c : compare_i64(a->hit, b->hit);
 }
 
@@ -598,13 +646,18 @@ size_t search_rank(const Snapshot *s, uint32_t *hits, size_t n, const QueryNode 
     size_t term_count = 0, term_cap = 0;
     plain_terms(&arena, query, &terms, &term_count, &term_cap);
     Ranked *rows = xmalloc((n ? n : 1) * sizeof *rows);
+    StrBuf lower = {0};
     for (size_t i = 0; i < n; i++) {
         rows[i] = (Ranked){.hit = hits[i]};
         if (term_count) {
-            rows[i].score = score(snap_lower(s, hits[i]), terms, term_count);
+            sb_clear(&lower);
+            sb_append(&lower, snap_name(s, hits[i]), snap_name_len(s, hits[i]));
+            ascii_lower(lower.data, lower.data, lower.len);
+            rows[i].score = score(lower.data, terms, term_count);
             rows[i].depth = depth_in_tree(s, hits[i]);
         }
     }
+    sb_free(&lower);
     k = sort_top(rows, n, sizeof *rows, k, compare_ranked, s);
     for (size_t i = 0; i < k; i++) hits[i] = rows[i].hit;
     free(rows);
@@ -617,9 +670,8 @@ size_t search_rank(const Snapshot *s, uint32_t *hits, size_t n, const QueryNode 
 
 static bool find_child_dir(const Snapshot *s, uint32_t parent, const char *lower_name, size_t len, uint32_t *out) {
     for (uint32_t id = parent + 1; id < s->total; id++) {
-        const FileRecord *r = snap_record(s, id);
-        if (r->parent == parent && record_is_dir(r) && snap_live(s, id) && r->name_len == len &&
-            memcmp(snap_lower(s, id), lower_name, len) == 0) {
+        if (snap_parent(s, id) == parent && snap_is_dir(s, id) && snap_live(s, id) && snap_name_len(s, id) == len &&
+            ascii_casecmp(snap_name(s, id), len, lower_name, len) == 0) {
             *out = id;
             return true;
         }
@@ -632,10 +684,10 @@ static bool search_resolve_dir(const Snapshot *s, const char *path, uint32_t *ou
     ascii_lower(target, target, strlen(target));
     bool found = false;
     for (uint32_t id = 0; id < s->total && !found; id++) {
-        const FileRecord *r = snap_record(s, id);
-        if (r->parent != NO_PARENT || !record_is_dir(r) || !snap_live(s, id)) continue;
-        char *root = xstrdup(snap_lower(s, id));
+        if (snap_parent(s, id) != NO_PARENT || !snap_is_dir(s, id) || !snap_live(s, id)) continue;
+        char *root = xstrdup(snap_name(s, id));
         size_t root_len = strlen(root);
+        ascii_lower(root, root, root_len);
         while (root_len > 1 && root[root_len - 1] == '/') root[--root_len] = '\0';
         if (strcmp(target, root) == 0) {
             *out = id;

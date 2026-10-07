@@ -63,36 +63,37 @@ void snap_path(const Snapshot *s, uint32_t id, StrBuf *sb) {
             cap *= 2;
         }
         chain[n++] = cur;
-        uint32_t parent = snap_record(s, cur)->parent;
+        uint32_t parent = snap_parent(s, cur);
         if (parent == NO_PARENT) break;
         cur = parent;
     }
     sb_clear(sb);
     for (size_t k = n; k-- > 0;) {
-        const FileRecord *r = snap_record(s, chain[k]);
         if (sb->len > 0 && sb->data[sb->len - 1] != '/') sb_putc(sb, '/');
-        sb_append(sb, snap_name(s, chain[k]), r->name_len);
+        sb_append(sb, snap_name(s, chain[k]), snap_name_len(s, chain[k]));
     }
     sb_cstr(sb);
     if (chain != stack_buf) free(chain);
 }
 
 const char *snap_ext(const Snapshot *s, uint32_t id, size_t *len) {
-    const char *lower = snap_lower(s, id);
-    const char *dot = strrchr(lower, '.');
-    if (!dot || dot == lower) {
-        *len = 0;
-        return "";
+    const char *name = snap_name(s, id);
+    size_t n = snap_name_len(s, id);
+    for (size_t i = n; i-- > 1;) {
+        if (name[i] == '.') {
+            *len = n - i - 1;
+            return name + i + 1;
+        }
     }
-    *len = strlen(dot + 1);
-    return dot + 1;
+    *len = 0;
+    return "";
 }
 
 void snap_stats(const Snapshot *s, int64_t *files, int64_t *dirs) {
     *files = *dirs = 0;
     for (uint32_t id = 0; id < s->total; id++) {
         if (!snap_live(s, id)) continue;
-        if (record_is_dir(snap_record(s, id))) {
+        if (snap_is_dir(s, id)) {
             (*dirs)++;
         } else {
             (*files)++;

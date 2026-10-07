@@ -158,6 +158,17 @@ void ascii_lower(char *dst, const char *src, size_t n) {
     }
 }
 
+static unsigned char lower_byte(unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
+int ascii_casecmp(const char *a, size_t alen, const char *b, size_t blen) {
+    size_t n = min_size(alen, blen);
+    for (size_t i = 0; i < n; i++) {
+        int x = lower_byte((unsigned char)a[i]), y = lower_byte((unsigned char)b[i]);
+        if (x != y) return x < y ? -1 : 1;
+    }
+    return (alen > blen) - (alen < blen);
+}
+
 bool has_prefix(const char *s, const char *prefix) { return strncmp(s, prefix, strlen(prefix)) == 0; }
 
 bool has_suffix(const char *s, const char *suffix) {

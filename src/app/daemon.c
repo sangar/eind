@@ -44,7 +44,7 @@ static void log_line(const char *fmt, ...) {
 static void watch_dirs(Watcher *w, const Snapshot *s) {
     StrBuf path = {0};
     for (uint32_t id = 0; id < s->total; id++) {
-        if (!snap_live(s, id) || !record_is_dir(snap_record(s, id))) continue;
+        if (!snap_live(s, id) || !snap_is_dir(s, id)) continue;
         snap_path(s, id, &path);
         watcher_add_dir(w, path.data);
     }

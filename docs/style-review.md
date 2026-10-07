@@ -26,41 +26,28 @@ others as cleanups that need only `make test` and `make sanitize`.
 
 ### 1. Hot search loop rescans strings whose length is known
 
-The scan in `search.c` runs once per record on every core. Several matchers
-call `strlen` on data whose length is already in the record or the matcher:
-
-- `match_text` (`src/index/search.c:153`) calls `has_suffix`, which does
-  `strlen` on the name and on the needle for every record. The record has
-  `name_len` and the matcher has `needle_len`.
-- `contains_word` (`search.c:122`) does `strlen(hay)` per record.
-- `depth_of` (`search.c:133`) does `strlen(path)` after `ctx_path` built the
-  path into a `StrBuf` that already knows its length.
-- `snap_ext` (`src/index/index.c:87`) does `strrchr` then `strlen`; a
-  backwards scan from `name_off + name_len` finds the dot and the length in
-  one pass.
-
-Change: pass the known lengths through `MatchCtx` and the matcher, and add
-a length-taking variant of `has_suffix` in `core/util.c`. Check with the
-`*.go`, `ext:json` and `--count e` rows of the benchmark table.
+Done on October 7, though measurement showed the loop was not where the
+time went: the gap to the Zig version was the index load, which decoded
+every column into a record array and copied a lowercase name table on
+every command, 1.3 ms of page faults and 10 MB. The base segment now reads
+the file's columns in place through `seg_*` accessors (`segment.h`), the
+matchers fold case while comparing instead of copying (`find_in` and
+`fold_equal_at` in `search.c`), `snap_ext` scans backwards from the known
+length, and hits from the base segment skip the path sort because the file
+already stores them in path order. Searches went from 6.8 to 7.4 ms to 5.5
+to 6.3 ms and from 20 MB to 10 MB.
 
 ### 2. Scanning allocates per directory instead of from a pool
 
-`eind index` makes about 412k heap allocations for 156k entries. Nearly all
-are per-directory work items in `src/fs/scanner.c`:
-
-- `new_scan` (`scanner.c:69`) does `xcalloc` for the `DirScan`, and
-  `arena_init` with a 16 KB first block that is allocated on the first
-  child, so one block per directory.
-- `add_child` (`scanner.c:51`) grows `children` with `xrealloc`.
-- the path is a `path_join` allocation.
-- `threadpool_submit` (`src/core/threadpool.c:51`) mallocs a `Task` per
-  submission and `worker` frees it.
-
-The items are fixed size, short lived and created in bulk: the pool case.
-Change: a free list of `DirScan` structs (reset the arena instead of
-freeing it, keep the `children` capacity) owned by `scan_tree`, and embed
-the `Task` in the work item or give the pool an intrusive queue so a submit
-does not allocate. Check the allocation count and the `eind index` row.
+Done on October 7. `Task` now lives inside the work item, so a submission
+allocates nothing; the collector keeps and reuses `DirScan` items; and the
+read buffers (arena, children, scratch path) circulate through a small
+pool that a worker takes when it starts listing and the collector returns
+after copying, so only the directories being listed hold one. Allocations
+for an index of `~/Developer` went from 412k to 77k, the build from 382 ms
+to 363 ms and its peak memory from 54 MB to 51 MB. A first version that
+kept the buffers on the spare items instead peaked at 686 MB, because a
+breadth-first scan queues tens of thousands of directories at once.
 
 ### 3. No assertions
 
