@@ -34,7 +34,31 @@ set from signal handlers.
 make            # ./eind
 make test       # unit and integration tests
 make sanitize   # the tests under AddressSanitizer and UndefinedBehaviorSanitizer
-cp eind ~/.local/bin/      # or anywhere on your PATH
+```
+
+## Install
+
+```sh
+make install      # ~/.local/bin/eind, and eind serve at login
+make uninstall    # stop the service and remove the binary
+```
+
+`make install` copies the binary to `~/.local/bin`, which must be on your
+`PATH`, and enables the login service (`eind service enable`). Run it again
+after pulling to upgrade; the service restarts on the new binary. Install
+elsewhere with `make install PREFIX=/usr/local`, and uninstall with the same
+`PREFIX`.
+
+`make uninstall` keeps the index and config; `eind status` shows where they
+are, so you can delete them too. On macOS the service logs to
+`~/Library/Logs/eind.log`.
+
+On Linux, raise the inotify limit once, since the watcher registers every
+indexed directory and the default of 8192 watches is too low for a home
+directory:
+
+```sh
+sudo cp packaging/50-eind.conf /etc/sysctl.d/ && sudo sysctl --system
 ```
 
 A small SwiftUI client of the daemon for macOS lives in [macos/](macos/README.md).
@@ -49,7 +73,6 @@ eind ext:go 'size:>100kb'     # large Go files
 eind "*.psd" dm:lastmonth     # wildcards match the whole name
 eind                          # interactive view; Enter prints the chosen path
 cd "$(eind folder: project)"  # use it from the shell
-eind service enable           # keep the index fresh from login
 ```
 
 Searching with no index builds one first.

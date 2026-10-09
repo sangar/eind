@@ -5,6 +5,8 @@ CFLAGS  += -std=c23 -D_DEFAULT_SOURCE -D_GNU_SOURCE -D_DARWIN_C_SOURCE -Wall -We
            -Wimplicit-fallthrough -Wno-unused-parameter \
            -pthread -DEIND_VERSION='"$(VERSION)"'
 LDLIBS  += -pthread
+PREFIX  ?= $(HOME)/.local
+BINDIR   = $(PREFIX)/bin
 
 ifeq ($(shell uname -s),Darwin)
 LDLIBS  += -framework CoreServices
@@ -14,7 +16,7 @@ LIB_SRC  = $(wildcard src/core/*.c src/index/*.c src/fs/*.c src/app/*.c)
 LIB_OBJ  = $(LIB_SRC:src/%.c=build/%.o)
 TEST_OBJ = build/tests/test_eind.o
 
-.PHONY: all test sanitize clean
+.PHONY: all test sanitize clean install uninstall
 
 all: eind
 
@@ -43,3 +45,14 @@ sanitize:
 
 clean:
 	rm -rf build eind
+
+# Installs the binary and runs `eind serve` at login. Run again to upgrade: it restarts the service on the new binary.
+install: eind
+	install -d $(BINDIR)
+	install -m 755 eind $(BINDIR)/eind
+	$(BINDIR)/eind service enable
+
+# Stops the login service and removes the binary; the index and config are kept.
+uninstall:
+	if [ -x $(BINDIR)/eind ] && $(BINDIR)/eind status | grep -q '^service: enabled'; then $(BINDIR)/eind service disable; fi
+	rm -f $(BINDIR)/eind

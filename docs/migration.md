@@ -55,10 +55,11 @@ Do them in this order, so that only one daemon ever writes to the journal.
    git clone git@github.com:sangar/eind.git
    cd eind
    make && make test
-   cp eind ~/.local/bin/
+   make install
    ```
 
-   `~/.local/bin` must be on your `PATH`.
+   This copies the binary to `~/.local/bin`, which must be on your `PATH`,
+   and starts `eind serve` at login.
 
 4. **On Linux, raise the inotify limit.** The watcher registers every
    indexed directory, and the default limit of 8192 watches is far too low
@@ -74,12 +75,6 @@ Do them in this order, so that only one daemon ever writes to the journal.
 
    ```sh
    eind status
-   ```
-
-6. **Start the new daemon at login.**
-
-   ```sh
-   eind service enable
    ```
 
 ## If something looks wrong

@@ -12,7 +12,7 @@ quits; it looks for the binary at `EIND_BINARY`, on `PATH`, and in `~/.local/bin
 `/opt/homebrew/bin` and `/usr/local/bin`.
 
 ```sh
-make && cp eind ~/.local/bin/
+make install
 cd macos && swift run
 ```
 
