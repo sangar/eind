@@ -1,35 +1,28 @@
 #include "daemon.h"
 
-#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <time.h>
 
-#include "../core/threadpool.h"
-#include "../fs/fs.h"
+#include "mc/concurrency/cancel.h"
+#include "mc/concurrency/threadpool.h"
+#include "mc/platform/platform.h"
+#include "mc/platform/watch.h"
+#include "mc/text/path.h"
+#include "../fs/excludes.h"
 #include "../fs/updater.h"
-#include "../fs/watcher.h"
 #include "../index/index.h"
 #include "../index/journal.h"
 #include "build.h"
 #include "config.h"
 #include "server.h"
 
-#define POLL_MS 500
+/* Events are collected until they pause for SETTLE_MS; the loop wakes at least every POLL_MS. */
+enum { POLL_MS = 500, SETTLE_MS = 250 };
 
-static volatile sig_atomic_t stop_requested; // a signal handler can only set a flag; modern-c: allow global-mutable
-
-static void on_stop(int sig) {
-    (void)sig;
-    stop_requested = 1;
-}
-
-static void log_line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-static void log_line(const char *fmt, ...) {
+[[gnu::format(printf, 1, 2)]] static void log_line(const char *fmt, ...) {
     char stamp[16];
-    time_t now = time(NULL);
+    time_t now = time(nullptr);
     struct tm tm;
     localtime_r(&now, &tm);
     strftime(stamp, sizeof stamp, "%H:%M:%S", &tm);
@@ -41,55 +34,61 @@ static void log_line(const char *fmt, ...) {
     fputc('\n', stderr);
 }
 
-static void watch_dirs(Watcher *w, const Snapshot *s) {
-    StrBuf path = {0};
-    for (uint32_t id = 0; id < s->total; id++) {
-        if (!snap_live(s, id) || !snap_is_dir(s, id)) continue;
-        snap_path(s, id, &path);
-        watcher_add_dir(w, path.data);
-    }
-    sb_free(&path);
+/* wait_for_stop turns the first stop or reload signal into a cancelled run. */
+static void *wait_for_stop(void *argument) {
+    signals_wait();
+    cancel_request(argument);
+    return nullptr;
 }
 
-/*
- * compact_and_save merges the deltas into a fresh index file, starts the
- * updater over from it and starts its journal.
- */
-static bool compact_and_save(Index *ix, Updater *u, Journal **j, const char *index_path, Err *err) {
-    size_t changes = journal_entries(*j);
-    Snapshot *merged = index_compact(updater_snapshot(u), index_path, err);
-    if (!merged) return false;
-    Journal *fresh = journal_open(index_path, merged, err);
-    if (!fresh) {
+/* Daemon is what the loop works on; it lives on daemon_run's stack. */
+typedef struct {
+    Index ix;
+    Updater *updater;
+    Journal *journal;
+    String index_path;
+} Daemon;
+
+/* start_over makes a freshly loaded snapshot, and its journal, the current state; it takes the reference to s. */
+static void start_over(Daemon *d, Snapshot *s, Journal *journal) {
+    journal_free(d->journal);
+    d->journal = journal;
+    snapshot_retain(s);
+    index_publish(&d->ix, s);
+    updater_reset(d->updater, s);
+}
+
+/* compact_and_save merges the deltas into a fresh index file, starts the updater over from it and starts its journal. */
+[[nodiscard]] static Error compact_and_save(Daemon *d, Err *err) {
+    size_t changes = journal_entries(d->journal);
+    Snapshot *merged;
+    Error e = index_compact(updater_snapshot(d->updater), d->index_path, &merged, err);
+    if (e != ERR_OK) return e;
+    Journal *fresh;
+    e = journal_open(d->index_path, merged, &fresh, err);
+    if (e != ERR_OK) {
         snapshot_release(merged);
-        return false;
+        return e;
     }
-    journal_free(*j);
-    *j = fresh;
-    snapshot_retain(merged);
-    index_publish(ix, merged);
-    updater_reset(u, merged);
+    start_over(d, merged, fresh);
     log_line("folded %zu changes into the index: %u entries", changes, snap_live_count(merged));
-    return true;
+    return ERR_OK;
 }
 
 /* reload starts over from an index file another process wrote. */
-static bool reload(Index *ix, Updater *u, Journal **j, const char *index_path, Err *err) {
+[[nodiscard]] static Error reload(Daemon *d, Err *err) {
     log_line("the index file was replaced by another process; loading it again");
-    bool missing;
-    Snapshot *fresh = index_load(index_path, &missing, err);
-    if (!fresh) return false;
-    Journal *fresh_journal = journal_open(index_path, fresh, err);
-    if (!fresh_journal) {
+    Snapshot *fresh;
+    Error e = index_load(d->index_path, &fresh, err);
+    if (e != ERR_OK) return e;
+    Journal *fresh_journal;
+    e = journal_open(d->index_path, fresh, &fresh_journal, err);
+    if (e != ERR_OK) {
         snapshot_release(fresh);
-        return false;
+        return e;
     }
-    journal_free(*j);
-    *j = fresh_journal;
-    snapshot_retain(fresh);
-    index_publish(ix, fresh);
-    updater_reset(u, fresh);
-    return true;
+    start_over(d, fresh, fresh_journal);
+    return ERR_OK;
 }
 
 /*
@@ -99,88 +98,120 @@ static bool reload(Index *ix, Updater *u, Journal **j, const char *index_path, E
  */
 static size_t compact_after(const Snapshot *s) { return max_size(10000, snap_live_count(s) / 100); }
 
-bool daemon_run(const DaemonOptions *o, Err *err) {
+/* apply_events reconciles one batch, journals it at once so commands loading the index see it, and flushes. */
+[[nodiscard]] static Error apply_events(Daemon *d, const WatchEventList *events, Err *err) {
+    Snapshot *before = updater_snapshot(d->updater);
+    snapshot_retain(before);
+    if (updater_apply(d->updater, events->items, events->count))
+        journal_record(d->journal, before, updater_snapshot(d->updater));
+    snapshot_release(before);
+    bool replaced;
+    Error e = journal_flush(d->journal, &replaced, err);
+    return e == ERR_OK && replaced ? reload(d, err) : e;
+}
+
+typedef struct {
+    const Excludes *ex;
+} WatchFilter;
+
+static bool skip_excluded(void *context, String directory) {
+    const WatchFilter *filter = context;
+    return excludes_match(filter->ex, directory, path_base(directory));
+}
+
+[[nodiscard]] static Error watch_loop(Daemon *d, Watch *watch, Cancel *stop, int64_t save_interval_ms, Err *err) {
+    Arena *batch = arena_create(0);
+    int64_t next_save = clock_monotonic_ns() + save_interval_ms * NS_PER_MILLISECOND;
+    Error e = ERR_OK;
+    while (e == ERR_OK && !cancel_requested(stop)) {
+        arena_reset(batch);
+        int64_t until_save = (next_save - clock_monotonic_ns()) / NS_PER_MILLISECOND;
+        int wait = until_save < 0 ? 0 : until_save < POLL_MS ? (int)until_save : POLL_MS;
+        WatchEventList events = {0};
+        e = watch_read(watch, batch, wait, SETTLE_MS, &events, err);
+        if (e == ERR_OK && events.count > 0) e = apply_events(d, &events, err);
+        if (e == ERR_OK && clock_monotonic_ns() >= next_save) {
+            next_save = clock_monotonic_ns() + save_interval_ms * NS_PER_MILLISECOND;
+            if (journal_entries(d->journal) >= compact_after(updater_snapshot(d->updater))) e = compact_and_save(d, err);
+        }
+    }
+    if (e == ERR_OK && journal_entries(d->journal) > 0) e = compact_and_save(d, err);
+    arena_destroy(batch);
+    return e;
+}
+
+/* watch_and_update runs the loop with everything it needs, then takes it all down again. */
+[[nodiscard]] static Error watch_and_update(Daemon *d, const Excludes *ex, Cancel *stop, int64_t save_interval_ms,
+                                            Err *err) {
+    Snapshot *initial = index_acquire(&d->ix);
+    WatchFilter filter = {ex};
+    Watch *watch = nullptr;
+    ThreadPool *io = nullptr;
+    Error e = watch_create(initial->roots, skip_excluded, &filter, &watch, err);
+    if (e == ERR_OK) e = journal_open(d->index_path, initial, &d->journal, err);
+    if (e == ERR_OK) {
+        for (size_t i = 0; i < initial->roots.count; i++)
+            fprintf(stderr, "watching %.*s\n", (int)initial->roots.items[i].len, initial->roots.items[i].data);
+    }
+    snapshot_release(initial);
+    if (e == ERR_OK) e = threadpool_create(io_thread_count(), &io, err);
+    if (e == ERR_OK) {
+        d->updater = updater_create(io, &d->ix, ex);
+        e = watch_loop(d, watch, stop, save_interval_ms, err);
+        updater_destroy(d->updater);
+    }
+    if (io) threadpool_destroy(io);
+    journal_free(d->journal);
+    watch_destroy(watch);
+    return e;
+}
+
+Error daemon_run(const DaemonOptions *o, Err *err) {
+    Arena *arena = arena_create(0);
     Config cfg;
-    if (!config_load(o->config_path, &cfg, err)) return false;
     Excludes ex;
-    bool ok = excludes_init(&ex, &cfg.excludes, err);
-    config_free(&cfg);
-    if (!ok) return false;
-    Snapshot *initial = load_or_build(o->config_path, o->index_path, err);
-    if (!initial) {
-        excludes_free(&ex);
-        return false;
+    Error e = config_load(arena, o->config_path, &cfg, err);
+    if (e == ERR_OK) e = excludes_init(arena, &ex, cfg.excludes, env_home(arena), err);
+    Snapshot *initial = nullptr;
+    if (e == ERR_OK) e = load_or_build(o->config_path, o->index_path, &initial, err);
+    if (e != ERR_OK) {
+        arena_destroy(arena);
+        return e;
     }
-    Index ix;
-    index_init(&ix, initial);
+    Daemon d = {.index_path = o->index_path};
+    index_init(&d.ix, initial);
 
-    struct sigaction sa = {.sa_handler = on_stop};
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    /* From here on threads start; a signal now only ends the loop, which then saves the index. */
+    signals_block();
+    Arena *stop_arena = arena_create(sizeof(Cancel) + 64);
+    Cancel *stop = arena_push(stop_arena, sizeof *stop);
+    cancel_init(stop);
+    Thread signal_thread;
+    e = thread_start(&signal_thread, wait_for_stop, stop, err);
+    bool waiting_for_signal = e == ERR_OK;
 
-    ThreadPool *cpu = NULL;
-    Server *srv = NULL;
-    if (o->serve) {
-        cpu = threadpool_create(cpu_count());
-        srv = server_start(cpu, &ix, o->socket_path, o->index_path, err);
-        if (!srv) {
-            threadpool_destroy(cpu);
-            index_destroy(&ix);
-            excludes_free(&ex);
-            return false;
-        }
-        fprintf(stderr, "serving queries at %s\n", o->socket_path);
+    ThreadPool *cpu = nullptr;
+    Server *srv = nullptr;
+    if (e == ERR_OK && o->serve) {
+        e = threadpool_create(0, &cpu, err);
+        if (e == ERR_OK) e = server_start(cpu, &d.ix, o->socket_path, o->index_path, &srv, err);
+        if (e == ERR_OK) fprintf(stderr, "serving queries at %.*s\n", (int)o->socket_path.len, o->socket_path.data);
     }
-    fprintf(stderr, "Tip: `eind service enable` keeps it running in the background from login.\n");
-
-    Watcher *w = watcher_open(&initial->roots, err);
-    Journal *j = w ? journal_open(o->index_path, initial, err) : NULL;
-    ThreadPool *io = threadpool_create(io_thread_count());
-    Updater *u = j ? updater_new(io, &ix, &ex) : NULL;
-    if (w) {
-        for (size_t i = 0; i < initial->roots.len; i++) fprintf(stderr, "watching %s\n", initial->roots.items[i]);
-        if (watcher_needs_dirs()) watch_dirs(w, initial);
+    if (e == ERR_OK) {
+        fprintf(stderr, "Tip: `eind service enable` keeps it running in the background from login.\n");
+        e = watch_and_update(&d, &ex, stop, o->save_interval_ms, err);
     }
-    ok = u != NULL;
-    int64_t next_save = monotonic_ms() + o->save_interval_ms;
-    StrList changed = {0}, new_dirs = {0};
-    while (ok && !stop_requested) {
-        int wait = (int)min_i64(POLL_MS, max_i64(next_save - monotonic_ms(), 0));
-        int n = watcher_collect(w, wait, &changed, err);
-        if (n < 0) {
-            ok = false;
-            break;
-        }
-        if (n > 0) {
-            /* Every batch goes to the journal at once, so commands loading the index see it. */
-            Snapshot *before = updater_snapshot(u);
-            snapshot_retain(before);
-            if (updater_apply(u, &changed, &new_dirs)) journal_record(j, before, updater_snapshot(u));
-            snapshot_release(before);
-            for (size_t i = 0; i < new_dirs.len; i++) watcher_add_dir(w, new_dirs.items[i]);
-            strlist_clear(&changed);
-            strlist_clear(&new_dirs);
-            JournalStatus st = journal_flush(j, err);
-            if (st == JOURNAL_FAILED) ok = false;
-            if (st == JOURNAL_REPLACED) ok = reload(&ix, u, &j, o->index_path, err);
-        }
-        if (ok && monotonic_ms() >= next_save) {
-            next_save = monotonic_ms() + o->save_interval_ms;
-            if (journal_entries(j) >= compact_after(updater_snapshot(u)))
-                ok = compact_and_save(&ix, u, &j, o->index_path, err);
-        }
-    }
-    if (ok && journal_entries(j) > 0) ok = compact_and_save(&ix, u, &j, o->index_path, err);
-    strlist_free(&changed);
-    strlist_free(&new_dirs);
     if (srv) server_stop(srv);
-    if (u) updater_free(u);
     if (cpu) threadpool_destroy(cpu);
-    threadpool_destroy(io);
-    journal_free(j);
-    watcher_close(w);
-    index_destroy(&ix);
-    excludes_free(&ex);
-    return ok;
+    index_destroy(&d.ix);
+    arena_destroy(arena);
+    if (waiting_for_signal && !cancel_requested(stop)) {
+        /* Nothing can wake the thread still waiting for a signal, so it keeps stop for as long as the process lives. */
+        thread_detach(&signal_thread);
+        return e;
+    }
+    if (waiting_for_signal) thread_join(&signal_thread);
+    cancel_destroy(stop);
+    arena_destroy(stop_arena);
+    return e;
 }

@@ -47,15 +47,16 @@ Do them in this order, so that only one daemon ever writes to the journal.
    mise reshim        # only with mise, to drop its shim
    ```
 
-3. **Build and install the C version.** It needs a C23 compiler and `make`:
+3. **Build and install the C version.** It needs only a C23 compiler:
    Apple clang with the Xcode command line tools on macOS, clang 18 or
    gcc 14 or newer on Linux.
 
    ```sh
    git clone git@github.com:sangar/eind.git
    cd eind
-   make && make test
-   make install
+   cc tools/build.c -o nob
+   ./nob test
+   ./nob install
    ```
 
    This copies the binary to `~/.local/bin`, which must be on your `PATH`,

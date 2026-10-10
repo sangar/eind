@@ -1,11 +1,9 @@
 #ifndef EIND_OUTPUT_H
 #define EIND_OUTPUT_H
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-
-#include "../core/util.h"
+#include "mc/core/arena.h"
+#include "mc/core/error.h"
+#include "mc/text/str.h"
 #include "../index/index.h"
 
 typedef enum { FORMAT_PLAIN, FORMAT_JSON, FORMAT_CSV } OutputFormat;
@@ -20,19 +18,21 @@ typedef struct {
 
 /* OutRecord is one search hit in the JSON, CSV and socket formats. */
 typedef struct {
-    const char *path;
-    const char *name;
+    String path;
+    String name;
     bool dir;
     int64_t size;
     int64_t mtime;
     int64_t ctime; /* 0 when unknown */
 } OutRecord;
 
+/* output_write_hits writes count hits to fd in the chosen format; its buffers live in scratch until it returns. */
+[[nodiscard]] Error output_write_hits(int fd, Arena *scratch, const Snapshot *s, const uint32_t *hits, size_t count,
+                                      const OutputOptions *o, Err *err);
 
-/* output_write_hits returns false when writing fails, with errno set. */
-bool output_write_hits(FILE *out, const Snapshot *s, const uint32_t *hits, size_t count, const OutputOptions *o);
-
-void record_of(const Snapshot *s, uint32_t id, OutRecord *rec, StrBuf *path);
-void record_json(StrBuf *sb, const OutRecord *r);
+/* record_of describes id, building its path in path. */
+OutRecord record_of(const Snapshot *s, uint32_t id, StringBuilder *path);
+/* record_json appends r as a JSON object; its timestamps are formatted in scratch, which is not out's arena, and released again. */
+void record_json(StringBuilder *out, Arena *scratch, const OutRecord *r);
 
 #endif

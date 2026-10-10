@@ -1,23 +1,21 @@
 /* eind is an instant file search for the command line. */
-#include <errno.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
 
+#include "mc/concurrency/threadpool.h"
+#include "mc/core/arena.h"
+#include "mc/platform/platform.h"
+#include "mc/platform/service.h"
+#include "mc/platform/terminal.h"
+#include "mc/text/fmt.h"
+#include "mc/text/path.h"
 #include "app/build.h"
 #include "app/config.h"
 #include "app/daemon.h"
 #include "app/output.h"
 #include "app/server.h"
-#include "app/service.h"
 #include "app/tui.h"
-#include "core/arena.h"
-#include "core/threadpool.h"
 #include "index/search.h"
 
 #ifndef EIND_VERSION
@@ -77,12 +75,11 @@ static const char usage_text[] =
 /* Exit statuses: 1 for failures, 2 for mistakes on the command line. */
 enum { EXIT_USAGE = 2 };
 
-static void print_usage(FILE *out) {
-    char *cfg = config_path(), *ix = index_path(), *sock = default_socket_path();
-    fprintf(out, usage_text, cfg, ix, sock);
-    free(cfg);
-    free(ix);
-    free(sock);
+static const char SERVICE_NAME[] = "eind";
+
+static void print_usage(Arena *arena, FILE *out) {
+    fprintf(out, usage_text, str_cstr(arena, config_path(arena)), str_cstr(arena, index_path(arena)),
+            str_cstr(arena, default_socket_path(arena)));
 }
 
 static int fail(const char *msg) {
@@ -99,72 +96,57 @@ static int usage_fail(const char *msg) {
 
 typedef enum { FLAG_BOOL, FLAG_INT, FLAG_STRING, FLAG_LIST, FLAG_DURATION } FlagType;
 
+/* A Flag's dst is a bool, an int64_t, a String, a StringList or, for a duration, an int64_t of milliseconds. */
 typedef struct {
     const char *name;
     FlagType type;
     void *dst;
 } Flag;
 
+/* FlagError is the message for a flag that could not be read. */
+typedef struct {
+    char msg[300];
+} FlagError;
+
 /* parse_duration accepts Go-style durations such as 10s, 500ms, 1m30s. */
-static bool parse_duration(const char *s, int *ms) {
-    double total = 0;
-    const char *p = s;
-    if (!*p) return false;
-    while (*p) {
-        char *end;
-        double v = strtod(p, &end);
-        if (end == p) return false;
-        p = end;
-        double unit;
-        if (!strncmp(p, "ms", 2)) {
-            unit = 1, p += 2;
-        } else if (*p == 's') {
-            unit = 1000, p++;
-        } else if (*p == 'm') {
-            unit = 60000, p++;
-        } else if (*p == 'h') {
-            unit = 3600000, p++;
-        } else {
-            return false;
-        }
-        total += v * unit;
-    }
-    *ms = (int)total;
-    return total > 0;
+static bool parse_duration(String s, int64_t *ms) {
+    int64_t ns;
+    if (!fmt_parse_duration(s, &ns) || ns <= 0) return false;
+    *ms = ns / NS_PER_MILLISECOND;
+    return true;
 }
 
-static const Flag *find_flag(const Flag *flags, size_t count, const char *name, size_t len) {
+static const Flag *find_flag(const Flag *flags, size_t count, String name) {
     for (size_t i = 0; i < count; i++)
-        if (strlen(flags[i].name) == len && strncmp(flags[i].name, name, len) == 0) return &flags[i];
-    return NULL;
+        if (str_equal(S(flags[i].name), name)) return &flags[i];
+    return nullptr;
 }
 
-static bool set_flag(const Flag *f, const char *value, bool has_value, char *err, size_t errlen) {
+static bool set_flag(Arena *arena, const Flag *f, String value, bool has_value, FlagError *why) {
     switch (f->type) {
     case FLAG_BOOL:
-        if (!has_value || !strcmp(value, "true") || !strcmp(value, "1")) {
+        if (!has_value || str_equal(value, S("true")) || str_equal(value, S("1"))) {
             *(bool *)f->dst = true;
-        } else if (!strcmp(value, "false") || !strcmp(value, "0")) {
+        } else if (str_equal(value, S("false")) || str_equal(value, S("0"))) {
             *(bool *)f->dst = false;
         } else {
-            snprintf(err, errlen, "invalid boolean value \"%s\" for -%s", value, f->name);
+            snprintf(why->msg, sizeof why->msg, "invalid boolean value \"%.*s\" for -%s", (int)value.len, value.data, f->name);
             return false;
         }
         return true;
-    case FLAG_INT: {
-        int64_t v;
-        if (!parse_int64(value, &v)) {
-            snprintf(err, errlen, "invalid value \"%s\" for flag -%s: parse error", value, f->name);
+    case FLAG_INT:
+        if (!str_parse_i64(str_trim(value), (int64_t *)f->dst)) {
+            snprintf(why->msg, sizeof why->msg, "invalid value \"%.*s\" for flag -%s: parse error", (int)value.len,
+                     value.data, f->name);
             return false;
         }
-        *(long *)f->dst = (long)v;
         return true;
-    }
-    case FLAG_STRING: *(const char **)f->dst = value; return true;
-    case FLAG_LIST: strlist_push((StrList *)f->dst, value); return true;
+    case FLAG_STRING: *(String *)f->dst = value; return true;
+    case FLAG_LIST: strlist_push(arena, (StringList *)f->dst, value); return true;
     case FLAG_DURATION:
-        if (!parse_duration(value, (int *)f->dst)) {
-            snprintf(err, errlen, "invalid value \"%s\" for flag -%s: parse error", value, f->name);
+        if (!parse_duration(value, (int64_t *)f->dst)) {
+            snprintf(why->msg, sizeof why->msg, "invalid value \"%.*s\" for flag -%s: parse error", (int)value.len,
+                     value.data, f->name);
             return false;
         }
         return true;
@@ -174,9 +156,12 @@ static bool set_flag(const Flag *f, const char *value, bool has_value, char *err
 
 /* Globals are the options every command accepts: where the config, index and socket live. */
 typedef struct {
-    const char *config_path, *index_path, *socket_path;
-    char *owned[3];
+    String config_path, index_path, socket_path;
 } Globals;
+
+static Globals globals_default(Arena *arena) {
+    return (Globals){config_path(arena), index_path(arena), default_socket_path(arena)};
+}
 
 /*
  * parse_flags reads the global flags and the command's own the way Go's
@@ -185,63 +170,57 @@ typedef struct {
  * collects the rest as positional. It returns 0 on success, or the exit
  * status to stop with.
  */
-static int parse_flags(Globals *g, const Flag *flags, size_t count, int argc, char **argv, StrList *positional) {
+static int parse_flags(Arena *arena, Globals *g, const Flag *flags, size_t count, StringList args, StringList *positional) {
     const Flag global[] = {{"config", FLAG_STRING, &g->config_path},
                            {"index", FLAG_STRING, &g->index_path},
                            {"socket", FLAG_STRING, &g->socket_path}};
-    int i = 0;
-    for (; i < argc; i++) {
-        const char *a = argv[i];
-        if (a[0] != '-' || a[1] == '\0') break;
-        if (!strcmp(a, "--")) {
+    size_t i = 0;
+    for (; i < args.count; i++) {
+        String a = args.items[i];
+        if (a.len < 2 || a.data[0] != '-') break;
+        if (str_equal(a, S("--"))) {
             i++;
             break;
         }
-        const char *name = a + (a[1] == '-' ? 2 : 1);
-        const char *eq = strchr(name, '=');
-        size_t len = eq ? (size_t)(eq - name) : strlen(name);
-        if ((len == 1 && name[0] == 'h') || (len == 4 && !strncmp(name, "help", 4))) {
-            print_usage(stdout);
+        String name = str_trim_prefix(str_trim_prefix(a, S("-")), S("-"));
+        String value;
+        bool has_value = str_cut(name, '=', &name, &value);
+        if (str_equal(name, S("h")) || str_equal(name, S("help"))) {
+            print_usage(arena, stdout);
             exit(EXIT_SUCCESS);
         }
-        const Flag *f = find_flag(global, countof(global), name, len);
-        if (!f) f = find_flag(flags, count, name, len);
-        char err[300];
+        const Flag *f = find_flag(global, countof(global), name);
+        if (!f) f = find_flag(flags, count, name);
+        FlagError why;
         if (!f) {
-            snprintf(err, sizeof err, "flag provided but not defined: -%.*s (see eind --help)", (int)len, name);
-            return usage_fail(err);
+            snprintf(why.msg, sizeof why.msg, "flag provided but not defined: -%.*s (see eind --help)", (int)name.len,
+                     name.data);
+            return usage_fail(why.msg);
         }
-        const char *value = eq ? eq + 1 : NULL;
-        if (!value && f->type != FLAG_BOOL) {
-            if (i + 1 >= argc) {
-                snprintf(err, sizeof err, "flag needs an argument: -%s (see eind --help)", f->name);
-                return usage_fail(err);
+        if (!has_value && f->type != FLAG_BOOL) {
+            if (i + 1 >= args.count) {
+                snprintf(why.msg, sizeof why.msg, "flag needs an argument: -%s (see eind --help)", f->name);
+                return usage_fail(why.msg);
             }
-            value = argv[++i];
+            value = args.items[++i];
+            has_value = true;
         }
-        if (!set_flag(f, value ? value : "", value != NULL, err, sizeof err)) {
-            strncat(err, " (see eind --help)", sizeof err - strlen(err) - 1);
-            return usage_fail(err);
+        if (!set_flag(arena, f, has_value ? value : S(""), has_value, &why)) {
+            fprintf(stderr, "eind: %s (see eind --help)\n", why.msg);
+            return EXIT_USAGE;
         }
     }
-    for (; i < argc; i++) strlist_push(positional, argv[i]);
+    for (; i < args.count; i++) strlist_push(arena, positional, args.items[i]);
     return 0;
 }
 
 /* Flags that take a value, so the pre-pass keeps the next argument with them. */
-static bool takes_value(const char *name) {
-    static const char *names[] = {"n", "max-results", "o", "offset", "s", "sort", "path", "color",
-                                  "config", "index", "root", "save-interval", "socket"};
+static bool takes_value(String name) {
+    static const char *const names[] = {"n", "max-results", "o", "offset", "s", "sort", "path", "color",
+                                        "config", "index", "root", "save-interval", "socket"};
     for (size_t i = 0; i < countof(names); i++)
-        if (!strcmp(names[i], name)) return true;
+        if (str_equal(S(names[i]), name)) return true;
     return false;
-}
-
-static bool is_number(const char *s) {
-    if (!*s) return false;
-    for (; *s; s++)
-        if (*s < '0' || *s > '9') return false;
-    return true;
 }
 
 /*
@@ -250,87 +229,100 @@ static bool is_number(const char *s) {
  * text; *literal says the first word came after "--", so it is never taken
  * as a subcommand.
  */
-static void split_args(int argc, char **argv, StrList *positional, StrList *flags, bool *literal) {
+static void split_args(Arena *arena, int argc, char **argv, StringList *positional, StringList *flags, bool *literal) {
     *literal = false;
     for (int i = 0; i < argc; i++) {
-        const char *a = argv[i];
-        if (!strcmp(a, "--")) {
-            *literal = positional->len == 0;
-            for (i++; i < argc; i++) strlist_push(positional, argv[i]);
+        String a = S(argv[i]);
+        if (str_equal(a, S("--"))) {
+            *literal = positional->count == 0;
+            for (i++; i < argc; i++) strlist_push(arena, positional, S(argv[i]));
             break;
         }
-        if (strlen(a) < 2 || a[0] != '-' || has_prefix(a, "-.") || (is_number(a + 1) && strcmp(a, "-0") != 0)) {
-            strlist_push(positional, a);
+        String number = str_slice(a, 1, a.len);
+        if (a.len < 2 || a.data[0] != '-' || str_starts_with(a, S("-.")) ||
+            (str_is_digits(number) && !str_equal(a, S("-0")))) {
+            strlist_push(arena, positional, a);
             continue;
         }
-        strlist_push(flags, a);
-        const char *name = a;
-        while (*name == '-') name++;
-        if (!strchr(name, '=') && takes_value(name) && i + 1 < argc) strlist_push(flags, argv[++i]);
+        strlist_push(arena, flags, a);
+        String name = a;
+        while (str_starts_with(name, S("-"))) name = str_slice(name, 1, name.len);
+        if (!str_contains(name, S("=")) && takes_value(name) && i + 1 < argc) strlist_push(arena, flags, S(argv[++i]));
     }
-}
-
-static void globals_init(Globals *g) {
-    g->owned[0] = config_path();
-    g->owned[1] = index_path();
-    g->owned[2] = default_socket_path();
-    g->config_path = g->owned[0];
-    g->index_path = g->owned[1];
-    g->socket_path = g->owned[2];
-}
-
-static void globals_free(Globals *g) {
-    for (size_t i = 0; i < countof(g->owned); i++) free(g->owned[i]);
 }
 
 /* ---- search ---- */
 
 typedef struct {
     bool regex, case_sensitive, whole_word, match_path;
-    long max_results, offset;
-    const char *sort;
+    int64_t max_results, offset;
+    String sort;
     bool descending;
-    const char *path;
+    String path;
     bool files_only, dirs_only;
     bool json, csv, null_sep, name_only;
     bool show_size, show_modified, show_created;
     bool count;
-    const char *color;
+    String color;
     bool show_version;
 } SearchFlags;
 
-static bool use_color(const char *mode) {
-    if (!strcmp(mode, "always")) return true;
-    if (!strcmp(mode, "never")) return false;
-    return isatty(STDOUT_FILENO) && !getenv("NO_COLOR");
+static bool use_color(Arena *arena, String mode) {
+    if (str_equal(mode, S("always"))) return true;
+    if (str_equal(mode, S("never"))) return false;
+    String no_color;
+    return terminal_is_terminal(1) && !env_get(arena, S("NO_COLOR"), &no_color);
 }
 
-static OutputOptions output_options(const SearchFlags *f) {
+static OutputOptions output_options(Arena *arena, const SearchFlags *f) {
     OutputOptions o = {.null_sep = f->null_sep,
                        .name_only = f->name_only,
                        .show_size = f->show_size,
                        .show_modified = f->show_modified,
                        .show_created = f->show_created,
-                       .color = use_color(f->color)};
+                       .color = use_color(arena, f->color)};
     if (f->json) o.format = FORMAT_JSON;
     else if (f->csv) o.format = FORMAT_CSV;
     return o;
 }
 
-static char *join_terms(const StrList *terms) {
-    StrBuf sb = {0};
-    for (size_t i = 0; i < terms->len; i++) {
-        if (i) sb_putc(&sb, ' ');
-        sb_puts(&sb, terms->items[i]);
+/* print_hits orders and prints the hits of one query the way the flags ask. */
+static int print_hits(Arena *arena, const Snapshot *s, IdList hits, const QueryNode *query, SortKey sort,
+                      const SearchFlags *f) {
+    if (f->count) {
+        printf("%zu\n", hits.count);
+        return EXIT_SUCCESS;
     }
-    sb_cstr(&sb);
-    return sb.data;
+    int64_t keep = f->max_results > 0 ? f->offset + f->max_results : -1;
+    size_t kept = sort == SORT_RELEVANCE ? search_rank(arena, s, hits.items, hits.count, query, keep)
+                                         : search_top(arena, s, hits.items, hits.count, sort, f->descending, keep);
+    size_t from = min_size(f->offset > 0 ? (size_t)f->offset : 0, kept);
+    size_t count = kept - from;
+    if (f->max_results > 0 && (uint64_t)f->max_results < count) count = (size_t)f->max_results;
+    OutputOptions o = output_options(arena, f);
+    Err err;
+    fflush(stdout);
+    if (output_write_hits(1, arena, s, hits.items + from, count, &o, &err) != ERR_OK) return fail(err.msg);
+    return EXIT_SUCCESS;
 }
 
-static int cmd_search(StrList *flag_args, StrList *terms, bool force_tui) {
-    Globals g;
-    globals_init(&g);
-    SearchFlags f = {.sort = "path", .color = "auto"};
+static int search_and_print(Arena *arena, const Snapshot *s, String text, QueryDefaults defaults, SortKey sort,
+                            const SearchFlags *f) {
+    Err err;
+    QueryNode *query;
+    if (query_parse(arena, text, defaults, &query, &err) != ERR_OK) return fail(err.msg);
+    ThreadPool *cpu;
+    if (threadpool_create(0, &cpu, &err) != ERR_OK) return fail(err.msg);
+    IdList hits;
+    Error e = search_run(cpu, arena, s, query_restrict(arena, query, f->path, f->files_only, f->dirs_only), nullptr,
+                         &hits, &err);
+    threadpool_destroy(cpu);
+    return e == ERR_OK ? print_hits(arena, s, hits, query, sort, f) : fail(err.msg);
+}
+
+static int cmd_search(Arena *arena, StringList flag_args, StringList terms, bool force_tui) {
+    Globals g = globals_default(arena);
+    SearchFlags f = {.sort = S("path"), .color = S("auto")};
     const Flag flags[] = {
         {"r", FLAG_BOOL, &f.regex},          {"regex", FLAG_BOOL, &f.regex},
         {"i", FLAG_BOOL, &f.case_sensitive}, {"case", FLAG_BOOL, &f.case_sensitive},
@@ -348,313 +340,247 @@ static int cmd_search(StrList *flag_args, StrList *terms, bool force_tui) {
         {"dc", FLAG_BOOL, &f.show_created},  {"count", FLAG_BOOL, &f.count},
         {"color", FLAG_STRING, &f.color},    {"version", FLAG_BOOL, &f.show_version},
     };
-    StrList extra = {0};
-    int rc = parse_flags(&g, flags, countof(flags), (int)flag_args->len, flag_args->items, &extra);
-    strlist_free(&extra);
-    if (rc) {
-        globals_free(&g);
-        return rc;
-    }
+    StringList extra = {0};
+    int rc = parse_flags(arena, &g, flags, countof(flags), flag_args, &extra);
+    if (rc) return rc;
     if (f.show_version) {
         printf("eind %s\n", EIND_VERSION);
-        globals_free(&g);
-        return 0;
+        return EXIT_SUCCESS;
     }
     Err err;
     SortKey sort;
-    if (!sort_key_parse(f.sort, &sort, &err)) {
-        globals_free(&g);
-        return fail(err.msg);
-    }
-    char *query = join_terms(terms);
-    bool want_tui = force_tui || (terms->len == 0 && isatty(STDOUT_FILENO) && !f.count && !f.json && !f.csv);
-    rc = EXIT_SUCCESS;
-    Snapshot *s = load_or_build(g.config_path, g.index_path, &err);
-    if (!s) {
-        free(query);
-        globals_free(&g);
-        return fail(err.msg);
-    }
+    if (sort_key_parse(f.sort, &sort, &err) != ERR_OK) return fail(err.msg);
+    bool want_tui = force_tui || (terms.count == 0 && terminal_is_terminal(1) && !f.count && !f.json && !f.csv);
+    Snapshot *s;
+    if (load_or_build(g.config_path, g.index_path, &s, &err) != ERR_OK) return fail(err.msg);
     QueryDefaults defaults = {.regex = f.regex, .case_sensitive = f.case_sensitive, .whole_word = f.whole_word,
                               .match_path = f.match_path};
     if (want_tui) {
-        char *chosen;
-        if (!tui_run(s, defaults, &chosen, &err)) {
-            rc = fail(err.msg);
-        } else if (chosen) {
-            printf("%s\n", chosen);
-            free(chosen);
-        }
+        String chosen;
+        rc = tui_run(arena, s, defaults, &chosen, &err) != ERR_OK ? fail(err.msg) : EXIT_SUCCESS;
+        if (chosen.len) printf("%.*s\n", (int)chosen.len, chosen.data);
     } else {
-        Arena arena;
-        arena_init(&arena, 4096);
-        QueryNode *node = query_parse(&arena, query, defaults, &err);
-        U32Vec hits = {0};
-        ThreadPool *cpu = threadpool_create(cpu_count());
-        if (!node || search_run(cpu, s, query_restrict(&arena, node, f.path, f.files_only, f.dirs_only), NULL, &hits,
-                                &err) != SEARCH_OK) {
-            rc = fail(err.msg);
-        } else if (f.count) {
-            printf("%zu\n", hits.len);
-        } else {
-            long keep = f.max_results > 0 ? f.offset + f.max_results : -1;
-            size_t kept = sort == SORT_RELEVANCE ? search_rank(s, hits.data, hits.len, node, keep)
-                                                 : search_top(s, hits.data, hits.len, sort, f.descending, keep);
-            size_t from = min_size(f.offset > 0 ? (size_t)f.offset : 0, kept);
-            size_t count = kept - from;
-            if (f.max_results > 0 && (size_t)f.max_results < count) count = (size_t)f.max_results;
-            OutputOptions o = output_options(&f);
-            if (!output_write_hits(stdout, s, hits.data + from, count, &o) && errno != EPIPE)
-                rc = fail(strerror(errno));
-        }
-        threadpool_destroy(cpu);
-        u32vec_free(&hits);
-        arena_free(&arena);
+        rc = search_and_print(arena, s, str_join(arena, terms, S(" ")), defaults, sort, &f);
     }
     snapshot_release(s);
-    free(query);
-    globals_free(&g);
     return rc;
 }
 
 /* ---- other commands ---- */
 
-static int cmd_index(StrList *args) {
-    Globals g;
-    globals_init(&g);
-    StrList roots = {0};
+static int cmd_index(Arena *arena, StringList args) {
+    Globals g = globals_default(arena);
+    StringList roots = {0}, extra = {0};
     const Flag flags[] = {{"root", FLAG_LIST, &roots}};
-    StrList extra = {0};
-    int rc = parse_flags(&g, flags, countof(flags), (int)args->len, args->items, &extra);
+    int rc = parse_flags(arena, &g, flags, countof(flags), args, &extra);
+    if (rc) return rc;
     Config cfg;
     Err err;
-    if (!rc && !config_load(g.config_path, &cfg, &err)) rc = fail(err.msg);
-    if (!rc) {
-        if (roots.len) {
-            strlist_free(&cfg.roots);
-            for (size_t i = 0; i < roots.len; i++) strlist_push_owned(&cfg.roots, expand_home(roots.items[i]));
-        }
-        Snapshot *s = build_index(&cfg, g.index_path, &err);
-        if (s) snapshot_release(s);
-        else rc = fail(err.msg);
-        config_free(&cfg);
+    if (config_load(arena, g.config_path, &cfg, &err) != ERR_OK) return fail(err.msg);
+    if (roots.count) {
+        cfg.roots = (StringList){0};
+        String home = env_home(arena);
+        for (size_t i = 0; i < roots.count; i++) strlist_push(arena, &cfg.roots, path_expand_home(arena, roots.items[i], home));
     }
-    strlist_free(&roots);
-    strlist_free(&extra);
-    globals_free(&g);
-    return rc;
+    Snapshot *s;
+    if (build_index(&cfg, g.index_path, &s, &err) != ERR_OK) return fail(err.msg);
+    snapshot_release(s);
+    return EXIT_SUCCESS;
 }
 
-static int cmd_daemon(StrList *args, bool serve) {
-    Globals g;
-    globals_init(&g);
-    int interval = 10000;
-    const Flag flags[] = {{"save-interval", FLAG_DURATION, &interval}};
-    StrList extra = {0};
-    int rc = parse_flags(&g, flags, countof(flags), (int)args->len, args->items, &extra);
-    if (!rc) {
-        DaemonOptions o = {.config_path = g.config_path,
-                           .index_path = g.index_path,
-                           .socket_path = g.socket_path,
-                           .serve = serve,
-                           .save_interval_ms = interval};
-        Err err;
-        if (!daemon_run(&o, &err)) rc = fail(err.msg);
-    }
-    strlist_free(&extra);
-    globals_free(&g);
-    return rc;
-}
-
-static int cmd_service(StrList *args) {
-    if (args->len != 1 || (strcmp(args->items[0], "enable") && strcmp(args->items[0], "disable")))
-        return usage_fail("usage: eind service enable|disable");
+static int cmd_daemon(Arena *arena, StringList args, bool serve) {
+    Globals g = globals_default(arena);
+    int64_t interval_ms = 10000;
+    const Flag flags[] = {{"save-interval", FLAG_DURATION, &interval_ms}};
+    StringList extra = {0};
+    int rc = parse_flags(arena, &g, flags, countof(flags), args, &extra);
+    if (rc) return rc;
+    DaemonOptions o = {.config_path = g.config_path,
+                       .index_path = g.index_path,
+                       .socket_path = g.socket_path,
+                       .serve = serve,
+                       .save_interval_ms = interval_ms};
     Err err;
-    char *unit = service_unit_path(&err);
-    if (!unit) return fail(err.msg);
-    int rc = EXIT_SUCCESS;
-    if (!strcmp(args->items[0], "disable")) {
-        if (service_disable(&err)) printf("stopped eind serve and removed %s\n", unit);
-        else rc = fail(err.msg);
-    } else {
-        char *exe = service_executable_path(&err);
-        if (!exe || !service_enable(exe, &err)) rc = fail(err.msg);
-        else printf("eind serve now runs at login; definition at %s\n", unit);
-        free(exe);
-    }
-    free(unit);
-    return rc;
+    return daemon_run(&o, &err) != ERR_OK ? fail(err.msg) : EXIT_SUCCESS;
 }
 
-static int cmd_status(StrList *args) {
-    Globals g;
-    globals_init(&g);
-    StrList extra = {0};
-    int rc = parse_flags(&g, NULL, 0, (int)args->len, args->items, &extra);
-    strlist_free(&extra);
-    if (rc) {
-        globals_free(&g);
-        return rc;
-    }
-    struct stat st;
-    printf("config: %s%s\n", g.config_path, stat(g.config_path, &st) ? " (not present, using defaults)" : "");
-    if (server_running(g.socket_path)) {
-        printf("daemon: running at %s\n", g.socket_path);
-    } else {
-        printf("daemon: not running (start with `eind serve`, socket %s)\n", g.socket_path);
-    }
+/* eind_service runs `eind serve` from executable; launchd keeps its output in a log file, systemd in its journal. */
+static Service eind_service(Arena *arena, const ServiceManager *manager, String executable) {
+    Service service = {.name = S(SERVICE_NAME), .description = S("eind file index daemon")};
+    strlist_push(arena, &service.argv, executable);
+    strlist_push(arena, &service.argv, S("serve"));
+    if (manager->kind == SERVICE_LAUNCHD) service.log_path = path_join(arena, env_home(arena), S("Library/Logs/eind.log"));
+    return service;
+}
+
+static int cmd_service(Arena *arena, StringList args) {
+    bool enable = args.count == 1 && str_equal(args.items[0], S("enable"));
+    bool disable = args.count == 1 && str_equal(args.items[0], S("disable"));
+    if (!enable && !disable) return usage_fail("usage: eind service enable|disable");
     Err err;
-    char *unit = service_unit_path(&err);
-    if (unit && service_installed()) {
-        printf("service: enabled, %s\n", unit);
+    ServiceManager manager;
+    if (service_manager(arena, &manager, &err) != ERR_OK) return fail(err.msg);
+    String definition = service_path(arena, &manager, S(SERVICE_NAME));
+    if (disable) {
+        if (service_disable(arena, &manager, S(SERVICE_NAME), &err) != ERR_OK) return fail(err.msg);
+        printf("stopped eind serve and removed %.*s\n", (int)definition.len, definition.data);
+        return EXIT_SUCCESS;
+    }
+    String executable;
+    if (service_executable_path(arena, S(SERVICE_NAME), &executable, &err) != ERR_OK) return fail(err.msg);
+    Service service = eind_service(arena, &manager, executable);
+    if (service_enable(arena, &manager, &service, &err) != ERR_OK) return fail(err.msg);
+    printf("eind serve now runs at login; definition at %.*s\n", (int)definition.len, definition.data);
+    return EXIT_SUCCESS;
+}
+
+static void print_service_status(Arena *arena) {
+    ServiceManager manager;
+    if (service_manager(arena, &manager, nullptr) == ERR_OK && service_installed(arena, &manager, S(SERVICE_NAME))) {
+        String definition = service_path(arena, &manager, S(SERVICE_NAME));
+        printf("service: enabled, %.*s\n", (int)definition.len, definition.data);
     } else {
         printf("service: not enabled (run `eind service enable` to start eind serve at login)\n");
     }
-    free(unit);
-    printf("index:  %s", g.index_path);
-    if (stat(g.index_path, &st) != 0) {
+}
+
+static int cmd_status(Arena *arena, StringList args) {
+    Globals g = globals_default(arena);
+    StringList extra = {0};
+    int rc = parse_flags(arena, &g, nullptr, 0, args, &extra);
+    if (rc) return rc;
+    printf("config: %.*s%s\n", (int)g.config_path.len, g.config_path.data,
+           file_exists(g.config_path) ? "" : " (not present, using defaults)");
+    if (server_running(g.socket_path)) {
+        printf("daemon: running at %.*s\n", (int)g.socket_path.len, g.socket_path.data);
+    } else {
+        printf("daemon: not running (start with `eind serve`, socket %.*s)\n", (int)g.socket_path.len, g.socket_path.data);
+    }
+    print_service_status(arena);
+    printf("index:  %.*s", (int)g.index_path.len, g.index_path.data);
+    FileInfo info;
+    if (file_info_follow(g.index_path, &info, nullptr) != ERR_OK || !info.exists) {
         printf(" (not built yet; run `eind index`)\n");
-        globals_free(&g);
-        return 0;
+        return EXIT_SUCCESS;
     }
-    char size[32], files_s[32], dirs_s[32], took[32], built[32];
-    printf(" (%s)\n", human_size(st.st_size, size));
-    int64_t start = monotonic_us();
-    bool missing;
-    Snapshot *s = index_load(g.index_path, &missing, &err);
-    if (!s) {
-        globals_free(&g);
-        return fail(err.msg);
-    }
+    String size = fmt_bytes(arena, info.size);
+    printf(" (%.*s)\n", (int)size.len, size.data);
+    int64_t start = clock_monotonic_ns();
+    Err err;
+    Snapshot *s;
+    if (index_load(g.index_path, &s, &err) != ERR_OK) return fail(err.msg);
     int64_t files, dirs;
     snap_stats(s, &files, &dirs);
+    String took = format_elapsed(arena, clock_monotonic_ns() - start);
+    char built[32];
     time_t when = (time_t)s->built_at;
     struct tm tm;
     localtime_r(&when, &tm);
     strftime(built, sizeof built, "%Y-%m-%d %H:%M:%S", &tm);
+    String files_text = fmt_thousands(arena, files), dirs_text = fmt_thousands(arena, dirs);
     printf("built:  %s\n", built);
-    printf("loaded: %s files, %s folders in %s\n", commas(files, files_s), commas(dirs, dirs_s),
-           format_duration(elapsed_ms_since(start), took));
-    for (size_t i = 0; i < s->roots.len; i++) printf("root:   %s\n", s->roots.items[i]);
+    printf("loaded: %.*s files, %.*s folders in %.*s\n", (int)files_text.len, files_text.data, (int)dirs_text.len,
+           dirs_text.data, (int)took.len, took.data);
+    for (size_t i = 0; i < s->roots.count; i++) printf("root:   %.*s\n", (int)s->roots.items[i].len, s->roots.items[i].data);
     snapshot_release(s);
-    globals_free(&g);
-    return 0;
+    return EXIT_SUCCESS;
 }
 
 /* run_editor runs $VISUAL or $EDITOR through the shell, so values with arguments such as "code --wait" work. */
-static bool run_editor(const char *path, Err *err) {
-    const char *editor = getenv("VISUAL");
-    if (!editor || !*editor) editor = getenv("EDITOR");
-    if (!editor || !*editor) editor = "vi";
-    pid_t pid = fork();
-    if (pid == 0) {
-        StrBuf cmd = {0};
-        sb_printf(&cmd, "%s \"$1\"", editor);
-        execl("/bin/sh", "sh", "-c", cmd.data, "sh", path, (char *)NULL);
-        _exit(127);
+[[nodiscard]] static Error run_editor(Arena *arena, String path, Err *err) {
+    String editor;
+    if (!env_get(arena, S("VISUAL"), &editor) || editor.len == 0) {
+        if (!env_get(arena, S("EDITOR"), &editor) || editor.len == 0) editor = S("vi");
     }
-    int status;
-    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        err_set(err, "editor \"%s\" failed", editor);
-        return false;
-    }
-    return true;
+    StringList argv = {0};
+    strlist_push(arena, &argv, S("/bin/sh"));
+    strlist_push(arena, &argv, S("-c"));
+    strlist_push(arena, &argv, str_concat(arena, editor, S(" \"$1\"")));
+    strlist_push(arena, &argv, S("sh"));
+    strlist_push(arena, &argv, path);
+    int exit_code;
+    Error e = process_run_interactive(arena, argv, &exit_code, err);
+    if (e == ERR_OK && exit_code != 0) e = err_set(err, ERR_IO, "editor \"%.*s\" failed", (int)editor.len, editor.data);
+    return e;
 }
 
-static int cmd_config(StrList *args) {
-    Globals g;
-    globals_init(&g);
-    bool initialize = false;
-    const Flag flags[] = {{"init", FLAG_BOOL, &initialize}};
-    StrList rest = {0};
-    int rc = parse_flags(&g, flags, countof(flags), (int)args->len, args->items, &rest);
+static int config_edit(Arena *arena, String path) {
     Err err;
     bool created;
-    if (rc) {
-        /* already reported */
-    } else if (rest.len == 1 && !strcmp(rest.items[0], "edit")) {
-        if (!config_write_default(g.config_path, &created, &err) || !run_editor(g.config_path, &err)) {
-            rc = fail(err.msg);
-        } else {
-            Config cfg;
-            if (config_load(g.config_path, &cfg, &err)) {
-                config_free(&cfg);
-                printf("config is valid; run `eind index` to apply it\n");
-            } else {
-                fprintf(stderr, "eind: %s\nrun `eind config edit` again to fix it\n", err.msg);
-                rc = EXIT_FAILURE;
-            }
-        }
-    } else if (rest.len > 0) {
-        char msg[300];
-        snprintf(msg, sizeof msg, "unknown config action \"%s\" (want edit)", rest.items[0]);
-        rc = usage_fail(msg);
-    } else if (initialize) {
-        if (!config_write_default(g.config_path, &created, &err)) rc = fail(err.msg);
-        else if (created) printf("wrote %s\n", g.config_path);
-        else printf("%s already exists\n", g.config_path);
-    } else {
-        Config cfg;
-        if (!config_load(g.config_path, &cfg, &err)) {
-            rc = fail(err.msg);
-        } else {
-            StrBuf text = {0};
-            config_render(&cfg, &text);
-            printf("# %s\n%s", g.config_path, sb_cstr(&text));
-            sb_free(&text);
-            config_free(&cfg);
-        }
+    if (config_write_default(arena, path, &created, &err) != ERR_OK || run_editor(arena, path, &err) != ERR_OK)
+        return fail(err.msg);
+    Config cfg;
+    if (config_load(arena, path, &cfg, &err) != ERR_OK) {
+        fprintf(stderr, "eind: %s\nrun `eind config edit` again to fix it\n", err.msg);
+        return EXIT_FAILURE;
     }
-    strlist_free(&rest);
-    globals_free(&g);
-    return rc;
+    printf("config is valid; run `eind index` to apply it\n");
+    return EXIT_SUCCESS;
 }
 
-static void append_all(StrList *dst, const StrList *src, size_t from) {
-    for (size_t i = from; i < src->len; i++) strlist_push(dst, src->items[i]);
+static int cmd_config(Arena *arena, StringList args) {
+    Globals g = globals_default(arena);
+    bool initialize = false;
+    const Flag flags[] = {{"init", FLAG_BOOL, &initialize}};
+    StringList rest = {0};
+    int rc = parse_flags(arena, &g, flags, countof(flags), args, &rest);
+    if (rc) return rc;
+    if (rest.count == 1 && str_equal(rest.items[0], S("edit"))) return config_edit(arena, g.config_path);
+    if (rest.count > 0) {
+        String action = rest.items[0];
+        fprintf(stderr, "eind: unknown config action \"%.*s\" (want edit)\n", (int)action.len, action.data);
+        return EXIT_USAGE;
+    }
+    Err err;
+    if (initialize) {
+        bool created;
+        if (config_write_default(arena, g.config_path, &created, &err) != ERR_OK) return fail(err.msg);
+        printf(created ? "wrote %.*s\n" : "%.*s already exists\n", (int)g.config_path.len, g.config_path.data);
+        return EXIT_SUCCESS;
+    }
+    Config cfg;
+    if (config_load(arena, g.config_path, &cfg, &err) != ERR_OK) return fail(err.msg);
+    StringBuilder text = str_builder_create(arena, 1024);
+    config_render(&cfg, &text);
+    printf("# %.*s\n%.*s", (int)g.config_path.len, g.config_path.data, (int)text.len, text.data);
+    return EXIT_SUCCESS;
 }
 
-static int run(int argc, char **argv) {
-    StrList positional = {0}, flags = {0}, args = {0};
+static StringList concat_lists(Arena *arena, StringList a, StringList b, size_t b_from) {
+    StringList all = strlist_copy(arena, a);
+    for (size_t i = b_from; i < b.count; i++) strlist_push(arena, &all, b.items[i]);
+    return all;
+}
+
+static int run(Arena *arena, int argc, char **argv) {
+    StringList positional = {0}, flags = {0};
     bool literal;
-    split_args(argc, argv, &positional, &flags, &literal);
-    const char *cmd = positional.len && !literal ? positional.items[0] : "";
-    int rc;
-    append_all(&args, &flags, 0);
-    if (!strcmp(cmd, "index") || !strcmp(cmd, "watch") || !strcmp(cmd, "serve") || !strcmp(cmd, "config")) {
-        append_all(&args, &positional, 1);
-        rc = cmd[0] == 'i' ? cmd_index(&args) : cmd[0] == 'c' ? cmd_config(&args) : cmd_daemon(&args, cmd[1] == 'e');
-    } else if (!strcmp(cmd, "status")) {
-        rc = cmd_status(&args);
-    } else if (!strcmp(cmd, "service")) {
-        StrList rest = {0};
-        append_all(&rest, &positional, 1);
-        rc = cmd_service(&rest);
-        strlist_free(&rest);
-    } else if (!strcmp(cmd, "tui")) {
-        StrList none = {0};
-        rc = cmd_search(&args, &none, true);
-    } else if (!strcmp(cmd, "search")) {
-        StrList terms = {0};
-        append_all(&terms, &positional, 1);
-        rc = cmd_search(&args, &terms, false);
-        strlist_free(&terms);
-    } else if (!strcmp(cmd, "version")) {
+    split_args(arena, argc, argv, &positional, &flags, &literal);
+    String cmd = positional.count && !literal ? positional.items[0] : S("");
+    StringList rest = concat_lists(arena, (StringList){0}, positional, 1);
+    StringList with_rest = concat_lists(arena, flags, positional, 1);
+    if (str_equal(cmd, S("index"))) return cmd_index(arena, with_rest);
+    if (str_equal(cmd, S("config"))) return cmd_config(arena, with_rest);
+    if (str_equal(cmd, S("watch"))) return cmd_daemon(arena, with_rest, false);
+    if (str_equal(cmd, S("serve"))) return cmd_daemon(arena, with_rest, true);
+    if (str_equal(cmd, S("status"))) return cmd_status(arena, flags);
+    if (str_equal(cmd, S("service"))) return cmd_service(arena, rest);
+    if (str_equal(cmd, S("tui"))) return cmd_search(arena, flags, (StringList){0}, true);
+    if (str_equal(cmd, S("search"))) return cmd_search(arena, flags, rest, false);
+    if (str_equal(cmd, S("version"))) {
         printf("eind %s\n", EIND_VERSION);
-        rc = 0;
-    } else if (!strcmp(cmd, "help")) {
-        print_usage(stdout);
-        rc = 0;
-    } else {
-        rc = cmd_search(&args, &positional, false);
+        return EXIT_SUCCESS;
     }
-    strlist_free(&positional);
-    strlist_free(&flags);
-    strlist_free(&args);
-    return rc;
+    if (str_equal(cmd, S("help"))) {
+        print_usage(arena, stdout);
+        return EXIT_SUCCESS;
+    }
+    return cmd_search(arena, flags, positional, false);
 }
 
 int main(int argc, char **argv) {
-    signal(SIGPIPE, SIG_IGN);
-    return run(argc - 1, argv + 1);
+    Arena *arena = arena_create(0);
+    int rc = run(arena, argc - 1, argv + 1);
+    arena_destroy(arena);
+    return rc;
 }

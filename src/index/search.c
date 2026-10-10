@@ -1,18 +1,16 @@
 #include "search.h"
 
 #include <regex.h>
-#include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 
-#include "../core/arena.h"
-#include "../core/sort.h"
-#include "../core/threadpool.h"
+#include "mc/container/sort.h"
+#include "mc/platform/platform.h"
+#include "mc/text/path.h"
+#include "mc/text/utf8.h"
 
-#define CANCEL_CHECK_INTERVAL 8192
-#define MIN_CHUNK 4096
+enum { CANCEL_CHECK_INTERVAL = 8192, MIN_CHUNK = 4096 };
 
-bool sort_key_parse(const char *s, SortKey *out, Err *err) {
+Error sort_key_parse(String s, SortKey *out, Err *err) {
     static const struct {
         const char *name;
         SortKey key;
@@ -24,13 +22,13 @@ bool sort_key_parse(const char *s, SortKey *out, Err *err) {
         {"rank", SORT_RELEVANCE},
     };
     for (size_t i = 0; i < countof(keys); i++) {
-        if (strcasecmp(s, keys[i].name) == 0) {
+        if (str_equal_ignore_case(s, S(keys[i].name))) {
             *out = keys[i].key;
-            return true;
+            return ERR_OK;
         }
     }
-    err_set(err, "unknown sort key \"%s\" (use path, name, size, dm, dc, ext or relevance)", s);
-    return false;
+    return err_set(err, ERR_INVALID_ARGUMENT, "unknown sort key \"%.*s\" (use path, name, size, dm, dc, ext or relevance)",
+                   (int)s.len, s.data);
 }
 
 /* ---- matchers ---- */
@@ -65,13 +63,12 @@ typedef struct Matcher {
     struct Matcher **kids;
     uint32_t kid_count;
     struct Matcher *kid;
-    const char *needle;
-    size_t needle_len;
+    String needle;
     regex_t *re;
     TextMode mode;
     GlobKind glob;
     bool path, cased;
-    const char **exts;
+    const String *exts;
     uint32_t ext_count;
     Range range;
     bool dir;
@@ -79,37 +76,47 @@ typedef struct Matcher {
 } Matcher;
 
 typedef struct {
-    Arena arena;
+    regex_t **items;
+    size_t count;
+    size_t capacity;
+} RegexList;
+
+/* Compiled is a query's matcher tree; it and its regexes live in arena until compiled_free. */
+typedef struct {
+    Arena *arena;
     Matcher *root;
-    regex_t **regexes;
-    size_t regex_count, regex_cap;
+    RegexList regexes;
 } Compiled;
 
 /* MatchCtx carries one record through the matcher tree, building its path only if a matcher asks. */
 typedef struct {
     const Snapshot *s;
     uint32_t id;
-    StrBuf path, path_lower;
+    StringBuilder path, path_lower;
     bool have_path, have_lower;
 } MatchCtx;
 
-static const char *ctx_path(MatchCtx *c) {
+static String ctx_path(MatchCtx *c) {
     if (!c->have_path) {
         snap_path(c->s, c->id, &c->path);
         c->have_path = true;
     }
-    return c->path.data;
+    return (String){c->path.data, c->path.len};
 }
 
-static const char *ctx_path_lower(MatchCtx *c) {
+static unsigned char fold_byte(char c) { return (unsigned char)(c >= 'A' && c <= 'Z' ? c + 32 : c); }
+
+static String ctx_path_lower(MatchCtx *c) {
     if (!c->have_lower) {
-        const char *p = ctx_path(c);
-        sb_clear(&c->path_lower);
-        sb_append(&c->path_lower, p, c->path.len);
-        ascii_lower(c->path_lower.data, c->path_lower.data, c->path_lower.len);
+        String path = ctx_path(c);
+        StringBuilder *lower = &c->path_lower;
+        if (lower->capacity <= path.len) *lower = str_builder_create(lower->arena, 2 * path.len + 1);
+        for (size_t i = 0; i < path.len; i++) lower->data[i] = (char)fold_byte(path.data[i]);
+        lower->data[path.len] = '\0';
+        lower->len = path.len;
         c->have_lower = true;
     }
-    return c->path_lower.data;
+    return (String){c->path_lower.data, c->path_lower.len};
 }
 
 /* Bytes of multi-byte UTF-8 sequences count as letters; underscores separate words so ww:main finds main_test.go. */
@@ -117,34 +124,41 @@ static bool is_word_byte(unsigned char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c >= 0x80;
 }
 
-static unsigned char fold_byte(char c) { return (unsigned char)(c >= 'A' && c <= 'Z' ? c + 32 : c); }
-
 /*
  * The name matchers fold case while they compare, so a scan reads each name
  * once in place and copies nothing. The needle is already lowercase when
  * fold is set.
  */
-static bool fold_equal_at(const char *hay, const char *needle, size_t n, bool fold) {
-    for (size_t k = 0; k < n; k++)
-        if ((fold ? fold_byte(hay[k]) : (unsigned char)hay[k]) != (unsigned char)needle[k]) return false;
+static bool fold_equal_at(const char *hay, String needle, bool fold) {
+    for (size_t k = 0; k < needle.len; k++)
+        if ((fold ? fold_byte(hay[k]) : (unsigned char)hay[k]) != (unsigned char)needle.data[k]) return false;
     return true;
 }
 
-static const char *find_in(const char *hay, size_t hay_len, const char *needle, size_t needle_len, bool fold) {
-    if (needle_len == 0) return hay;
-    if (!fold) return needle_len > hay_len ? NULL : memmem(hay, hay_len, needle, needle_len);
-    unsigned char first = (unsigned char)needle[0];
-    for (size_t i = 0; i + needle_len <= hay_len; i++)
-        if (fold_byte(hay[i]) == first && fold_equal_at(hay + i + 1, needle + 1, needle_len - 1, true)) return hay + i;
-    return NULL;
+/* find_in stores where needle first occurs in hay. */
+static bool find_in(String hay, String needle, bool fold, size_t *at) {
+    if (!fold) return str_find(hay, needle, at);
+    if (needle.len == 0) {
+        *at = 0;
+        return true;
+    }
+    unsigned char first = (unsigned char)needle.data[0];
+    String rest = str_slice(needle, 1, needle.len);
+    for (size_t i = 0; i + needle.len <= hay.len; i++) {
+        if (fold_byte(hay.data[i]) == first && fold_equal_at(hay.data + i + 1, rest, true)) {
+            *at = i;
+            return true;
+        }
+    }
+    return false;
 }
 
-static bool contains_word(const char *hay, size_t hay_len, const char *needle, size_t needle_len, bool fold) {
-    if (needle_len == 0) return true;
-    for (const char *p = hay; (p = find_in(p, hay_len - (size_t)(p - hay), needle, needle_len, fold)) != NULL; p++) {
-        size_t start = (size_t)(p - hay), end = start + needle_len;
-        bool before = start == 0 || !is_word_byte((unsigned char)hay[start - 1]);
-        bool after = end >= hay_len || !is_word_byte((unsigned char)hay[end]);
+static bool contains_word(String hay, String needle, bool fold) {
+    if (needle.len == 0) return true;
+    for (size_t start = 0, at; find_in(str_slice(hay, start, hay.len), needle, fold, &at); start += at + 1) {
+        size_t begin = start + at, end = begin + needle.len;
+        bool before = begin == 0 || !is_word_byte((unsigned char)hay.data[begin - 1]);
+        bool after = end >= hay.len || !is_word_byte((unsigned char)hay.data[end]);
         if (before && after) return true;
     }
     return false;
@@ -152,42 +166,36 @@ static bool contains_word(const char *hay, size_t hay_len, const char *needle, s
 
 static bool in_range(int64_t v, Range r) { return v >= r.lo && v <= r.hi; }
 
-static int64_t depth_of(const char *path) {
-    size_t n = strlen(path);
-    while (n > 0 && path[n - 1] == '/') n--;
-    int64_t d = 0;
-    for (size_t i = 0; i < n; i++)
-        if (path[i] == '/') d++;
-    return d;
+static int64_t depth_of(String path) {
+    while (path.len > 0 && path.data[path.len - 1] == '/') path.len--;
+    return (int64_t)str_count_char(path, '/');
 }
 
 static bool match_text(const Matcher *m, MatchCtx *c) {
-    const char *hay;
-    size_t hay_len;
+    String hay;
     bool fold = !m->cased;
+    size_t at;
     if (m->re) {
-        hay = m->path ? ctx_path(c) : snap_name(c->s, c->id);
-        return regexec(m->re, hay, 0, NULL, 0) == 0;
+        hay = m->path ? ctx_path(c) : snap_name_view(c->s, c->id);
+        return regexec(m->re, hay.data, 0, nullptr, 0) == 0;
     }
     if (m->path) {
         hay = m->cased ? ctx_path(c) : ctx_path_lower(c);
-        hay_len = c->path.len;
         fold = false; /* the path copy is already lowercased */
     } else {
-        hay = snap_name(c->s, c->id);
-        hay_len = snap_name_len(c->s, c->id);
+        hay = snap_name_view(c->s, c->id);
     }
-    size_t n = m->needle_len;
+    size_t n = m->needle.len;
     switch (m->glob) {
-    case GLOB_SUFFIX: return n <= hay_len && fold_equal_at(hay + hay_len - n, m->needle, n, fold);
-    case GLOB_PREFIX: return n <= hay_len && fold_equal_at(hay, m->needle, n, fold);
-    case GLOB_CONTAINS: return find_in(hay, hay_len, m->needle, n, fold) != NULL;
+    case GLOB_SUFFIX: return n <= hay.len && fold_equal_at(hay.data + hay.len - n, m->needle, fold);
+    case GLOB_PREFIX: return n <= hay.len && fold_equal_at(hay.data, m->needle, fold);
+    case GLOB_CONTAINS: return find_in(hay, m->needle, fold, &at);
     case GLOB_NONE: break;
     }
     switch (m->mode) {
-    case TEXT_WHOLENAME: return n == hay_len && fold_equal_at(hay, m->needle, n, fold);
-    case TEXT_WHOLEWORD: return contains_word(hay, hay_len, m->needle, n, fold);
-    default: return find_in(hay, hay_len, m->needle, n, fold) != NULL;
+    case TEXT_WHOLENAME: return n == hay.len && fold_equal_at(hay.data, m->needle, fold);
+    case TEXT_WHOLEWORD: return contains_word(hay, m->needle, fold);
+    default: return find_in(hay, m->needle, fold, &at);
     }
 }
 
@@ -206,16 +214,15 @@ static bool matches(const Matcher *m, MatchCtx *c) {
     case M_NOT: return !matches(m->kid, c);
     case M_TEXT: return match_text(m, c);
     case M_EXT: {
-        size_t len;
-        const char *ext = snap_ext(c->s, c->id, &len);
+        String ext = snap_ext(c->s, c->id);
         for (uint32_t k = 0; k < m->ext_count; k++)
-            if (ascii_casecmp(ext, len, m->exts[k], strlen(m->exts[k])) == 0) return true;
+            if (str_equal_ignore_case(ext, m->exts[k])) return true;
         return false;
     }
     case M_SIZE: return in_range(snap_size(c->s, c->id), m->range);
     case M_MODIFIED: return in_range(snap_mtime(c->s, c->id), m->range);
     case M_CREATED: return in_range(snap_ctime(c->s, c->id), m->range);
-    case M_NAMELEN: return in_range(utf8_count(snap_name(c->s, c->id), snap_name_len(c->s, c->id)), m->range);
+    case M_NAMELEN: return in_range((int64_t)utf8_count(snap_name_view(c->s, c->id)), m->range);
     case M_DEPTH: return in_range(depth_of(ctx_path(c)), m->range);
     case M_ISDIR: return snap_is_dir(c->s, c->id) == m->dir;
     case M_PARENT: return snap_parent(c->s, c->id) == m->dir_id;
@@ -227,43 +234,43 @@ static bool matches(const Matcher *m, MatchCtx *c) {
     return false;
 }
 
-static GlobKind simple_glob(const char *pattern, const char **inner, size_t *inner_len) {
-    if (strchr(pattern, '?')) return GLOB_NONE;
-    size_t n = strlen(pattern);
-    size_t lo = 0, hi = n;
-    while (lo < n && pattern[lo] == '*') lo++;
-    while (hi > lo && pattern[hi - 1] == '*') hi--;
-    if (memchr(pattern + lo, '*', hi - lo) || (lo == 0 && hi == n)) return GLOB_NONE;
-    *inner = pattern + lo;
-    *inner_len = hi - lo;
-    if (lo > 0 && hi < n) return GLOB_CONTAINS;
+static GlobKind simple_glob(String pattern, String *inner) {
+    if (str_contains(pattern, S("?"))) return GLOB_NONE;
+    size_t lo = 0, hi = pattern.len;
+    while (lo < pattern.len && pattern.data[lo] == '*') lo++;
+    while (hi > lo && pattern.data[hi - 1] == '*') hi--;
+    *inner = str_slice(pattern, lo, hi);
+    if (str_contains(*inner, S("*")) || (lo == 0 && hi == pattern.len)) return GLOB_NONE;
+    if (lo > 0 && hi < pattern.len) return GLOB_CONTAINS;
     return lo > 0 ? GLOB_SUFFIX : GLOB_PREFIX;
 }
 
 /* wildcard_regex anchors the pattern: a wildcard term must match the whole name. */
-static void wildcard_regex(StrBuf *out, const char *glob) {
-    sb_putc(out, '^');
-    for (const char *p = glob; *p; p++) {
-        if (*p == '*') {
-            sb_puts(out, ".*");
-        } else if (*p == '?') {
-            sb_putc(out, '.');
+static void wildcard_regex(StringBuilder *out, String glob) {
+    str_builder_append_char(out, '^');
+    for (size_t i = 0; i < glob.len; i++) {
+        char c = glob.data[i];
+        if (c == '*') {
+            str_builder_append(out, S(".*"));
+        } else if (c == '?') {
+            str_builder_append_char(out, '.');
         } else {
-            if (strchr(".[]()*+?{}|^$\\", *p)) sb_putc(out, '\\');
-            sb_putc(out, *p);
+            if (str_contains_any((String){&c, 1}, S(".[]()*+?{}|^$\\"))) str_builder_append_char(out, '\\');
+            str_builder_append_char(out, c);
         }
     }
-    sb_putc(out, '$');
+    str_builder_append_char(out, '$');
 }
 
 /* posix_regex rewrites the Perl-style classes people type (\d, \w, \s) into POSIX bracket expressions. */
-static void posix_regex(StrBuf *out, const char *re) {
+static void posix_regex(StringBuilder *out, String re) {
     bool in_bracket = false;
-    for (const char *p = re; *p; p++) {
-        if (*p == '\\' && p[1]) {
-            const char *cls = NULL;
+    for (size_t i = 0; i < re.len; i++) {
+        char c = re.data[i];
+        if (c == '\\' && i + 1 < re.len) {
+            const char *cls = nullptr;
             bool negated = false;
-            switch (p[1]) {
+            switch (re.data[i + 1]) {
             case 'd': cls = "0-9"; break;
             case 'D': cls = "0-9", negated = true; break;
             case 'w': cls = "[:alnum:]_"; break;
@@ -272,115 +279,99 @@ static void posix_regex(StrBuf *out, const char *re) {
             case 'S': cls = "[:space:]", negated = true; break;
             }
             if (cls && in_bracket) {
-                sb_puts(out, cls);
+                str_builder_append(out, S(cls));
             } else if (cls) {
-                sb_printf(out, "[%s%s]", negated ? "^" : "", cls);
+                str_builder_append_format(out, "[%s%s]", negated ? "^" : "", cls);
             } else {
-                sb_append(out, p, 2);
+                str_builder_append(out, str_slice(re, i, i + 2));
             }
-            p++;
+            i++;
             continue;
         }
-        if (*p == '[' && !in_bracket) {
+        if (c == '[' && !in_bracket) {
             in_bracket = true;
-            sb_putc(out, *p);
-            if (p[1] == '^') sb_putc(out, *++p);
-            if (p[1] == ']') sb_putc(out, *++p);
+            str_builder_append_char(out, c);
+            if (i + 1 < re.len && re.data[i + 1] == '^') str_builder_append_char(out, re.data[++i]);
+            if (i + 1 < re.len && re.data[i + 1] == ']') str_builder_append_char(out, re.data[++i]);
             continue;
         }
-        if (*p == ']' && in_bracket) in_bracket = false;
-        sb_putc(out, *p);
+        if (c == ']' && in_bracket) in_bracket = false;
+        str_builder_append_char(out, c);
     }
 }
 
-static bool compile_regex(Compiled *cc, Matcher *m, const char *pattern, const char *original, bool cased, Err *err) {
-    regex_t *re = xmalloc(sizeof *re);
-    StrBuf posix = {0};
+[[nodiscard]] static Error compile_regex(Compiled *cc, Matcher *m, String pattern, String original, bool cased, Err *err) {
+    regex_t *re = arena_push(cc->arena, sizeof *re);
+    StringBuilder posix = str_builder_create(cc->arena, pattern.len + 16);
     posix_regex(&posix, pattern);
-    int rc = regcomp(re, sb_cstr(&posix), REG_EXTENDED | REG_NOSUB | (cased ? 0 : REG_ICASE));
-    sb_free(&posix);
+    int rc = regcomp(re, str_builder_finish(&posix).data, REG_EXTENDED | REG_NOSUB | (cased ? 0 : REG_ICASE));
     if (rc != 0) {
         char why[256];
         regerror(rc, re, why, sizeof why);
-        err_set(err, "invalid regex \"%s\": %s", original, why);
-        free(re);
-        return false;
+        return err_set(err, ERR_PARSE, "invalid regex \"%.*s\": %s", (int)original.len, original.data, why);
     }
-    if (cc->regex_count == cc->regex_cap) {
-        cc->regex_cap = cc->regex_cap ? cc->regex_cap * 2 : 4;
-        cc->regexes = xrealloc(cc->regexes, cc->regex_cap * sizeof *cc->regexes);
-    }
-    cc->regexes[cc->regex_count++] = re;
+    cc->regexes.items = arena_grow(cc->arena, cc->regexes.items, &cc->regexes.capacity, cc->regexes.count,
+                                   sizeof *cc->regexes.items);
+    cc->regexes.items[cc->regexes.count++] = re;
     m->re = re;
-    return true;
+    return ERR_OK;
 }
 
-static char *lowered(Arena *a, const char *s, size_t n, bool keep_case) {
-    char *out = arena_strndup(a, s, n);
-    if (!keep_case) ascii_lower(out, out, n);
-    return out;
-}
+static String lowered(Arena *a, String s, bool keep_case) { return keep_case ? str_copy(a, s) : str_lower_ascii(a, s); }
 
-static Matcher *compile(Compiled *cc, const Snapshot *s, const QueryNode *n, Err *err);
-/* search_resolve_dir finds the directory record for a path, ignoring case. */
-static bool search_resolve_dir(const Snapshot *s, const char *path, uint32_t *out);
+[[nodiscard]] static Error compile(Compiled *cc, const Snapshot *s, const QueryNode *n, Matcher **out, Err *err);
+/* resolve_dir finds the directory record for a path, ignoring case. */
+static bool resolve_dir(Arena *arena, const Snapshot *s, String path, uint32_t *out);
 
-static Matcher *compile_text(Compiled *cc, Matcher *m, const QueryNode *n, Err *err) {
+[[nodiscard]] static Error compile_text(Compiled *cc, Matcher *m, const QueryNode *n, Err *err) {
     m->kind = M_TEXT;
     m->mode = n->mode;
     m->path = n->match_path;
     m->cased = n->case_sensitive;
     if (n->mode == TEXT_WILDCARD) {
-        const char *inner;
-        size_t len;
-        GlobKind kind = simple_glob(n->text, &inner, &len);
+        String inner;
+        GlobKind kind = simple_glob(n->text, &inner);
         if (kind != GLOB_NONE) {
             m->glob = kind;
-            m->needle = lowered(&cc->arena, inner, len, n->case_sensitive);
-            m->needle_len = len;
-            return m;
+            m->needle = lowered(cc->arena, inner, n->case_sensitive);
+            return ERR_OK;
         }
     }
-    if (n->mode == TEXT_REGEX || n->mode == TEXT_WILDCARD) {
-        StrBuf pattern = {0};
-        if (n->mode == TEXT_WILDCARD) {
-            wildcard_regex(&pattern, n->text);
-        } else {
-            sb_puts(&pattern, n->text);
-        }
-        bool ok = compile_regex(cc, m, sb_cstr(&pattern), n->text, n->case_sensitive, err);
-        sb_free(&pattern);
-        return ok ? m : NULL;
+    if (n->mode == TEXT_REGEX) return compile_regex(cc, m, n->text, n->text, n->case_sensitive, err);
+    if (n->mode == TEXT_WILDCARD) {
+        StringBuilder pattern = str_builder_create(cc->arena, n->text.len + 8);
+        wildcard_regex(&pattern, n->text);
+        return compile_regex(cc, m, str_builder_finish(&pattern), n->text, n->case_sensitive, err);
     }
-    m->needle_len = strlen(n->text);
-    m->needle = lowered(&cc->arena, n->text, m->needle_len, n->case_sensitive);
-    return m;
+    m->needle = lowered(cc->arena, n->text, n->case_sensitive);
+    return ERR_OK;
 }
 
-static Matcher *compile(Compiled *cc, const Snapshot *s, const QueryNode *n, Err *err) {
-    Matcher *m = arena_calloc(&cc->arena, 1, sizeof *m);
+[[nodiscard]] static Error compile(Compiled *cc, const Snapshot *s, const QueryNode *n, Matcher **out, Err *err) {
+    Matcher *m = arena_push(cc->arena, sizeof *m);
+    *out = m;
+    Error e = ERR_OK;
     switch (n->kind) {
     case Q_AND:
     case Q_OR:
         if (n->kind == Q_AND && n->kid_count == 0) {
             m->kind = M_ALL;
-            return m;
+            return ERR_OK;
         }
         m->kind = n->kind == Q_AND ? M_AND : M_OR;
         m->kid_count = n->kid_count;
-        m->kids = arena_alloc(&cc->arena, (n->kid_count ? n->kid_count : 1) * sizeof *m->kids);
-        for (uint32_t k = 0; k < n->kid_count; k++)
-            if (!(m->kids[k] = compile(cc, s, n->kids[k], err))) return NULL;
-        return m;
+        m->kids = arena_push(cc->arena, (n->kid_count + 1) * sizeof *m->kids);
+        for (uint32_t k = 0; k < n->kid_count && e == ERR_OK; k++) e = compile(cc, s, n->kids[k], &m->kids[k], err);
+        return e;
     case Q_NOT:
         m->kind = M_NOT;
-        return (m->kid = compile(cc, s, n->kid, err)) ? m : NULL;
+        return compile(cc, s, n->kid, &m->kid, err);
     case Q_TEXT: return compile_text(cc, m, n, err);
     case Q_EXT:
         m->kind = M_EXT;
         m->exts = n->exts;
         m->ext_count = n->ext_count;
-        return m;
+        return ERR_OK;
     case Q_SIZE: m->kind = M_SIZE; break;
     case Q_MODIFIED: m->kind = M_MODIFIED; break;
     case Q_CREATED: m->kind = M_CREATED; break;
@@ -389,77 +380,80 @@ static Matcher *compile(Compiled *cc, const Snapshot *s, const QueryNode *n, Err
     case Q_ISDIR:
         m->kind = M_ISDIR;
         m->dir = n->dir;
-        return m;
+        return ERR_OK;
     case Q_PARENT:
     case Q_INFOLDER:
-        m->kind = search_resolve_dir(s, n->path, &m->dir_id) ? (n->kind == Q_PARENT ? M_PARENT : M_INFOLDER) : M_NONE;
-        return m;
+        m->kind = resolve_dir(cc->arena, s, n->path, &m->dir_id) ? (n->kind == Q_PARENT ? M_PARENT : M_INFOLDER) : M_NONE;
+        return ERR_OK;
     }
     m->range = n->range;
-    return m;
+    return ERR_OK;
 }
 
 static void compiled_free(Compiled *cc) {
-    for (size_t i = 0; i < cc->regex_count; i++) {
-        regfree(cc->regexes[i]);
-        free(cc->regexes[i]);
-    }
-    free(cc->regexes);
-    arena_free(&cc->arena);
+    for (size_t i = 0; i < cc->regexes.count; i++) regfree(cc->regexes.items[i]);
+    arena_destroy(cc->arena);
 }
 
 /* ---- parallel evaluation ---- */
 
+/* A ChunkScan is one chunk's private state: its hits and path buffers live in its own arena. */
+typedef struct {
+    Arena *arena;
+    IdList hits;
+} ChunkScan;
+
 typedef struct {
     const Snapshot *s;
     const Matcher *root;
-    const atomic_int *cancel;
-    uint32_t first_id;
-    U32Vec *parts;
+    Cancel *cancel;
+    ChunkScan *chunks;
 } ScanJob;
 
-static void scan_chunk(void *arg, size_t lo, size_t hi, size_t chunk) {
-    ScanJob *job = arg;
-    MatchCtx c = {.s = job->s};
-    U32Vec *out = &job->parts[chunk];
+static void scan_chunk(void *context, size_t lo, size_t hi, size_t chunk) {
+    ScanJob *job = context;
+    ChunkScan *out = &job->chunks[chunk];
+    MatchCtx c = {.s = job->s, .path = str_builder_create(out->arena, 256), .path_lower = str_builder_create(out->arena, 256)};
     for (size_t i = lo; i < hi; i++) {
-        if ((i - lo) % CANCEL_CHECK_INTERVAL == 0 && job->cancel && atomic_load(job->cancel)) break;
-        uint32_t id = job->first_id + (uint32_t)i;
+        if ((i - lo) % CANCEL_CHECK_INTERVAL == 0 && job->cancel && cancel_requested(job->cancel)) break;
+        uint32_t id = (uint32_t)i;
         if (!snap_live(job->s, id)) continue;
         c.id = id;
         c.have_path = c.have_lower = false;
-        if (matches(job->root, &c)) u32vec_push(out, id);
+        if (matches(job->root, &c)) idlist_push(out->arena, &out->hits, id);
     }
-    sb_free(&c.path);
-    sb_free(&c.path_lower);
 }
 
-static void scan(ThreadPool *pool, ScanJob job, size_t n, U32Vec *hits) {
+static void scan(ThreadPool *pool, Arena *scratch, ScanJob job, size_t n, Arena *arena, IdList *hits) {
     if (n == 0) return;
     ParallelPlan plan = parallel_plan(pool, n, MIN_CHUNK);
-    job.parts = xcalloc(plan.chunks, sizeof *job.parts);
-    threadpool_run_chunks(pool, plan, scan_chunk, &job);
-    for (size_t c = 0; c < plan.chunks; c++) {
-        for (size_t i = 0; i < job.parts[c].len; i++) u32vec_push(hits, job.parts[c].data[i]);
-        u32vec_free(&job.parts[c]);
+    job.chunks = arena_push(scratch, plan.chunks * sizeof *job.chunks);
+    for (size_t k = 0; k < plan.chunks; k++) job.chunks[k].arena = arena_create(16 * 1024);
+    threadpool_run_chunks(pool, scratch, plan, scan_chunk, &job);
+    size_t total = 0;
+    for (size_t k = 0; k < plan.chunks; k++) total += job.chunks[k].hits.count;
+    hits->items = arena_push(arena, (total + 1) * sizeof *hits->items);
+    hits->capacity = total + 1;
+    for (size_t k = 0; k < plan.chunks; k++) {
+        const IdList *part = &job.chunks[k].hits;
+        if (part->count) memcpy(hits->items + hits->count, part->items, part->count * sizeof *part->items);
+        hits->count += part->count;
+        arena_destroy(job.chunks[k].arena);
     }
-    free(job.parts);
 }
 
-SearchStatus search_run(ThreadPool *pool, const Snapshot *s, const QueryNode *query, const atomic_int *cancel, U32Vec *hits,
-                        Err *err) {
-    Compiled cc = {0};
-    arena_init(&cc.arena, 4096);
-    cc.root = compile(&cc, s, query, err);
-    if (!cc.root) {
-        compiled_free(&cc);
-        return SEARCH_ERROR;
+Error search_run(ThreadPool *pool, Arena *arena, const Snapshot *s, const QueryNode *query, Cancel *cancel, IdList *hits,
+                 Err *err) {
+    *hits = (IdList){0};
+    Compiled cc = {.arena = arena_create(16 * 1024)};
+    Error e = compile(&cc, s, query, &cc.root, err);
+    if (e == ERR_OK) {
+        ScanJob job = {.s = s, .root = cc.root, .cancel = cancel};
+        scan(pool, cc.arena, job, s->total, arena, hits);
+        if (cancel && cancel_requested(cancel)) e = ERR_CANCELLED;
     }
-    hits->len = 0;
-    ScanJob job = {.s = s, .root = cc.root, .cancel = cancel};
-    scan(pool, job, s->total, hits);
     compiled_free(&cc);
-    return cancel && atomic_load(cancel) ? SEARCH_CANCELLED : SEARCH_OK;
+    return e;
 }
 
 /* ---- ordering ---- */
@@ -473,9 +467,9 @@ typedef struct {
 static int compare_i64(int64_t a, int64_t b) { return a < b ? -1 : a > b; }
 
 static int compare_names(const Snapshot *s, uint32_t a, uint32_t b) {
-    const char *na = snap_name(s, a), *nb = snap_name(s, b);
-    int c = ascii_casecmp(na, snap_name_len(s, a), nb, snap_name_len(s, b));
-    if (!c) c = strcmp(na, nb);
+    String na = snap_name_view(s, a), nb = snap_name_view(s, b);
+    int c = str_compare_ignore_case(na, nb);
+    if (!c) c = str_compare(na, nb);
     return c ? c : compare_i64(a, b);
 }
 
@@ -493,19 +487,14 @@ static int compare_by_key(const void *ctx, const void *pa, const void *pb) {
     case SORT_SIZE: c = compare_i64(snap_size(s, a), snap_size(s, b)); break;
     case SORT_MODIFIED: c = compare_i64(snap_mtime(s, a), snap_mtime(s, b)); break;
     case SORT_CREATED: c = compare_i64(snap_ctime(s, a), snap_ctime(s, b)); break;
-    case SORT_EXT: {
-        size_t la, lb;
-        const char *ea = snap_ext(s, a, &la), *eb = snap_ext(s, b, &lb);
-        c = ascii_casecmp(ea, la, eb, lb);
-        break;
-    }
+    case SORT_EXT: c = str_compare_ignore_case(snap_ext(s, a), snap_ext(s, b)); break;
     default: break;
     }
     return c ? c : compare_names(s, a, b);
 }
 
 typedef struct {
-    char *path;
+    String path;
     uint32_t hit;
 } KeyedPath;
 
@@ -517,27 +506,21 @@ static int compare_keyed(const void *ctx, const void *pa, const void *pb) {
         a = b;
         b = t;
     }
-    int c = strcmp(a->path, b->path);
+    int c = str_compare(a->path, b->path);
     return c ? c : compare_names(sc->s, a->hit, b->hit);
 }
 
 /* top_by_path builds each lowercased path once, which beats walking parent chains on every comparison. */
-static size_t top_by_path(const Snapshot *s, uint32_t *hits, size_t n, size_t k, bool descending) {
-    Arena arena;
-    arena_init(&arena, 1 << 20);
-    KeyedPath *rows = xmalloc(n * sizeof *rows);
-    StrBuf sb = {0};
+static size_t top_by_path(Arena *scratch, const Snapshot *s, uint32_t *hits, size_t n, size_t k, bool descending) {
+    KeyedPath *rows = arena_push(scratch, (n + 1) * sizeof *rows);
+    StringBuilder path = str_builder_create(scratch, 256);
     for (size_t i = 0; i < n; i++) {
-        snap_path(s, hits[i], &sb);
-        rows[i].path = lowered(&arena, sb.data, sb.len, false);
+        rows[i].path = str_lower_ascii(scratch, snap_path(s, hits[i], &path));
         rows[i].hit = hits[i];
     }
-    sb_free(&sb);
     SortCtx sc = {.s = s, .key = SORT_PATH, .descending = descending};
-    k = sort_top(rows, n, sizeof *rows, k, compare_keyed, &sc);
+    k = sort_top(scratch, rows, n, sizeof *rows, k, compare_keyed, &sc);
     for (size_t i = 0; i < k; i++) hits[i] = rows[i].hit;
-    free(rows);
-    arena_free(&arena);
     return k;
 }
 
@@ -562,16 +545,18 @@ static void reverse(uint32_t *hits, size_t n) {
     }
 }
 
-size_t search_top(const Snapshot *s, uint32_t *hits, size_t n, SortKey key, bool descending, long keep) {
-    size_t k = keep < 0 || (size_t)keep > n ? n : (size_t)keep;
+static size_t kept_count(size_t n, int64_t keep) { return keep < 0 || (uint64_t)keep > n ? n : (size_t)keep; }
+
+size_t search_top(Arena *scratch, const Snapshot *s, uint32_t *hits, size_t n, SortKey key, bool descending, int64_t keep) {
+    size_t k = kept_count(n, keep);
     if (key == SORT_RELEVANCE) key = SORT_NAME;
     if (key == SORT_PATH && in_path_order(s, hits, n)) {
         if (descending) reverse(hits, n);
         return k;
     }
-    if (key == SORT_PATH) return top_by_path(s, hits, n, k, descending);
+    if (key == SORT_PATH) return top_by_path(scratch, s, hits, n, k, descending);
     SortCtx sc = {.s = s, .key = key, .descending = descending};
-    return sort_top(hits, n, sizeof *hits, k, compare_by_key, &sc);
+    return sort_top(scratch, hits, n, sizeof *hits, k, compare_by_key, &sc);
 }
 
 /* ---- relevance ---- */
@@ -583,26 +568,27 @@ typedef struct {
     int score, depth;
 } Ranked;
 
-static bool starts_word_in(const char *hay, const char *needle) {
-    for (const char *p = hay; (p = strstr(p, needle)) != NULL; p++)
-        if (p == hay || !is_word_byte((unsigned char)p[-1])) return true;
+static bool starts_word_in(String hay, String needle) {
+    for (size_t start = 0, at; str_find(str_slice(hay, start, hay.len), needle, &at); start += at + 1) {
+        size_t begin = start + at;
+        if (begin == 0 || !is_word_byte((unsigned char)hay.data[begin - 1])) return true;
+    }
     return false;
 }
 
-static int score(const char *lower_name, const char **terms, size_t term_count) {
-    const char *dot = strrchr(lower_name, '.');
-    size_t stem_len = dot && dot != lower_name ? (size_t)(dot - lower_name) : strlen(lower_name);
+static int score(String lower_name, const StringList *terms) {
+    size_t dot;
+    String stem = str_find_last_char(lower_name, '.', &dot) && dot > 0 ? str_slice(lower_name, 0, dot) : lower_name;
     int total = 0;
-    for (size_t i = 0; i < term_count; i++) {
-        const char *t = terms[i];
-        size_t tlen = strlen(t);
-        if (strcmp(lower_name, t) == 0 || (stem_len == tlen && strncmp(lower_name, t, tlen) == 0)) {
+    for (size_t i = 0; i < terms->count; i++) {
+        String t = terms->items[i];
+        if (str_equal(lower_name, t) || str_equal(stem, t)) {
             total += SCORE_EXACT;
-        } else if (strncmp(lower_name, t, tlen) == 0) {
+        } else if (str_starts_with(lower_name, t)) {
             total += SCORE_PREFIX;
         } else if (starts_word_in(lower_name, t)) {
             total += SCORE_WORD_START;
-        } else if (strstr(lower_name, t)) {
+        } else if (str_contains(lower_name, t)) {
             total += SCORE_CONTAINS;
         }
     }
@@ -616,17 +602,13 @@ static int depth_in_tree(const Snapshot *s, uint32_t id) {
 }
 
 /* plain_terms collects the name terms a user typed; negated, path, wildcard and regex terms carry no ranking signal. */
-static void plain_terms(Arena *a, const QueryNode *n, const char ***terms, size_t *count, size_t *cap) {
+static void plain_terms(Arena *a, const QueryNode *n, StringList *terms) {
     if (n->kind == Q_AND || n->kind == Q_OR) {
-        for (uint32_t k = 0; k < n->kid_count; k++) plain_terms(a, n->kids[k], terms, count, cap);
+        for (uint32_t k = 0; k < n->kid_count; k++) plain_terms(a, n->kids[k], terms);
         return;
     }
     if (n->kind != Q_TEXT || n->match_path || n->mode == TEXT_WILDCARD || n->mode == TEXT_REGEX) return;
-    if (*count == *cap) {
-        *cap = *cap ? *cap * 2 : 8;
-        *terms = xrealloc(*terms, *cap * sizeof **terms);
-    }
-    (*terms)[(*count)++] = lowered(a, n->text, strlen(n->text), false);
+    strlist_push(a, terms, str_lower_ascii(a, n->text));
 }
 
 static int compare_ranked(const void *ctx, const void *pa, const void *pb) {
@@ -634,44 +616,37 @@ static int compare_ranked(const void *ctx, const void *pa, const void *pb) {
     const Ranked *a = pa, *b = pb;
     if (a->score != b->score) return a->score > b->score ? -1 : 1;
     if (a->depth != b->depth) return a->depth < b->depth ? -1 : 1;
-    int c = ascii_casecmp(snap_name(s, a->hit), snap_name_len(s, a->hit), snap_name(s, b->hit), snap_name_len(s, b->hit));
+    int c = str_compare_ignore_case(snap_name_view(s, a->hit), snap_name_view(s, b->hit));
     return c ? c : compare_i64(a->hit, b->hit);
 }
 
-size_t search_rank(const Snapshot *s, uint32_t *hits, size_t n, const QueryNode *query, long keep) {
-    size_t k = keep < 0 || (size_t)keep > n ? n : (size_t)keep;
-    Arena arena;
-    arena_init(&arena, 4096);
-    const char **terms = NULL;
-    size_t term_count = 0, term_cap = 0;
-    plain_terms(&arena, query, &terms, &term_count, &term_cap);
-    Ranked *rows = xmalloc((n ? n : 1) * sizeof *rows);
-    StrBuf lower = {0};
+size_t search_rank(Arena *scratch, const Snapshot *s, uint32_t *hits, size_t n, const QueryNode *query, int64_t keep) {
+    size_t k = kept_count(n, keep);
+    StringList terms = {0};
+    plain_terms(scratch, query, &terms);
+    Ranked *rows = arena_push(scratch, (n + 1) * sizeof *rows);
+    StringBuilder lower = str_builder_create(scratch, 256);
     for (size_t i = 0; i < n; i++) {
         rows[i] = (Ranked){.hit = hits[i]};
-        if (term_count) {
-            sb_clear(&lower);
-            sb_append(&lower, snap_name(s, hits[i]), snap_name_len(s, hits[i]));
-            ascii_lower(lower.data, lower.data, lower.len);
-            rows[i].score = score(lower.data, terms, term_count);
+        if (terms.count) {
+            lower.len = 0;
+            str_builder_append(&lower, snap_name_view(s, hits[i]));
+            for (size_t b = 0; b < lower.len; b++) lower.data[b] = (char)fold_byte(lower.data[b]);
+            rows[i].score = score((String){lower.data, lower.len}, &terms);
             rows[i].depth = depth_in_tree(s, hits[i]);
         }
     }
-    sb_free(&lower);
-    k = sort_top(rows, n, sizeof *rows, k, compare_ranked, s);
+    k = sort_top(scratch, rows, n, sizeof *rows, k, compare_ranked, s);
     for (size_t i = 0; i < k; i++) hits[i] = rows[i].hit;
-    free(rows);
-    free(terms);
-    arena_free(&arena);
     return k;
 }
 
 /* ---- folders ---- */
 
-static bool find_child_dir(const Snapshot *s, uint32_t parent, const char *lower_name, size_t len, uint32_t *out) {
+static bool find_child_dir(const Snapshot *s, uint32_t parent, String name, uint32_t *out) {
     for (uint32_t id = parent + 1; id < s->total; id++) {
-        if (snap_parent(s, id) == parent && snap_is_dir(s, id) && snap_live(s, id) && snap_name_len(s, id) == len &&
-            ascii_casecmp(snap_name(s, id), len, lower_name, len) == 0) {
+        if (snap_parent(s, id) == parent && snap_is_dir(s, id) && snap_live(s, id) &&
+            str_equal_ignore_case(snap_name_view(s, id), name)) {
             *out = id;
             return true;
         }
@@ -679,38 +654,31 @@ static bool find_child_dir(const Snapshot *s, uint32_t parent, const char *lower
     return false;
 }
 
-static bool search_resolve_dir(const Snapshot *s, const char *path, uint32_t *out) {
-    char *target = path_abs(path);
-    ascii_lower(target, target, strlen(target));
-    bool found = false;
-    for (uint32_t id = 0; id < s->total && !found; id++) {
+static bool resolve_dir(Arena *arena, const Snapshot *s, String path, uint32_t *out) {
+    String target = str_lower_ascii(arena, path_absolute(arena, path_expand_home(arena, path, env_home(arena))));
+    for (uint32_t id = 0; id < s->total; id++) {
         if (snap_parent(s, id) != NO_PARENT || !snap_is_dir(s, id) || !snap_live(s, id)) continue;
-        char *root = xstrdup(snap_name(s, id));
-        size_t root_len = strlen(root);
-        ascii_lower(root, root, root_len);
-        while (root_len > 1 && root[root_len - 1] == '/') root[--root_len] = '\0';
-        if (strcmp(target, root) == 0) {
+        String root = str_lower_ascii(arena, snap_name_view(s, id));
+        while (root.len > 1 && root.data[root.len - 1] == '/') root.len--;
+        if (str_equal(target, root)) {
             *out = id;
-            found = true;
-        } else {
-            size_t prefix = strcmp(root, "/") == 0 ? 1 : root_len + 1;
-            if (strncmp(target, root, root_len) == 0 && (root_len == 1 || target[root_len] == '/')) {
-                uint32_t cur = id;
-                bool ok = true;
-                for (const char *p = target + prefix; ok && *p;) {
-                    size_t len = strcspn(p, "/");
-                    ok = find_child_dir(s, cur, p, len, &cur);
-                    p += len;
-                    if (*p == '/') p++;
-                }
-                if (ok) {
-                    *out = cur;
-                    found = true;
-                }
-            }
+            return true;
         }
-        free(root);
+        String below;
+        bool slash_root = str_equal(root, S("/"));
+        if (slash_root ? !str_starts_with(target, root) : !path_relative(root, target, &below)) continue;
+        if (slash_root) below = str_slice(target, 1, target.len);
+        uint32_t cur = id;
+        bool found = true;
+        String part, rest = below;
+        while (found && rest.len) {
+            str_cut(rest, '/', &part, &rest);
+            if (part.len) found = find_child_dir(s, cur, part, &cur);
+        }
+        if (found) {
+            *out = cur;
+            return true;
+        }
     }
-    free(target);
-    return found;
+    return false;
 }

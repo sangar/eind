@@ -1,12 +1,10 @@
 #ifndef EIND_SERVER_H
 #define EIND_SERVER_H
 
-#include <stdbool.h>
-
-#include "../core/arena.h"
-#include "../core/json.h"
-#include "../core/threadpool.h"
-#include "../core/util.h"
+#include "mc/concurrency/threadpool.h"
+#include "mc/core/arena.h"
+#include "mc/core/error.h"
+#include "mc/text/str.h"
 #include "../index/index.h"
 
 /*
@@ -14,17 +12,22 @@
  * response object per request. A new request on a connection cancels the one
  * before it, which then answers {"id":..,"cancelled":true}. See docs/protocol.md.
  */
-#define DEFAULT_LIMIT 100
+enum { DEFAULT_LIMIT = 100 };
 
 typedef struct Server Server;
 
-/* server_start binds the socket and answers queries from ix's snapshots on background threads. */
-/* server_start answers searches on cpu until server_stop. */
-Server *server_start(ThreadPool *cpu, Index *ix, const char *socket_path, const char *index_path, Err *err);
+/*
+ * server_start binds the socket and answers queries from ix's snapshots on
+ * background threads, searching on cpu, until server_stop. A socket another
+ * daemon still answers on is ERR_IO.
+ */
+[[nodiscard]] Error server_start(ThreadPool *cpu, Index *ix, String socket_path, String index_path, Server **server,
+                                 Err *err);
+/* server_stop closes the listener and every open connection, so shutdown never waits on an idle client. */
 void server_stop(Server *srv);
 
 /* default_socket_path is $EIND_SOCKET, else $XDG_RUNTIME_DIR/eind.sock, else a per-user temp file. */
-char *default_socket_path(void);
-bool server_running(const char *socket_path);
+String default_socket_path(Arena *arena);
+bool server_running(String socket_path);
 
 #endif

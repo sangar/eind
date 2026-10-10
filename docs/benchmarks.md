@@ -4,7 +4,7 @@ Measure before and after any change meant to make eind faster or smaller, on
 the same tree and machine, and compare medians.
 
 ```sh
-make && tools/bench.py ~/some/tree            # wall time, peak RSS, instructions (macOS)
+./nob && tools/bench.py ~/some/tree           # wall time, peak RSS, instructions (macOS)
 tools/bench.py ~/some/tree --runs 50          # more runs for small differences
 tools/bench.py ~/some/tree --binary ../../rust/eind/target/release/eind   # another implementation
 ```

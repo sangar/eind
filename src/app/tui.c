@@ -1,168 +1,147 @@
 #include "tui.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <signal.h>
-#include <spawn.h>
-#include <stdatomic.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <sys/select.h>
-#include <termios.h>
-#include <unistd.h>
+#include <time.h>
 
-#include "../core/arena.h"
-#include "../core/threadpool.h"
+#include "mc/concurrency/cancel.h"
+#include "mc/concurrency/queue.h"
+#include "mc/concurrency/threadpool.h"
+#include "mc/platform/platform.h"
+#include "mc/platform/terminal.h"
+#include "mc/text/fmt.h"
+#include "mc/text/utf8.h"
 #include "../index/search.h"
 
-/* How long the input must be idle before a search starts. */
-#define TYPING_PAUSE_MS 40
-#define ESCAPE_WAIT_MS 30
+/* How long the input must be idle before a search starts, and how long an escape sequence may take to arrive. */
+enum { TYPING_PAUSE_MS = 40, ESCAPE_WAIT_MS = 30 };
 
-extern char **environ;
-
-static volatile sig_atomic_t resized; // a signal handler can only set a flag; modern-c: allow global-mutable
-
-static void on_winch(int sig) {
-    (void)sig;
-    resized = 1;
-}
+static const char SCREEN_SETUP[] = "\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J";
+static const char SCREEN_RESTORE[] = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
 /*
- * A Search runs on its own detached thread so the input never blocks. Cancelling
- * only raises the flag; the thread keeps going until it notices, then reports
- * itself through the wake pipe and the main loop frees it. The job holds a
- * reference to the snapshot so a search still running when the view closes
- * stays safe.
+ * A Search runs on its own detached thread so the input never blocks.
+ * Cancelling only raises the flag; the thread keeps going until it notices,
+ * then hands itself back through the done queue and the main loop frees it.
+ * The job, its copy of the input and its hits live in its arena, and it
+ * holds a reference to the snapshot.
  */
 typedef struct {
+    Arena *arena;
     Snapshot *s;
     ThreadPool *cpu;
-    char *input;
+    Queue *done;
+    Terminal *terminal;
+    String input;
     QueryDefaults defaults;
-    atomic_int cancel;
-    int wake_fd;
-    U32Vec hits;
-    SearchStatus status;
+    Cancel cancel;
+    IdList hits;
+    Error status;
     Err err;
-    double elapsed_ms;
+    int64_t elapsed_ns;
 } Search;
 
-static void *run_search(void *arg) {
-    Search *job = arg;
-    int64_t start = monotonic_us();
-    Arena arena;
-    arena_init(&arena, 4096);
-    QueryNode *node = query_parse(&arena, job->input, job->defaults, &job->err);
-    job->status = node ? search_run(job->cpu, job->s, node, &job->cancel, &job->hits, &job->err) : SEARCH_ERROR;
-    bool blank = strspn(job->input, " \t") == strlen(job->input);
+static void *run_search(void *argument) {
+    Search *job = argument;
+    int64_t start = clock_monotonic_ns();
+    QueryNode *node;
+    job->status = query_parse(job->arena, job->input, job->defaults, &node, &job->err);
+    if (job->status == ERR_OK)
+        job->status = search_run(job->cpu, job->arena, job->s, node, &job->cancel, &job->hits, &job->err);
     /* A blank query lists the whole index; leaving it in index order keeps that instant even for millions. */
-    if (job->status == SEARCH_OK && !blank && !atomic_load(&job->cancel))
-        search_top(job->s, job->hits.data, job->hits.len, SORT_NAME, false, -1);
-    arena_free(&arena);
-    job->elapsed_ms = elapsed_ms_since(start);
-    /* The main loop owns the job from here on, so nothing may touch it after this write. */
-    if (write(job->wake_fd, &job, sizeof job) < 0) {
-        /* the view has closed and the process is exiting */
-    }
-    return NULL;
+    bool blank = str_trim(job->input).len == 0;
+    if (job->status == ERR_OK && !blank && !cancel_requested(&job->cancel))
+        search_top(job->arena, job->s, job->hits.items, job->hits.count, SORT_NAME, false, -1);
+    job->elapsed_ns = clock_monotonic_ns() - start;
+    /* The main loop owns the job once it is queued, so nothing may touch it afterwards. */
+    Terminal *terminal = job->terminal;
+    (void)queue_push(job->done, job);
+    terminal_wake(terminal);
+    return nullptr;
 }
 
 static void free_search(Search *job) {
+    if (!job) return;
     snapshot_release(job->s);
-    u32vec_free(&job->hits);
-    free(job->input);
-    free(job);
+    cancel_destroy(&job->cancel);
+    arena_destroy(job->arena);
 }
 
 typedef struct {
+    Arena *arena; /* the view and its input */
+    Arena *frame; /* one drawn frame, reset for the next */
     Snapshot *s;
     QueryDefaults defaults;
     ThreadPool *cpu;
-    int tty;
-    int wake[2];
-    int width, height;
+    Terminal *terminal;
+    Queue *done;
+    TerminalSize size;
 
-    StrBuf input;
-    U32Vec hits;
+    StringBuilder input;
+    Search *shown; /* the search whose hits are listed, or nullptr */
     size_t selected, top;
-    double elapsed_ms;
-    char error[512];
+    Err error; /* shown instead of the status while its message is set */
 
     Search *search;  /* the search whose result is still wanted */
     int outstanding; /* searches that have not reported yet, wanted or not */
     bool searching, accept_when_done;
-    int64_t settle_at; /* when to start the next search, or 0 */
+    int64_t settle_at_ns; /* when to start the next search, or 0 */
 } View;
 
-static void query_size(View *v) {
-    struct winsize ws;
-    if (ioctl(v->tty, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-        v->width = ws.ws_col;
-        v->height = ws.ws_row;
-    } else {
-        v->width = 80;
-        v->height = 24;
-    }
-}
+static IdList shown_hits(const View *v) { return v->shown ? v->shown->hits : (IdList){0}; }
 
 static void cancel_search(View *v) {
     if (!v->search) return;
-    atomic_store(&v->search->cancel, 1);
-    v->search = NULL;
+    cancel_request(&v->search->cancel);
+    v->search = nullptr;
 }
 
 static void start_search(View *v) {
     cancel_search(v);
-    Search *job = xcalloc(1, sizeof *job);
-    job->s = v->s;
-    job->cpu = v->cpu;
-    job->input = xstrdup(sb_cstr(&v->input));
-    job->defaults = v->defaults;
-    job->wake_fd = v->wake[1];
-    atomic_init(&job->cancel, 0);
+    Arena *arena = arena_create(64 * 1024);
+    Search *job = arena_push(arena, sizeof *job);
+    *job = (Search){.arena = arena,
+                    .s = v->s,
+                    .cpu = v->cpu,
+                    .done = v->done,
+                    .terminal = v->terminal,
+                    .input = str_copy(arena, (String){v->input.data, v->input.len}),
+                    .defaults = v->defaults};
+    cancel_init(&job->cancel);
     snapshot_retain(v->s);
-    pthread_attr_t detached;
-    pthread_attr_init(&detached);
-    pthread_attr_setdetachstate(&detached, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    int rc = pthread_create(&thread, &detached, run_search, job);
-    pthread_attr_destroy(&detached);
-    if (rc != 0) {
+    Thread thread;
+    Error e = thread_start(&thread, run_search, job, &v->error);
+    if (e != ERR_OK) {
         free_search(job);
-        snprintf(v->error, sizeof v->error, "cannot start search: %s", strerror(rc));
+        (void)err_wrap(&v->error, e, "cannot start search");
         v->searching = false;
         return;
     }
+    thread_detach(&thread);
     v->search = job;
     v->outstanding++;
     v->searching = true;
 }
 
 static void apply_search(View *v, Search *job) {
-    v->search = NULL;
+    v->search = nullptr;
     v->searching = false;
-    v->elapsed_ms = job->elapsed_ms;
     v->selected = v->top = 0;
-    u32vec_free(&v->hits);
-    if (job->status == SEARCH_OK) {
-        v->hits = job->hits;
-        job->hits = (U32Vec){0};
-        v->error[0] = '\0';
+    if (job->status == ERR_OK) {
+        free_search(v->shown);
+        v->shown = job;
+        v->error.msg[0] = '\0';
     } else {
-        snprintf(v->error, sizeof v->error, "%s", job->err.msg);
+        v->error = job->err;
+        free_search(job);
     }
-    free_search(job);
 }
 
-/* collect_searches takes every finished search off the wake pipe; only the current one changes the view. */
+/* collect_searches takes every finished search off the done queue; only the current one changes the view. */
 static bool collect_searches(View *v) {
     bool applied = false;
-    Search *job;
-    while (read(v->wake[0], &job, sizeof job) == sizeof job) {
+    void *item;
+    while (queue_pop_timeout(v->done, 0, &item)) {
+        Search *job = item;
         v->outstanding--;
         if (job == v->search) {
             apply_search(v, job);
@@ -174,176 +153,168 @@ static bool collect_searches(View *v) {
     return applied;
 }
 
-static void selected_path(const View *v, StrBuf *out) {
-    sb_clear(out);
-    if (v->hits.len) snap_path(v->s, v->hits.data[v->selected], out);
+static String selected_path(const View *v, Arena *arena) {
+    IdList hits = shown_hits(v);
+    if (!hits.count) return S("");
+    StringBuilder path = str_builder_create(arena, 256);
+    return snap_path(v->s, hits.items[v->selected], &path);
 }
 
-static void move(View *v, long delta) {
-    if (!v->hits.len) return;
-    long next = (long)v->selected + delta;
+static void move(View *v, int64_t delta) {
+    IdList hits = shown_hits(v);
+    if (!hits.count) return;
+    int64_t next = (int64_t)v->selected + delta;
     if (next < 0) next = 0;
-    if (next >= (long)v->hits.len) next = (long)v->hits.len - 1;
+    if (next >= (int64_t)hits.count) next = (int64_t)hits.count - 1;
     v->selected = (size_t)next;
 }
 
-static void open_with_system(const char *path) {
-#ifdef __APPLE__
-    char *argv[] = {"open", (char *)path, NULL};
-#else
-    char *argv[] = {"xdg-open", (char *)path, NULL};
-#endif
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    pid_t pid;
-    posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
+static void open_selected(View *v) {
+    ArenaMark mark = arena_mark(v->frame);
+    String path = selected_path(v, v->frame);
+    /* A failure shows in the status line through v->error. */
+    if (path.len) (void)process_open_default(path, &v->error);
+    arena_release(mark);
 }
 
 /* ---- drawing ---- */
 
 /* put appends at most width code points of s and returns how many it wrote. */
-static int put(StrBuf *frame, const char *s, int width) {
+static int put(StringBuilder *frame, String s, int width) {
     int cols = 0;
-    const char *p = s;
-    while (*p && cols < width) {
-        const char *start = p++;
-        while (((unsigned char)*p & 0xC0) == 0x80) p++;
-        sb_append(frame, start, (size_t)(p - start));
+    size_t p = 0;
+    while (p < s.len && cols < width) {
+        size_t start = p++;
+        while (p < s.len && ((unsigned char)s.data[p] & 0xC0) == 0x80) p++;
+        str_builder_append(frame, str_slice(s, start, p));
         cols++;
     }
     return cols;
 }
 
-static void pad(StrBuf *frame, int n) {
-    for (int i = 0; i < n; i++) sb_putc(frame, ' ');
+static void pad(StringBuilder *frame, int n) {
+    for (int i = 0; i < n; i++) str_builder_append_char(frame, ' ');
 }
 
-static void draw_row(View *v, StrBuf *frame, uint32_t id, bool selected) {
+static int min_int(int a, int b) { return a < b ? a : b; }
+static int max_int(int a, int b) { return a > b ? a : b; }
+
+/* skip_columns drops the first n code points of s. */
+static String skip_columns(String s, int n) {
+    size_t p = 0;
+    for (; n > 0 && p < s.len; n--) {
+        p++;
+        while (p < s.len && ((unsigned char)s.data[p] & 0xC0) == 0x80) p++;
+    }
+    return str_slice(s, p, s.len);
+}
+
+static void draw_row(View *v, StringBuilder *frame, uint32_t id, bool selected) {
+    int width = v->size.columns;
     bool is_dir = snap_is_dir(v->s, id);
-    char size[32], when[32], meta[64];
-    format_short_time(snap_mtime(v->s, id), when);
-    snprintf(meta, sizeof meta, "%9s  %s", is_dir ? "" : human_size(snap_size(v->s, id), size), when);
-    int meta_width = (int)strlen(meta) + 1;
-    const char *base = selected ? "\x1b[0;7m" : "\x1b[0m";
-    sb_puts(frame, base);
-    if (is_dir) sb_puts(frame, "\x1b[1;34m");
-    int x = put(frame, " ", v->width);
-    x += put(frame, snap_name(v->s, id), v->width - x);
-    sb_puts(frame, base);
-    int available = v->width - x - meta_width - 2;
+    char when[32];
+    time_t mtime = (time_t)snap_mtime(v->s, id);
+    struct tm tm;
+    localtime_r(&mtime, &tm);
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tm);
+    String size = is_dir ? S("") : fmt_bytes(v->frame, snap_size(v->s, id));
+    String meta = str_format(v->frame, "%9.*s  %s", (int)size.len, size.data, when);
+    int meta_width = (int)meta.len + 1;
+    String base = selected ? S("\x1b[0;7m") : S("\x1b[0m");
+    str_builder_append(frame, base);
+    if (is_dir) str_builder_append(frame, S("\x1b[1;34m"));
+    int x = put(frame, S(" "), width);
+    x += put(frame, snap_name_view(v->s, id), width - x);
+    str_builder_append(frame, base);
+    int available = width - x - meta_width - 2;
     uint32_t parent = snap_parent(v->s, id);
     if (parent != NO_PARENT && available > 4) {
-        StrBuf dir = {0};
-        snap_path(v->s, parent, &dir);
-        int len = utf8_count(dir.data, dir.len);
-        sb_puts(frame, "\x1b[2m");
-        x += put(frame, "  ", 2);
-        const char *shown = dir.data;
+        StringBuilder dir_path = str_builder_create(v->frame, 256);
+        String dir = snap_path(v->s, parent, &dir_path);
+        int len = (int)utf8_count(dir);
+        str_builder_append(frame, S("\x1b[2m"));
+        x += put(frame, S("  "), 2);
         if (len > available) {
-            x += put(frame, "…", 1);
-            for (int skip = len - available + 1; skip > 0; skip--) {
-                shown++;
-                while (((unsigned char)*shown & 0xC0) == 0x80) shown++;
-            }
-            x += put(frame, shown, available - 1);
+            x += put(frame, S("…"), 1);
+            x += put(frame, skip_columns(dir, len - available + 1), available - 1);
         } else {
-            x += put(frame, shown, available);
+            x += put(frame, dir, available);
         }
-        sb_free(&dir);
-        sb_puts(frame, base);
+        str_builder_append(frame, base);
     }
-    if (v->width - meta_width > x) pad(frame, v->width - meta_width - x);
-    if (v->width >= meta_width) {
-        sb_puts(frame, "\x1b[2m");
+    if (width - meta_width > x) pad(frame, width - meta_width - x);
+    if (width >= meta_width) {
+        str_builder_append(frame, S("\x1b[2m"));
         put(frame, meta, meta_width);
     }
-    sb_puts(frame, "\x1b[0m");
+    str_builder_append(frame, S("\x1b[0m"));
 }
 
 static void draw(View *v) {
-    StrBuf frame = {0};
-    sb_puts(&frame, "\x1b[?25l\x1b[H\x1b[0;1m> ");
-    put(&frame, sb_cstr(&v->input), v->width - 2);
-    sb_puts(&frame, "\x1b[0m\x1b[K\r\n\x1b[K");
+    arena_reset(v->frame);
+    int width = v->size.columns;
+    String input = {v->input.data, v->input.len};
+    StringBuilder frame = str_builder_create(v->frame, 64 * 1024);
+    str_builder_append(&frame, S("\x1b[?25l\x1b[H\x1b[0;1m> "));
+    put(&frame, input, width - 2);
+    str_builder_append(&frame, S("\x1b[0m\x1b[K\r\n\x1b[K"));
 
-    int list_height = v->height - 3;
+    IdList hits = shown_hits(v);
+    int list_height = v->size.rows - 3;
     if (list_height >= 1) {
         if (v->selected < v->top) v->top = v->selected;
         if (v->selected >= v->top + (size_t)list_height) v->top = v->selected - (size_t)list_height + 1;
         for (int row = 0; row < list_height; row++) {
-            sb_puts(&frame, "\r\n\x1b[K");
+            str_builder_append(&frame, S("\r\n\x1b[K"));
             size_t i = v->top + (size_t)row;
-            if (i < v->hits.len) draw_row(v, &frame, v->hits.data[i], i == v->selected);
+            if (i < hits.count) draw_row(v, &frame, hits.items[i], i == v->selected);
         }
-        char shown[32], total[32], status[600];
-        commas((int64_t)v->hits.len, shown);
-        commas(snap_live_count(v->s), total);
-        if (v->error[0]) {
-            snprintf(status, sizeof status, " %s", v->error);
+        String shown = fmt_thousands(v->frame, (int64_t)hits.count);
+        String total = fmt_thousands(v->frame, snap_live_count(v->s));
+        String status;
+        if (v->error.msg[0]) {
+            status = str_format(v->frame, " %s", v->error.msg);
         } else if (v->searching) {
-            snprintf(status, sizeof status, " %s of %s objects  searching...", shown, total);
+            status = str_format(v->frame, " %.*s of %.*s objects  searching...", (int)shown.len, shown.data,
+                                (int)total.len, total.data);
         } else {
-            snprintf(status, sizeof status, " %s of %s objects  %.0fms", shown, total, v->elapsed_ms);
+            double elapsed_ms = v->shown ? (double)v->shown->elapsed_ns / (double)NS_PER_MILLISECOND : 0;
+            status = str_format(v->frame, " %.*s of %.*s objects  %.0fms", (int)shown.len, shown.data, (int)total.len,
+                                total.data, elapsed_ms);
         }
-        const char *help = "Enter print path  Ctrl-O open  Esc quit ";
-        int help_width = (int)strlen(help);
-        sb_puts(&frame, "\r\n\x1b[0;7m");
-        int x = put(&frame, status, max_int(v->width - help_width, 0));
-        pad(&frame, v->width - help_width - x);
-        put(&frame, help, v->width - max_int(x, v->width - help_width));
-        sb_puts(&frame, "\x1b[0m");
+        String help = S("Enter print path  Ctrl-O open  Esc quit ");
+        int help_width = (int)help.len;
+        str_builder_append(&frame, S("\r\n\x1b[0;7m"));
+        int x = put(&frame, status, max_int(width - help_width, 0));
+        pad(&frame, width - help_width - x);
+        put(&frame, help, width - max_int(x, width - help_width));
+        str_builder_append(&frame, S("\x1b[0m"));
     }
-    int cursor = 3 + utf8_count(v->input.data ? v->input.data : "", v->input.len);
-    sb_printf(&frame, "\x1b[1;%dH\x1b[?25h", min_int(cursor, v->width));
-    if (write(v->tty, frame.data, frame.len) < 0) {
-        /* nothing useful to do when the terminal is gone */
-    }
-    sb_free(&frame);
+    int cursor = 3 + (int)utf8_count(input);
+    str_builder_append_format(&frame, "\x1b[1;%dH\x1b[?25h", min_int(cursor, width));
+    /* Nothing useful is left to do when the terminal is gone. */
+    (void)terminal_write(v->terminal, (String){frame.data, frame.len}, nullptr);
 }
 
 /* ---- input ---- */
 
 typedef enum { ACT_NONE, ACT_QUIT, ACT_ACCEPT, ACT_INPUT_CHANGED } Action;
 
-/*
- * wait_readable waits until one of two descriptors is readable. It uses
- * select because macOS poll does not support terminal devices.
- */
-static int wait_readable(int a, int b, int timeout_ms, bool *a_ready, bool *b_ready) {
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(a, &set);
-    if (b >= 0) FD_SET(b, &set);
-    struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
-    int rc = select(max_int(a, b) + 1, &set, NULL, NULL, timeout_ms < 0 ? NULL : &tv);
-    *a_ready = rc > 0 && FD_ISSET(a, &set);
-    if (b_ready) *b_ready = rc > 0 && b >= 0 && FD_ISSET(b, &set);
-    return rc;
-}
-
-static int read_byte(int fd, int timeout_ms) {
-    bool ready;
-    if (wait_readable(fd, -1, timeout_ms, &ready, NULL) <= 0 || !ready) return -1;
+static int read_byte(View *v, int timeout_ms) {
     unsigned char c;
-    return read(fd, &c, 1) == 1 ? c : -1;
+    return terminal_read_byte(v->terminal, timeout_ms, &c) ? c : -1;
 }
 
-static void delete_last_char(StrBuf *input) {
+static void delete_last_char(StringBuilder *input) {
     while (input->len > 0) {
         unsigned char c = (unsigned char)input->data[--input->len];
         if ((c & 0xC0) != 0x80) break;
     }
-    sb_cstr(input);
 }
 
-static void delete_word(StrBuf *input) {
+static void delete_word(StringBuilder *input) {
     while (input->len > 0 && input->data[input->len - 1] == ' ') input->len--;
     while (input->len > 0 && input->data[input->len - 1] != ' ') input->len--;
-    sb_cstr(input);
 }
 
 static void mouse(View *v, int button, int y, bool press) {
@@ -354,54 +325,54 @@ static void mouse(View *v, int button, int y, bool press) {
         move(v, 3);
     } else if (button == 0 && y >= 3) {
         size_t row = v->top + (size_t)(y - 3);
-        if (row < v->hits.len) v->selected = row;
+        if (row < shown_hits(v).count) v->selected = row;
     }
 }
 
+static bool is_sequence(const char *seq, const char *name) { return str_equal(S(seq), S(name)); }
+
 static Action escape_sequence(View *v) {
-    int c = read_byte(v->tty, ESCAPE_WAIT_MS);
+    int c = read_byte(v, ESCAPE_WAIT_MS);
     if (c < 0) return ACT_QUIT; /* a lone Esc */
     if (c != '[' && c != 'O') return ACT_NONE;
     char seq[32];
     size_t n = 0;
     int b;
-    while ((b = read_byte(v->tty, ESCAPE_WAIT_MS)) >= 0 && n < sizeof seq - 1) {
+    while ((b = read_byte(v, ESCAPE_WAIT_MS)) >= 0 && n < sizeof seq - 1) {
         seq[n++] = (char)b;
         if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~') break;
     }
     seq[n] = '\0';
-    int page = max_int(v->height - 3, 1);
+    int64_t page = max_int(v->size.rows - 3, 1);
+    int64_t all = (int64_t)shown_hits(v).count;
     if (seq[0] == '<') {
         int button, x, y;
         char kind;
         if (sscanf(seq + 1, "%d;%d;%d%c", &button, &x, &y, &kind) == 4) mouse(v, button, y, kind == 'M');
-    } else if (!strcmp(seq, "A")) {
+    } else if (is_sequence(seq, "A")) {
         move(v, -1);
-    } else if (!strcmp(seq, "B")) {
+    } else if (is_sequence(seq, "B")) {
         move(v, 1);
-    } else if (!strcmp(seq, "5~")) {
+    } else if (is_sequence(seq, "5~")) {
         move(v, -page);
-    } else if (!strcmp(seq, "6~")) {
+    } else if (is_sequence(seq, "6~")) {
         move(v, page);
-    } else if (!strcmp(seq, "H") || !strcmp(seq, "1~") || !strcmp(seq, "7~")) {
-        move(v, -(long)v->hits.len);
-    } else if (!strcmp(seq, "F") || !strcmp(seq, "4~") || !strcmp(seq, "8~")) {
-        move(v, (long)v->hits.len);
+    } else if (is_sequence(seq, "H") || is_sequence(seq, "1~") || is_sequence(seq, "7~")) {
+        move(v, -all);
+    } else if (is_sequence(seq, "F") || is_sequence(seq, "4~") || is_sequence(seq, "8~")) {
+        move(v, all);
     }
     return ACT_NONE;
 }
 
 static Action key(View *v, int c) {
-    StrBuf path = {0};
     switch (c) {
     case 0x1b: return escape_sequence(v);
     case 0x03: return ACT_QUIT;
     case '\r':
     case '\n': return ACT_ACCEPT;
     case 0x0f: /* Ctrl-O */
-        selected_path(v, &path);
-        if (path.len) open_with_system(path.data);
-        sb_free(&path);
+        open_selected(v);
         return ACT_NONE;
     case 0x7f:
     case 0x08:
@@ -410,7 +381,7 @@ static Action key(View *v, int c) {
         return ACT_INPUT_CHANGED;
     case 0x15: /* Ctrl-U */
         if (!v->input.len) return ACT_NONE;
-        sb_clear(&v->input);
+        v->input.len = 0;
         return ACT_INPUT_CHANGED;
     case 0x17: /* Ctrl-W */
         if (!v->input.len) return ACT_NONE;
@@ -420,129 +391,88 @@ static Action key(View *v, int c) {
     case 0x10: move(v, -1); return ACT_NONE; /* Ctrl-P */
     }
     if (c >= 0x20) {
-        sb_putc(&v->input, (char)c);
+        str_builder_append_char(&v->input, (char)c);
         return ACT_INPUT_CHANGED;
     }
     return ACT_NONE;
 }
 
-/* ---- terminal setup ---- */
+/* ---- the loop ---- */
 
-static bool enter_raw(int tty, struct termios *saved, Err *err) {
-    if (tcgetattr(tty, saved) != 0) {
-        err_set(err, "terminal: %s", strerror(errno));
-        return false;
-    }
-    struct termios raw = *saved;
-    raw.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(tcflag_t)OPOST;
-    raw.c_cflag |= CS8;
-    raw.c_lflag &= ~(tcflag_t)(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    tcsetattr(tty, TCSAFLUSH, &raw);
-    const char *setup = "\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J";
-    return write(tty, setup, strlen(setup)) >= 0;
-}
-
-static void leave_raw(int tty, const struct termios *saved) {
-    const char *restore = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
-    if (write(tty, restore, strlen(restore)) < 0) {
-        /* the terminal is gone; nothing left to restore */
-    }
-    tcsetattr(tty, TCSAFLUSH, saved);
-}
-
-bool tui_run(Snapshot *s, QueryDefaults defaults, char **chosen, Err *err) {
-    *chosen = NULL;
-    View v = {.s = s, .defaults = defaults};
-    v.tty = open("/dev/tty", O_RDWR | O_CLOEXEC);
-    if (v.tty < 0) {
-        err_set(err, "cannot open the terminal: %s", strerror(errno));
-        return false;
-    }
-    if (pipe(v.wake) != 0) {
-        err_set(err, "pipe: %s", strerror(errno));
-        close(v.tty);
-        return false;
-    }
-    fcntl(v.wake[0], F_SETFL, O_NONBLOCK);
-    struct termios saved;
-    if (!enter_raw(v.tty, &saved, err)) {
-        close(v.tty);
-        return false;
-    }
-    struct sigaction sa = {.sa_handler = on_winch}, old_sa;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGWINCH, &sa, &old_sa);
-    query_size(&v);
-    sb_cstr(&v.input);
-    v.cpu = threadpool_create(cpu_count());
-    start_search(&v);
-
-    bool accepted = false;
-    for (bool running = true; running;) {
-        if (resized) {
-            resized = 0;
-            query_size(&v);
-        }
-        draw(&v);
+/* run_view reads keys and search results until the user accepts or quits; it reports whether they accepted. */
+static bool run_view(View *v) {
+    start_search(v);
+    for (;;) {
+        draw(v);
         int timeout = -1;
-        if (v.settle_at) timeout = (int)max_i64(v.settle_at - monotonic_ms(), 0);
-        bool key_ready, search_done;
-        if (wait_readable(v.tty, v.wake[0], timeout, &key_ready, &search_done) < 0) continue; /* EINTR from a resize */
-        if (v.settle_at && monotonic_ms() >= v.settle_at) {
-            v.settle_at = 0;
-            start_search(&v);
+        if (v->settle_at_ns) {
+            int64_t wait = (v->settle_at_ns - clock_monotonic_ns()) / NS_PER_MILLISECOND;
+            timeout = wait < 0 ? 0 : (int)wait;
         }
-        if (search_done && collect_searches(&v) && v.accept_when_done) {
-            accepted = true;
-            running = false;
+        TerminalReady ready = terminal_wait(v->terminal, timeout);
+        if (ready.resized) v->size = terminal_size(v->terminal);
+        if (v->settle_at_ns && clock_monotonic_ns() >= v->settle_at_ns) {
+            v->settle_at_ns = 0;
+            start_search(v);
         }
-        if (running && key_ready) {
-            int c = read_byte(v.tty, 0);
-            if (c < 0) running = false; /* the terminal went away */
-            switch (c < 0 ? ACT_NONE : key(&v, c)) {
-            case ACT_QUIT: running = false; break;
-            case ACT_ACCEPT:
-                if (v.searching) {
-                    v.accept_when_done = true;
-                    if (!v.search) {
-                        v.settle_at = 0;
-                        start_search(&v);
-                    }
-                } else {
-                    accepted = true;
-                    running = false;
-                }
-                break;
-            case ACT_INPUT_CHANGED:
-                cancel_search(&v);
-                v.searching = true;
-                v.settle_at = monotonic_ms() + TYPING_PAUSE_MS;
-                break;
-            case ACT_NONE: break;
+        if (collect_searches(v) && v->accept_when_done) return true;
+        if (!ready.input) continue;
+        int c = read_byte(v, 0);
+        if (c < 0) return false; /* the terminal went away */
+        switch (key(v, c)) {
+        case ACT_QUIT: return false;
+        case ACT_ACCEPT:
+            if (!v->searching) return true;
+            v->accept_when_done = true;
+            if (!v->search) {
+                v->settle_at_ns = 0;
+                start_search(v);
             }
+            break;
+        case ACT_INPUT_CHANGED:
+            cancel_search(v);
+            v->searching = true;
+            v->settle_at_ns = clock_monotonic_ns() + TYPING_PAUSE_MS * NS_PER_MILLISECOND;
+            break;
+        case ACT_NONE: break;
         }
     }
-    if (accepted) {
-        StrBuf path = {0};
-        selected_path(&v, &path);
-        if (path.len) *chosen = path.data;
-        else sb_free(&path);
+}
+
+Error tui_run(Arena *arena, Snapshot *s, QueryDefaults defaults, String *chosen, Err *err) {
+    *chosen = S("");
+    Terminal *terminal;
+    Error e = terminal_open(&terminal, err);
+    if (e != ERR_OK) return err_wrap(err, e, "cannot open the terminal");
+    ThreadPool *cpu;
+    e = threadpool_create(0, &cpu, err);
+    if (e == ERR_OK) e = terminal_write(terminal, S(SCREEN_SETUP), err);
+    if (e != ERR_OK) {
+        terminal_close(terminal);
+        return e;
     }
+    View v = {.arena = arena_create(0),
+              .frame = arena_create(0),
+              .s = s,
+              .defaults = defaults,
+              .cpu = cpu,
+              .terminal = terminal,
+              .done = queue_create(),
+              .size = terminal_size(terminal)};
+    v.input = str_builder_create(v.arena, 256);
+    if (run_view(&v)) *chosen = selected_path(&v, arena);
     cancel_search(&v);
-    leave_raw(v.tty, &saved);
-    sigaction(SIGWINCH, &old_sa, NULL);
-    close(v.tty);
-    collect_searches(&v);
-    /* A search still running keeps its snapshot, its pool and the pipe it reports to; the process is about to exit. */
-    if (v.outstanding == 0) {
-        close(v.wake[0]);
-        close(v.wake[1]);
-        threadpool_destroy(v.cpu);
+    (void)terminal_write(terminal, S(SCREEN_RESTORE), nullptr);
+    /* The searches still running report to the queue and wake the terminal, so both outlive them. */
+    while (v.outstanding > 0) {
+        free_search(queue_pop(v.done));
+        v.outstanding--;
     }
-    sb_free(&v.input);
-    u32vec_free(&v.hits);
-    return true;
+    free_search(v.shown);
+    terminal_close(terminal);
+    threadpool_destroy(cpu);
+    queue_destroy(v.done);
+    arena_destroy(v.frame);
+    arena_destroy(v.arena);
+    return ERR_OK;
 }

@@ -1,9 +1,8 @@
 #ifndef EIND_JOURNAL_H
 #define EIND_JOURNAL_H
 
-#include <stdbool.h>
-#include <stddef.h>
-
+#include "mc/core/error.h"
+#include "mc/text/str.h"
 #include "index.h"
 
 /*
@@ -23,9 +22,12 @@
  * is ignored altogether.
  */
 
-/* journal_replay applies the journal of the index file at path to s, which
- * must be freshly loaded from it, and returns the snapshot to use. */
-Snapshot *journal_replay(Snapshot *s, const char *path, Err *err);
+/*
+ * journal_replay applies the journal of the index file at path to s, which
+ * must be freshly loaded from it, and stores the snapshot to use. It takes
+ * the caller's reference to s, also on failure.
+ */
+[[nodiscard]] Error journal_replay(Snapshot *s, String path, Snapshot **replayed, Err *err);
 
 typedef struct Journal Journal;
 
@@ -35,17 +37,17 @@ typedef struct Journal Journal;
  * file, or ends in a half-written entry is rewritten to hold exactly the
  * changes s has replayed.
  */
-Journal *journal_open(const char *path, const Snapshot *s, Err *err);
+[[nodiscard]] Error journal_open(String path, const Snapshot *s, Journal **journal, Err *err);
 void journal_free(Journal *j);
 
 /* journal_record queues the records added and removed between two snapshots. */
 void journal_record(Journal *j, const Snapshot *before, const Snapshot *after);
 
-typedef enum { JOURNAL_OK, JOURNAL_FAILED, JOURNAL_REPLACED } JournalStatus;
-
-/* journal_flush appends the queued changes; JOURNAL_REPLACED means another
- * process wrote a new index file, which must be loaded again. */
-JournalStatus journal_flush(Journal *j, Err *err);
+/*
+ * journal_flush appends the queued changes. *replaced says that another
+ * process wrote a new index file instead, which must be loaded again.
+ */
+[[nodiscard]] Error journal_flush(Journal *j, bool *replaced, Err *err);
 
 /* journal_entries is the number of changes since the index file was written. */
 size_t journal_entries(const Journal *j);

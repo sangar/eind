@@ -12,7 +12,7 @@ quits; it looks for the binary at `EIND_BINARY`, on `PATH`, and in `~/.local/bin
 `/opt/homebrew/bin` and `/usr/local/bin`.
 
 ```sh
-make install
+cc tools/build.c -o nob && ./nob install
 cd macos && swift run
 ```
 

@@ -1,12 +1,12 @@
 #ifndef EIND_INDEX_H
 #define EIND_INDEX_H
 
-#include <pthread.h>
 #include <stdatomic.h>
-#include <stdbool.h>
-#include <stdint.h>
 
-#include "../core/util.h"
+#include "mc/core/arena.h"
+#include "mc/core/error.h"
+#include "mc/platform/platform.h"
+#include "mc/text/str.h"
 #include "segment.h"
 
 /*
@@ -14,21 +14,27 @@
  * the delta segments added since, and a tombstone bitmap over all file ids.
  * File ids run contiguously across segments, and a parent always has a
  * smaller id than its children, so paths are rebuilt by walking up parents.
- * Searches hold a snapshot while the watcher publishes newer ones.
+ * Searches hold a snapshot while the watcher publishes newer ones. A
+ * snapshot's own memory lives in its arena; its segments are shared.
  */
 typedef struct Snapshot {
     atomic_int refs;
+    Arena *arena;
     Segment **segs;
     uint32_t seg_count;
     uint32_t total; /* ids 0..total-1 exist, dead or alive */
     uint64_t *dead; /* tombstone bitmap */
     uint32_t dead_count;
     int64_t built_at;
-    StrList roots;
+    StringList roots; /* the base segment's */
 } Snapshot;
 
-/* snapshot_derive adds an optional delta segment (taking its reference) and replaces the tombstones. */
-Snapshot *snapshot_derive(const Snapshot *from, Segment *delta, uint64_t *dead, uint32_t dead_count);
+/*
+ * snapshot_derive adds an optional delta segment, taking its reference, and
+ * replaces the tombstones with a copy of dead, which covers every id of the
+ * result plus one word.
+ */
+Snapshot *snapshot_derive(const Snapshot *from, Segment *delta, const uint64_t *dead, uint32_t dead_count);
 void snapshot_retain(Snapshot *s);
 void snapshot_release(Snapshot *s);
 
@@ -96,16 +102,30 @@ static inline size_t bitmap_words(uint32_t n) { return ((size_t)n + 63) / 64; }
 static inline bool snap_live(const Snapshot *s, uint32_t id) { return !bitmap_test(s->dead, id); }
 static inline bool record_is_dir(const FileRecord *r) { return r->flags & RECORD_DIR; }
 
-/* snap_path writes the absolute path of id into sb, replacing its contents. */
-void snap_path(const Snapshot *s, uint32_t id, StrBuf *sb);
+/* snap_path writes the absolute path of id into out, replacing its contents, and returns it. */
+String snap_path(const Snapshot *s, uint32_t id, StringBuilder *out);
+/* snap_name_view is the name of id as a String view. */
+static inline String snap_name_view(const Snapshot *s, uint32_t id) { return (String){snap_name(s, id), snap_name_len(s, id)}; }
 /* snap_ext returns the extension as written, without the dot, or ""; compare it ignoring ASCII case. */
-const char *snap_ext(const Snapshot *s, uint32_t id, size_t *len);
+String snap_ext(const Snapshot *s, uint32_t id);
 void snap_stats(const Snapshot *s, int64_t *files, int64_t *dirs);
 uint32_t snap_live_count(const Snapshot *s);
 
+/* IdList is a growable list of file ids in an arena, such as the hits of a search. */
+typedef struct {
+    uint32_t *items;
+    size_t count;
+    size_t capacity;
+} IdList;
+
+static inline void idlist_push(Arena *arena, IdList *list, uint32_t id) {
+    list->items = arena_grow(arena, list->items, &list->capacity, list->count, sizeof *list->items);
+    list->items[list->count++] = id;
+}
+
 /* Index publishes snapshots: readers acquire the current one, writers replace it. */
 typedef struct {
-    pthread_mutex_t mu;
+    Mutex mutex;
     Snapshot *current;
 } Index;
 
@@ -114,13 +134,13 @@ void index_destroy(Index *ix);
 Snapshot *index_acquire(Index *ix);
 void index_publish(Index *ix, Snapshot *next);
 
-/* index_load maps the index file and replays its journal; *missing is set when there is none yet. */
-Snapshot *index_load(const char *path, bool *missing, Err *err);
+/* index_load maps the index file and replays its journal; ERR_NOT_FOUND when there is none yet. */
+[[nodiscard]] Error index_load(String path, Snapshot **snapshot, Err *err);
 /*
  * index_compact merges every segment into one, drops tombstoned records and
  * everything below them, writes the result to path and returns a snapshot
  * of the written file. File ids are not stable across a compaction.
  */
-Snapshot *index_compact(const Snapshot *s, const char *path, Err *err);
+[[nodiscard]] Error index_compact(const Snapshot *s, String path, Snapshot **compacted, Err *err);
 
 #endif

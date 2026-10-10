@@ -1,29 +1,21 @@
 #include "journal.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-#define JOURNAL_MAGIC "EINJ"
-#define JOURNAL_HEADER_SIZE 12
-#define OP_ADD 'A'
-#define OP_REMOVE 'R'
-#define OP_UPDATE 'U'
+enum { JOURNAL_HEADER_SIZE = 12, OP_ADD = 'A', OP_REMOVE = 'R', OP_UPDATE = 'U' };
 
+static const char JOURNAL_MAGIC[4] = {'E', 'I', 'N', 'J'};
+
+/* A Journal and everything it holds live in its arena. */
 struct Journal {
-    char *path;
+    Arena *arena;
+    String path;
     char header[JOURNAL_HEADER_SIZE];
-    StrBuf pending;
+    StringBuilder pending;
     size_t entries;
 };
 
-static char *journal_path(const char *index_path) {
-    StrBuf sb = {0};
-    sb_printf(&sb, "%s.journal", index_path);
-    return sb.data;
-}
+static String journal_path(Arena *arena, String index_path) { return str_concat(arena, index_path, S(".journal")); }
 
 static void make_header(char out[JOURNAL_HEADER_SIZE], uint64_t generation) {
     memcpy(out, JOURNAL_MAGIC, 4);
@@ -58,15 +50,14 @@ static size_t entry_size(const char *p, size_t avail) {
 }
 
 /* valid_length is the length of the whole entries in data, or 0 if data is not this generation's journal. */
-static size_t valid_length(const StrBuf *data, uint64_t generation, size_t *entries) {
+static size_t valid_length(String data, uint64_t generation, size_t *entries) {
     char header[JOURNAL_HEADER_SIZE];
     make_header(header, generation);
     *entries = 0;
-    if (data->len < JOURNAL_HEADER_SIZE || memcmp(data->data, header, JOURNAL_HEADER_SIZE) != 0) return 0;
+    if (data.len < JOURNAL_HEADER_SIZE || memcmp(data.data, header, JOURNAL_HEADER_SIZE) != 0) return 0;
     size_t p = JOURNAL_HEADER_SIZE;
-    for (;;) {
-        if (p >= data->len) break;
-        size_t n = entry_size(data->data + p, data->len - p);
+    while (p < data.len) {
+        size_t n = entry_size(data.data + p, data.len - p);
         if (n == 0) break;
         p += n;
         (*entries)++;
@@ -75,73 +66,87 @@ static size_t valid_length(const StrBuf *data, uint64_t generation, size_t *entr
 }
 
 /* read_journal reads the journal at path; a missing journal reads as empty. */
-static bool read_journal(const char *path, StrBuf *out, Err *err) {
-    sb_clear(out);
-    if (access(path, F_OK) != 0 && errno == ENOENT) return true;
-    return read_file(path, out, err);
+[[nodiscard]] static Error read_journal(Arena *arena, String path, String *data, Err *err) {
+    Error e = file_read_all(arena, path, data, err);
+    if (e == ERR_NOT_FOUND) {
+        *data = S("");
+        return ERR_OK;
+    }
+    return e;
 }
 
-static void set_dead(uint64_t **dead, size_t *words, uint32_t id, uint32_t *dead_count) {
-    if (id / 64 >= *words) {
-        size_t grown = max_size(*words * 2, id / 64 + 1);
-        *dead = xrealloc(*dead, grown * sizeof **dead);
-        memset(*dead + *words, 0, (grown - *words) * sizeof **dead);
-        *words = grown;
-    }
-    if (!bitmap_test(*dead, id)) {
-        bitmap_set(*dead, id);
-        (*dead_count)++;
+/* Dead is a tombstone bitmap that grows with the ids the journal adds. */
+typedef struct {
+    Arena *arena;
+    uint64_t *bits;
+    size_t words;
+    uint32_t count;
+} Dead;
+
+static void dead_reserve(Dead *d, size_t words) {
+    if (words <= d->words) return;
+    size_t grown = max_size(d->words * 2, words);
+    uint64_t *bits = arena_push(d->arena, grown * sizeof *bits);
+    if (d->words) memcpy(bits, d->bits, d->words * sizeof *bits);
+    d->bits = bits;
+    d->words = grown;
+}
+
+static void dead_set(Dead *d, uint32_t id) {
+    dead_reserve(d, id / 64 + 1);
+    if (!bitmap_test(d->bits, id)) {
+        bitmap_set(d->bits, id);
+        d->count++;
     }
 }
 
-Snapshot *journal_replay(Snapshot *s, const char *path, Err *err) {
-    char *jpath = journal_path(path);
-    StrBuf data = {0};
-    bool ok = read_journal(jpath, &data, err);
-    free(jpath);
-    if (!ok) {
-        sb_free(&data);
-        snapshot_release(s);
-        return NULL;
-    }
-    size_t entries;
-    size_t valid = valid_length(&data, s->segs[0]->generation, &entries);
-    if (valid == 0 || entries == 0) {
-        sb_free(&data);
-        return s;
+Error journal_replay(Snapshot *s, String path, Snapshot **replayed, Err *err) {
+    *replayed = nullptr;
+    Arena *scratch = arena_create(0);
+    String data;
+    Error e = read_journal(scratch, journal_path(scratch, path), &data, err);
+    size_t entries = 0;
+    size_t valid = e == ERR_OK ? valid_length(data, s->segs[0]->generation, &entries) : 0;
+    if (e != ERR_OK || valid == 0 || entries == 0) {
+        arena_destroy(scratch);
+        if (e != ERR_OK) {
+            snapshot_release(s);
+            return e;
+        }
+        *replayed = s;
+        return ERR_OK;
     }
     Segment *base = s->segs[0]; /* unpublished, so the journal may still change its records */
     SegmentBuilder added;
     builder_init(&added, s->total);
-    size_t words = bitmap_words(s->total) + 1;
-    uint64_t *dead = xcalloc(words, sizeof *dead);
-    uint32_t dead_count = 0;
+    Dead dead = {.arena = scratch};
+    dead_reserve(&dead, bitmap_words(s->total) + 1);
     bool corrupt = false;
     for (size_t p = JOURNAL_HEADER_SIZE; p < valid && !corrupt;) {
-        const char *e = data.data + p;
-        p += entry_size(e, valid - p);
+        const char *entry = data.data + p;
+        p += entry_size(entry, valid - p);
         uint32_t total = s->total + added.count;
-        if (e[0] == OP_ADD) {
-            uint32_t parent = get_u32(e + 1);
-            uint16_t len = (uint16_t)((uint8_t)e[30] | (uint8_t)e[31] << 8);
+        if (entry[0] == OP_ADD) {
+            uint32_t parent = get_u32(entry + 1);
+            uint16_t len = (uint16_t)((uint8_t)entry[30] | (uint8_t)entry[31] << 8);
             if (parent != NO_PARENT && parent >= total) {
                 corrupt = true;
                 break;
             }
-            builder_add(&added, e + 32, len, parent, get_i64(e + 5), get_i64(e + 13), get_i64(e + 21),
-                        e[29] ? RECORD_DIR : 0);
+            builder_add(&added, (String){entry + 32, len}, parent, get_i64(entry + 5), get_i64(entry + 13),
+                        get_i64(entry + 21), entry[29] ? RECORD_DIR : 0);
             continue;
         }
-        uint32_t id = get_u32(e + 1);
+        uint32_t id = get_u32(entry + 1);
         if (id >= total) {
             corrupt = true;
             break;
         }
-        if (e[0] == OP_REMOVE) {
-            set_dead(&dead, &words, id, &dead_count);
+        if (entry[0] == OP_REMOVE) {
+            dead_set(&dead, id);
             continue;
         }
-        int64_t size = get_i64(e + 5), mtime = get_i64(e + 13), ctime = get_i64(e + 21);
+        int64_t size = get_i64(entry + 5), mtime = get_i64(entry + 13), ctime = get_i64(entry + 21);
         if (id < base->count) {
             segment_set_times(base, id, size, mtime, ctime);
         } else {
@@ -151,61 +156,56 @@ Snapshot *journal_replay(Snapshot *s, const char *path, Err *err) {
             r->ctime = ctime;
         }
     }
-    sb_free(&data);
     if (corrupt) {
         builder_free(&added);
-        free(dead);
+        arena_destroy(scratch);
         snapshot_release(s);
-        err_set(err, "%s: corrupt index journal", path);
-        return NULL;
+        return err_set(err, ERR_PARSE, "%.*s: corrupt index journal", (int)path.len, path.data);
     }
-    uint32_t total = s->total + added.count;
-    if (words < bitmap_words(total) + 1) {
-        size_t grown = bitmap_words(total) + 1;
-        dead = xrealloc(dead, grown * sizeof *dead);
-        memset(dead + words, 0, (grown - words) * sizeof *dead);
-    }
-    Segment *delta = added.count ? segment_from_builder(&added) : NULL;
+    dead_reserve(&dead, bitmap_words(s->total + added.count) + 1);
+    Segment *delta = added.count ? segment_from_builder(&added) : nullptr;
     builder_free(&added);
-    Snapshot *replayed = snapshot_derive(s, delta, dead, dead_count);
+    *replayed = snapshot_derive(s, delta, dead.bits, dead.count);
     snapshot_release(s);
-    return replayed;
+    arena_destroy(scratch);
+    return ERR_OK;
 }
 
-Journal *journal_open(const char *path, const Snapshot *s, Err *err) {
-    Journal *j = xcalloc(1, sizeof *j);
-    j->path = journal_path(path);
+Error journal_open(String path, const Snapshot *s, Journal **journal, Err *err) {
+    *journal = nullptr;
+    Arena *arena = arena_create(0);
+    Journal *j = arena_push(arena, sizeof *j);
+    j->arena = arena;
+    j->path = journal_path(arena, path);
+    j->pending = str_builder_create(arena, 4096);
     make_header(j->header, s->segs[0]->generation);
-    StrBuf data = {0};
-    if (!read_journal(j->path, &data, err)) {
-        sb_free(&data);
-        journal_free(j);
-        return NULL;
+    Arena *scratch = arena_create(0);
+    String data;
+    Error e = read_journal(scratch, j->path, &data, err);
+    if (e == ERR_OK) {
+        size_t valid = valid_length(data, s->segs[0]->generation, &j->entries);
+        if (valid == 0) {
+            e = file_write_atomic(j->path, (String){j->header, JOURNAL_HEADER_SIZE}, 0644, err);
+        } else if (valid < data.len) {
+            e = file_write_atomic(j->path, str_slice(data, 0, valid), 0644, err);
+        }
     }
-    size_t valid = valid_length(&data, s->segs[0]->generation, &j->entries);
-    bool ok = true;
-    if (valid == 0) {
-        ok = write_file_atomic(j->path, j->header, JOURNAL_HEADER_SIZE, 0644, err);
-    } else if (valid < data.len) {
-        ok = write_file_atomic(j->path, data.data, valid, 0644, err);
+    arena_destroy(scratch);
+    if (e != ERR_OK) {
+        arena_destroy(arena);
+        return e;
     }
-    sb_free(&data);
-    if (!ok) {
-        journal_free(j);
-        return NULL;
-    }
-    return j;
+    *journal = j;
+    return ERR_OK;
 }
 
 void journal_free(Journal *j) {
-    if (!j) return;
-    free(j->path);
-    sb_free(&j->pending);
-    free(j);
+    if (j) arena_destroy(j->arena);
 }
 
-static void put_u32(StrBuf *sb, uint32_t v) { sb_append(sb, (const char *)&v, 4); }
-static void put_i64(StrBuf *sb, int64_t v) { sb_append(sb, (const char *)&v, 8); }
+static void put_bytes(StringBuilder *out, const void *data, size_t len) { str_builder_append(out, (String){data, len}); }
+static void put_u32(StringBuilder *out, uint32_t v) { put_bytes(out, &v, 4); }
+static void put_i64(StringBuilder *out, int64_t v) { put_bytes(out, &v, 8); }
 
 /*
  * A changed file is a new record in the next snapshot and its old record a
@@ -215,55 +215,43 @@ static void put_i64(StrBuf *sb, int64_t v) { sb_append(sb, (const char *)&v, 8);
 void journal_record(Journal *j, const Snapshot *before, const Snapshot *after) {
     for (uint32_t id = before->total; id < after->total; id++) {
         FileRecord r = snap_record(after, id);
-        sb_putc(&j->pending, OP_ADD);
+        str_builder_append_char(&j->pending, OP_ADD);
         put_u32(&j->pending, r.parent);
         put_i64(&j->pending, r.size);
         put_i64(&j->pending, r.mtime);
         put_i64(&j->pending, r.ctime);
-        sb_putc(&j->pending, record_is_dir(&r) ? 1 : 0);
+        str_builder_append_char(&j->pending, record_is_dir(&r) ? 1 : 0);
         uint16_t len = (uint16_t)r.name_len;
-        sb_append(&j->pending, (const char *)&len, 2);
-        sb_append(&j->pending, snap_name(after, id), len);
+        put_bytes(&j->pending, &len, 2);
+        put_bytes(&j->pending, snap_name(after, id), len);
         j->entries++;
     }
     for (uint32_t id = 0; id < after->total; id++) {
         bool was_dead = id < before->total && !snap_live(before, id);
         if (snap_live(after, id) || was_dead) continue;
-        sb_putc(&j->pending, OP_REMOVE);
+        str_builder_append_char(&j->pending, OP_REMOVE);
         put_u32(&j->pending, id);
         j->entries++;
     }
 }
 
-JournalStatus journal_flush(Journal *j, Err *err) {
-    if (j->pending.len == 0) return JOURNAL_OK;
-    int fd = open(j->path, O_RDWR | O_APPEND | O_CLOEXEC);
-    if (fd < 0) {
-        err_set(err, "%s: %s", j->path, strerror(errno));
-        return JOURNAL_FAILED;
-    }
+Error journal_flush(Journal *j, bool *replaced, Err *err) {
+    *replaced = false;
+    if (j->pending.len == 0) return ERR_OK;
+    int fd;
+    Error e = file_open_append(j->path, &fd, err);
+    if (e != ERR_OK) return e;
     char header[JOURNAL_HEADER_SIZE];
-    ssize_t n = pread(fd, header, sizeof header, 0);
-    if (n != (ssize_t)sizeof header || memcmp(header, j->header, sizeof header) != 0) {
-        close(fd);
-        return JOURNAL_REPLACED;
+    size_t got = 0;
+    e = file_pread(fd, header, sizeof header, 0, &got, err);
+    if (e == ERR_OK && (got != sizeof header || memcmp(header, j->header, sizeof header) != 0)) {
+        *replaced = true;
+    } else if (e == ERR_OK) {
+        e = file_write(fd, (String){j->pending.data, j->pending.len}, err);
+        if (e == ERR_OK) j->pending.len = 0;
     }
-    const char *p = j->pending.data;
-    size_t left = j->pending.len;
-    while (left > 0) {
-        ssize_t w = write(fd, p, left);
-        if (w < 0 && errno == EINTR) continue;
-        if (w < 0) {
-            err_set(err, "%s: %s", j->path, strerror(errno));
-            close(fd);
-            return JOURNAL_FAILED;
-        }
-        p += w;
-        left -= (size_t)w;
-    }
-    close(fd);
-    sb_clear(&j->pending);
-    return JOURNAL_OK;
+    file_close(fd);
+    return e;
 }
 
 size_t journal_entries(const Journal *j) { return j->entries; }

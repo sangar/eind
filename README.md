@@ -8,54 +8,84 @@ language: `report ext:pdf size:>1mb dm:thisweek !draft`. A daemon keeps the
 index current from filesystem events and answers launchers over a Unix
 socket.
 
-Runs on macOS and Linux. No dependencies beyond a C23 compiler, `make` and
-pthreads.
+Runs on macOS and Linux. Building needs only a C23 compiler: its one
+dependency, [libmc](https://github.com/sangar/libmc), is vendored in
+`deps/libmc`, and the build program is C too.
 
 ## Profile
 
-Modern C Level 1. The language is C23; the compilers are clang 18 or newer
-(primary) and gcc 14 or newer; the targets are macOS on arm64 and x86_64 and
-Linux on x86_64 and aarch64. The build runs with `-Werror` and
-`-Wall -Wextra -Wshadow -Wconversion -Wvla -Wstrict-prototypes
--Wimplicit-fallthrough`; `make sanitize` runs the tests under AddressSanitizer
-and UndefinedBehaviorSanitizer. The only approved extension is
-`__attribute__((format))`.
+| | |
+|---|---|
+| Profile | Modern C Level 2 |
+| Language | C23 |
+| Compilers | clang 18 or newer (primary), gcc 14 or newer |
+| Targets | Linux x86_64 and aarch64, macOS arm64 and x86_64 |
+| Build | `tools/build.c`, a build program in C (see below) |
+| Dependencies | [libmc](https://github.com/sangar/libmc), vendored in `deps/libmc` and pinned in `deps.lock` |
 
-Deliberate departures from the profile: POSIX is treated as portable, so OS
-headers and `errno` appear throughout and only the file-event sources are
-isolated in `src/fs/fs_*.c`; errors travel as `bool` plus an `Err` message
-rather than an error enum; the growable containers own heap memory
-individually rather than living in arenas; and two `sig_atomic_t` flags are
-set from signal handlers.
+Everything shared comes from libmc: arenas, `String`, the `Error` codes,
+containers, JSON, the thread pool and the platform layer, including file
+watching, the login service, Unix sockets and the terminal. eind's own
+platform code is the default excludes in `src/platform/defaults_*.c`.
+Memory lives in arenas, fallible functions return `Error` with an `Err`
+message, and there is no global mutable state.
+
+The build runs with `-Werror` and `-Wall -Wextra -Wshadow -Wconversion -Wvla
+-Wstrict-prototypes -Wimplicit-fallthrough`; `./nob test` runs the tests
+under AddressSanitizer and UndefinedBehaviorSanitizer, and CI runs them with
+clang 18 and gcc 14 on Linux x86_64 and aarch64 and with clang on macOS. The
+only approved extension is `[[gnu::format]]`.
+
+`./nob cross` builds the Linux binaries for both architectures with the zig
+pinned in `mise.toml`, and compiles the macOS one; linking it needs the
+CoreServices framework from the macOS SDK, so macOS binaries are built on a
+Mac. Windows is not a target: libmc has no Windows platform layer.
+
+Deliberate departures from the profile: searches use the C library's POSIX
+regular expressions (`<regex.h>`), which macOS and Linux both provide, since
+libmc has no regex engine; dates use `localtime_r` and `mktime` from
+`<time.h>`; and the tests' `CHECK` macros are function-like so a failure can
+name its line.
 
 ## Build
 
+The build program is C and rebuilds itself when it changes. Bootstrap it
+once:
+
 ```sh
-make            # ./eind
-make test       # unit and integration tests
-make sanitize   # the tests under AddressSanitizer and UndefinedBehaviorSanitizer
+cc tools/build.c -o nob
+```
+
+```sh
+./nob             # ./eind, -O2 -g
+./nob test        # the tests under AddressSanitizer and UndefinedBehaviorSanitizer
+./nob check       # the modern-c contract check, then the tests
+./nob cross       # out/<target>/eind for every target, with zig
+./nob clean
+VERSION=1.2.3 ./nob   # what `eind version` prints (default: git describe or "dev")
 ```
 
 ## Install
 
 ```sh
-make install      # ~/.local/bin/eind, and eind serve at login
-make uninstall    # stop the service and remove the binary
+./nob install      # ~/.local/bin/eind, and eind serve at login
+./nob uninstall    # stop the service and remove the binary
 ```
 
-`make install` copies the binary to `~/.local/bin`, which must be on your
-`PATH`, and enables the login service (`eind service enable`). Run it again
-after pulling to upgrade; the service restarts on the new binary. Install
-elsewhere with `make install PREFIX=/usr/local`, and uninstall with the same
-`PREFIX`.
+`./nob install` builds and copies the binary to `~/.local/bin`, which must be
+on your `PATH`, and enables the login service (`eind service enable`). Run it
+again after pulling to upgrade; the service restarts on the new binary.
+Install elsewhere with `PREFIX=/usr/local ./nob install`, and uninstall with
+the same `PREFIX`.
 
-`make uninstall` keeps the index and config; `eind status` shows where they
+`./nob uninstall` keeps the index and config; `eind status` shows where they
 are, so you can delete them too. On macOS the service logs to
 `~/Library/Logs/eind.log`.
 
 On Linux, raise the inotify limit once, since the watcher registers every
 indexed directory and the default of 8192 watches is too low for a home
-directory:
+directory. Without enough watches, `eind watch` and `eind serve` stop with an
+error that names the limit:
 
 ```sh
 sudo cp packaging/50-eind.conf /etc/sysctl.d/ && sudo sysctl --system

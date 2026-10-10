@@ -1,413 +1,393 @@
 #include "server.h"
 
-#include <errno.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <time.h>
-#include <unistd.h>
 
+#include "mc/concurrency/cancel.h"
+#include "mc/encoding/json.h"
+#include "mc/platform/platform.h"
+#include "mc/text/fmt.h"
+#include "mc/text/path.h"
 #include "../index/search.h"
 #include "output.h"
 
-/* sun_path holds 104 bytes on macOS and the BSDs, 108 on Linux; leave room for the NUL. */
-#define MAX_SOCKET_PATH 103
-#define MAX_REQUEST_LINE (1 << 20)
+enum { MAX_REQUEST_LINE = 1 << 20, ACCEPT_POLL_MS = 250, READ_CHUNK = 16384 };
 
 typedef struct Conn Conn;
 
+/* The server, its paths and its list of connections live in its arena; the list only under mutex. */
 struct Server {
+    Arena *arena;
     Index *ix;
     ThreadPool *cpu;
-    char *index_path;
-    char *socket_path;
+    String index_path;
+    String socket_path;
     int listen_fd;
     atomic_bool stopping;
-    pthread_t accept_thread;
+    Thread accept_thread;
 
-    pthread_mutex_t mu;
-    pthread_cond_t idle;
+    Mutex mutex;
+    Cond idle;
     Conn **conns;
     size_t conn_count, conn_cap;
 };
 
+/* A Request, its JSON and its response live in its arena. */
 typedef struct Request {
+    Arena *arena;
     Conn *conn;
-    Arena arena;
-    const JsonValue *body;
-    atomic_int cancel;
-    pthread_t thread;
+    const Node *body;
+    Cancel cancel;
+    Thread thread;
 } Request;
 
+/* A Conn and its read buffer live in its arena. */
 struct Conn {
+    Arena *arena;
     Server *srv;
     int fd;
-    pthread_mutex_t write_mu;
+    Mutex write_mutex;
 };
 
-char *default_socket_path(void) {
-    const char *p = getenv("EIND_SOCKET");
-    if (p && *p) return xstrdup(p);
-    const char *runtime = getenv("XDG_RUNTIME_DIR");
-    if (runtime && *runtime) return path_join(runtime, "eind.sock");
-    const char *tmp = getenv("TMPDIR");
-    StrBuf sb = {0};
-    sb_printf(&sb, "eind-%d.sock", (int)getuid());
-    char *path = path_join(tmp && *tmp ? tmp : "/tmp", sb.data);
-    sb_free(&sb);
-    return path;
+String default_socket_path(Arena *arena) {
+    String path;
+    if (env_get(arena, S("EIND_SOCKET"), &path) && path.len) return path;
+    if (env_get(arena, S("XDG_RUNTIME_DIR"), &path) && path.len) return path_join(arena, path, S("eind.sock"));
+    if (!env_get(arena, S("TMPDIR"), &path) || path.len == 0) path = S("/tmp");
+    return path_join(arena, path, str_format(arena, "eind-%d.sock", process_user_id()));
 }
 
-static int connect_unix(const char *path) {
-    struct sockaddr_un addr = {.sun_family = AF_UNIX};
-    if (strlen(path) >= sizeof addr.sun_path) return -1;
-    strcpy(addr.sun_path, path);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        close(fd);
-        return -1;
-    }
-#ifdef SO_NOSIGPIPE
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
-    return fd;
-}
-
-bool server_running(const char *socket_path) {
-    int fd = connect_unix(socket_path);
-    if (fd < 0) return false;
-    close(fd);
-    return true;
-}
-
-static bool write_all(int fd, const char *data, size_t len) {
-    while (len > 0) {
-        ssize_t n = write(fd, data, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        data += n;
-        len -= (size_t)n;
-    }
+bool server_running(String socket_path) {
+    int fd;
+    if (net_connect_unix(socket_path, &fd, nullptr) != ERR_OK) return false;
+    net_close(fd);
     return true;
 }
 
 /* ---- request handling ---- */
 
-static void send_line(Conn *c, StrBuf *sb) {
-    sb_putc(sb, '\n');
-    pthread_mutex_lock(&c->write_mu);
-    if (!write_all(c->fd, sb->data, sb->len)) shutdown(c->fd, SHUT_RDWR);
-    pthread_mutex_unlock(&c->write_mu);
+static void send_line(Conn *c, StringBuilder *out) {
+    str_builder_append_char(out, '\n');
+    mutex_lock(&c->write_mutex);
+    if (net_send(c->fd, (String){out->data, out->len}, nullptr) != ERR_OK) net_shutdown(c->fd);
+    mutex_unlock(&c->write_mutex);
 }
 
-static void begin_response(StrBuf *sb, const JsonValue *body) {
-    const JsonValue *id = json_get(body, "id");
-    sb_putc(sb, '{');
-    if (id) {
-        sb_puts(sb, "\"id\":");
-        sb_append(sb, id->raw, id->raw_len);
-        sb_putc(sb, ',');
+/* append_id echoes a request's id: numbers as they were written, anything else as JSON. */
+static void append_id(StringBuilder *out, const Node *id) {
+    if (id->kind == NODE_INT || id->kind == NODE_FLOAT) {
+        str_builder_append(out, id->text);
+    } else if (id->kind == NODE_STRING) {
+        json_append_quoted(out, id->text);
+    } else {
+        str_builder_append(out, json_encode(out->arena, id));
     }
 }
 
-static void send_error(Conn *c, const JsonValue *body, const char *msg) {
-    StrBuf sb = {0};
-    begin_response(&sb, body);
-    sb_puts(&sb, "\"error\":");
-    json_write_string(&sb, msg, strlen(msg));
-    sb_putc(&sb, '}');
-    send_line(c, &sb);
-    sb_free(&sb);
+static StringBuilder begin_response(Arena *arena, const Node *body) {
+    StringBuilder out = str_builder_create(arena, 1024);
+    const Node *id = body ? node_get(body, S("id")) : nullptr;
+    str_builder_append_char(&out, '{');
+    if (id) {
+        str_builder_append(&out, S("\"id\":"));
+        append_id(&out, id);
+        str_builder_append_char(&out, ',');
+    }
+    return out;
 }
 
-static void send_cancelled(Conn *c, const JsonValue *body) {
-    StrBuf sb = {0};
-    begin_response(&sb, body);
-    sb_puts(&sb, "\"cancelled\":true}");
-    send_line(c, &sb);
-    sb_free(&sb);
+static void send_error(Conn *c, Arena *arena, const Node *body, String msg) {
+    StringBuilder out = begin_response(arena, body);
+    str_builder_append(&out, S("\"error\":"));
+    json_append_quoted(&out, msg);
+    str_builder_append_char(&out, '}');
+    send_line(c, &out);
 }
+
+static void send_cancelled(Request *r) {
+    StringBuilder out = begin_response(r->arena, r->body);
+    str_builder_append(&out, S("\"cancelled\":true}"));
+    send_line(r->conn, &out);
+}
+
+/* request_int reads a number field, accepting a fraction as JSON clients may send one. */
+static int64_t request_int(const Node *body, const char *key, int64_t fallback) {
+    const Node *n = node_get(body, S(key));
+    if (n && n->kind == NODE_INT) return n->integer;
+    if (n && n->kind == NODE_FLOAT && n->number > -9.2e18 && n->number < 9.2e18) return (int64_t)n->number;
+    return fallback;
+}
+
+static bool request_bool(const Node *body, const char *key) { return node_get_bool(body, S(key), false); }
+
+static String request_string(const Node *body, const char *key) { return node_get_string(body, S(key), S("")); }
 
 static void handle_status(Request *r) {
-    Snapshot *s = index_acquire(r->conn->srv->ix);
+    Server *srv = r->conn->srv;
+    Snapshot *s = index_acquire(srv->ix);
     int64_t files, dirs;
     snap_stats(s, &files, &dirs);
-    StrBuf sb = {0};
-    char built[40];
-    begin_response(&sb, r->body);
-    sb_printf(&sb, "\"files\":%lld,\"folders\":%lld,\"roots\":[", (long long)files, (long long)dirs);
-    for (size_t i = 0; i < s->roots.len; i++) {
-        if (i) sb_putc(&sb, ',');
-        json_write_string(&sb, s->roots.items[i], strlen(s->roots.items[i]));
+    StringBuilder out = begin_response(r->arena, r->body);
+    str_builder_append_format(&out, "\"files\":%lld,\"folders\":%lld,\"roots\":[", (long long)files, (long long)dirs);
+    for (size_t i = 0; i < s->roots.count; i++) {
+        if (i) str_builder_append_char(&out, ',');
+        json_append_quoted(&out, s->roots.items[i]);
     }
-    sb_printf(&sb, "],\"built\":\"%s\",\"index\":", format_rfc3339(s->built_at, built));
-    json_write_string(&sb, r->conn->srv->index_path, strlen(r->conn->srv->index_path));
-    sb_putc(&sb, '}');
-    send_line(r->conn, &sb);
-    sb_free(&sb);
+    String built = fmt_rfc3339(r->arena, s->built_at * NS_PER_SECOND, clock_local_offset(s->built_at), false);
+    str_builder_append_format(&out, "],\"built\":\"%.*s\",\"index\":", (int)built.len, built.data);
+    json_append_quoted(&out, srv->index_path);
+    str_builder_append_char(&out, '}');
+    send_line(r->conn, &out);
     snapshot_release(s);
+}
+
+static void send_results(Request *r, const Snapshot *s, const uint32_t *hits, size_t total, size_t count, int64_t start) {
+    StringBuilder out = begin_response(r->arena, r->body);
+    StringBuilder path = str_builder_create(r->arena, 256);
+    Arena *temporary = arena_create(4096);
+    double elapsed_ms = (double)(clock_monotonic_ns() - start) / (double)NS_PER_MILLISECOND;
+    str_builder_append_format(&out, "\"total\":%zu,\"elapsed_ms\":%.6g,\"results\":[", total, elapsed_ms);
+    for (size_t k = 0; k < count; k++) {
+        OutRecord rec = record_of(s, hits[k], &path);
+        if (k) str_builder_append_char(&out, ',');
+        record_json(&out, temporary, &rec);
+    }
+    str_builder_append(&out, S("]}"));
+    send_line(r->conn, &out);
+    arena_destroy(temporary);
 }
 
 static void handle_search(Request *r) {
-    int64_t start = monotonic_us();
-    const JsonValue *body = r->body;
+    int64_t start = clock_monotonic_ns();
+    const Node *body = r->body;
     Err err;
     SortKey sort = SORT_RELEVANCE;
-    const char *sort_name = json_string(body, "sort", "");
-    if (*sort_name && !sort_key_parse(sort_name, &sort, &err)) {
-        send_error(r->conn, body, err.msg);
+    String sort_name = request_string(body, "sort");
+    if (sort_name.len && sort_key_parse(sort_name, &sort, &err) != ERR_OK) {
+        send_error(r->conn, r->arena, body, S(err.msg));
         return;
     }
-    QueryDefaults defaults = {.regex = json_bool(body, "regex"),
-                              .case_sensitive = json_bool(body, "case"),
-                              .whole_word = json_bool(body, "whole_word"),
-                              .match_path = json_bool(body, "match_path")};
-    QueryNode *node = query_parse(&r->arena, json_string(body, "query", ""), defaults, &err);
-    if (!node) {
-        send_error(r->conn, body, err.msg);
+    QueryDefaults defaults = {.regex = request_bool(body, "regex"),
+                              .case_sensitive = request_bool(body, "case"),
+                              .whole_word = request_bool(body, "whole_word"),
+                              .match_path = request_bool(body, "match_path")};
+    QueryNode *node;
+    if (query_parse(r->arena, request_string(body, "query"), defaults, &node, &err) != ERR_OK) {
+        send_error(r->conn, r->arena, body, S(err.msg));
         return;
     }
-    node = query_restrict(&r->arena, node, json_string(body, "path", ""), json_bool(body, "files"), json_bool(body, "dirs"));
+    node = query_restrict(r->arena, node, request_string(body, "path"), request_bool(body, "files"),
+                          request_bool(body, "dirs"));
 
     Snapshot *s = index_acquire(r->conn->srv->ix);
-    U32Vec hits = {0};
-    SearchStatus status = search_run(r->conn->srv->cpu, s, node, &r->cancel, &hits, &err);
-    if (status == SEARCH_CANCELLED) {
-        send_cancelled(r->conn, body);
-    } else if (status == SEARCH_ERROR) {
-        send_error(r->conn, body, err.msg);
+    IdList hits;
+    Error e = search_run(r->conn->srv->cpu, r->arena, s, node, &r->cancel, &hits, &err);
+    if (e == ERR_CANCELLED) {
+        send_cancelled(r);
+    } else if (e != ERR_OK) {
+        send_error(r->conn, r->arena, body, S(err.msg));
     } else {
-        size_t total = hits.len;
-        double offset_value = json_number(body, "offset", 0);
+        size_t total = hits.count;
+        int64_t offset_value = request_int(body, "offset", 0);
         size_t offset = offset_value > 0 ? min_size((size_t)offset_value, total) : 0;
-        long limit = (long)json_number(body, "limit", DEFAULT_LIMIT);
+        int64_t limit = request_int(body, "limit", DEFAULT_LIMIT);
         size_t kept = 0;
         if (limit != 0) {
-            long keep = limit < 0 ? -1 : (long)offset + limit;
-            kept = sort == SORT_RELEVANCE ? search_rank(s, hits.data, total, node, keep)
-                                          : search_top(s, hits.data, total, sort, json_bool(body, "descending"), keep);
+            int64_t keep = limit < 0 || limit > INT64_MAX - (int64_t)offset ? -1 : (int64_t)offset + limit;
+            Arena *scratch = arena_create(0);
+            kept = sort == SORT_RELEVANCE ? search_rank(scratch, s, hits.items, total, node, keep)
+                                          : search_top(scratch, s, hits.items, total, sort, request_bool(body, "descending"), keep);
+            arena_destroy(scratch);
         }
         size_t from = min_size(offset, kept);
         size_t count = kept - from;
-        if (limit >= 0 && (size_t)limit < count) count = (size_t)limit;
-        if (atomic_load(&r->cancel)) {
-            send_cancelled(r->conn, body);
+        if (limit >= 0 && (uint64_t)limit < count) count = (size_t)limit;
+        if (cancel_requested(&r->cancel)) {
+            send_cancelled(r);
         } else {
-            StrBuf sb = {0}, path = {0};
-            begin_response(&sb, body);
-            sb_printf(&sb, "\"total\":%zu,\"elapsed_ms\":%.6g,\"results\":[", total, elapsed_ms_since(start));
-            for (size_t k = 0; k < count; k++) {
-                OutRecord rec;
-                record_of(s, hits.data[from + k], &rec, &path);
-                if (k) sb_putc(&sb, ',');
-                record_json(&sb, &rec);
-            }
-            sb_puts(&sb, "]}");
-            send_line(r->conn, &sb);
-            sb_free(&sb);
-            sb_free(&path);
+            send_results(r, s, hits.items + from, total, count, start);
         }
     }
-    u32vec_free(&hits);
     snapshot_release(s);
 }
 
-static void *run_request(void *arg) {
-    Request *r = arg;
-    const char *op = json_string(r->body, "op", "");
-    if (!*op || strcmp(op, "search") == 0) {
+static void *run_request(void *argument) {
+    Request *r = argument;
+    String op = request_string(r->body, "op");
+    if (op.len == 0 || str_equal(op, S("search"))) {
         handle_search(r);
-    } else if (strcmp(op, "status") == 0) {
+    } else if (str_equal(op, S("status"))) {
         handle_status(r);
     } else {
-        char msg[300];
-        snprintf(msg, sizeof msg, "unknown op \"%s\"", op);
-        send_error(r->conn, r->body, msg);
+        send_error(r->conn, r->arena, r->body, str_format(r->arena, "unknown op \"%.*s\"", (int)op.len, op.data));
     }
-    return NULL;
+    return nullptr;
 }
 
 static void finish_request(Request *r) {
     if (!r) return;
-    atomic_store(&r->cancel, 1);
-    pthread_join(r->thread, NULL);
-    arena_free(&r->arena);
-    free(r);
+    cancel_request(&r->cancel);
+    thread_join(&r->thread);
+    cancel_destroy(&r->cancel);
+    arena_destroy(r->arena);
 }
 
 /* ---- connections ---- */
 
 static void track(Server *srv, Conn *c) {
-    pthread_mutex_lock(&srv->mu);
-    if (srv->conn_count == srv->conn_cap) {
-        srv->conn_cap = srv->conn_cap ? srv->conn_cap * 2 : 8;
-        srv->conns = xrealloc(srv->conns, srv->conn_cap * sizeof *srv->conns);
-    }
+    mutex_lock(&srv->mutex);
+    srv->conns = arena_grow(srv->arena, srv->conns, &srv->conn_cap, srv->conn_count, sizeof *srv->conns);
     srv->conns[srv->conn_count++] = c;
-    pthread_mutex_unlock(&srv->mu);
+    mutex_unlock(&srv->mutex);
 }
 
 static void untrack(Server *srv, Conn *c) {
-    pthread_mutex_lock(&srv->mu);
+    mutex_lock(&srv->mutex);
     for (size_t i = 0; i < srv->conn_count; i++) {
         if (srv->conns[i] == c) {
             srv->conns[i] = srv->conns[--srv->conn_count];
             break;
         }
     }
-    if (srv->conn_count == 0) pthread_cond_broadcast(&srv->idle);
-    pthread_mutex_unlock(&srv->mu);
+    if (srv->conn_count == 0) cond_broadcast(&srv->idle);
+    mutex_unlock(&srv->mutex);
 }
 
-static void handle_line(Conn *c, Request **previous, char *line, size_t len) {
-    while (len > 0 && (line[len - 1] == ' ' || line[len - 1] == '\r' || line[len - 1] == '\t')) len--;
-    while (len > 0 && (*line == ' ' || *line == '\t')) line++, len--;
-    if (len == 0) return;
-    Request *r = xcalloc(1, sizeof *r);
+static void handle_line(Conn *c, Request **previous, String line) {
+    line = str_trim(line);
+    if (line.len == 0) return;
+    Arena *arena = arena_create(8192);
+    Request *r = arena_push(arena, sizeof *r);
+    r->arena = arena;
     r->conn = c;
-    arena_init(&r->arena, 8192);
     Err err;
-    const char *text = arena_strndup(&r->arena, line, len); /* responses echo the id's raw bytes */
-    r->body = json_parse(&r->arena, text, len, &err);
-    if (!r->body || r->body->type != JSON_OBJECT) {
-        char msg[600];
-        snprintf(msg, sizeof msg, "invalid request: %s", r->body ? "expected a JSON object" : err.msg);
-        send_error(c, NULL, msg);
-        arena_free(&r->arena);
-        free(r);
+    Node *body;
+    Error e = json_parse(arena, str_copy(arena, line), &body, &err);
+    if (e != ERR_OK || body->kind != NODE_MAPPING) {
+        send_error(c, arena, nullptr,
+                   str_format(arena, "invalid request: %s", e == ERR_OK ? "expected a JSON object" : err.msg));
+        arena_destroy(arena);
         return;
     }
+    r->body = body;
     finish_request(*previous);
-    atomic_init(&r->cancel, 0);
-    pthread_create(&r->thread, NULL, run_request, r);
+    *previous = nullptr;
+    cancel_init(&r->cancel);
+    if (thread_start(&r->thread, run_request, r, &err) != ERR_OK) {
+        send_error(c, arena, body, S(err.msg));
+        cancel_destroy(&r->cancel);
+        arena_destroy(arena);
+        return;
+    }
     *previous = r;
 }
 
-static void *serve_conn(void *arg) {
-    Conn *c = arg;
-    Request *previous = NULL;
-    StrBuf buf = {0};
-    char chunk[16384];
+static void *serve_conn(void *argument) {
+    Conn *c = argument;
+    Request *previous = nullptr;
+    StringBuilder buf = str_builder_create(c->arena, READ_CHUNK);
+    char chunk[READ_CHUNK];
     for (;;) {
-        ssize_t n = read(c->fd, chunk, sizeof chunk);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
-        sb_append(&buf, chunk, (size_t)n);
-        char *start = buf.data, *nl;
-        while ((nl = memchr(start, '\n', buf.len - (size_t)(start - buf.data))) != NULL) {
-            handle_line(c, &previous, start, (size_t)(nl - start));
-            start = nl + 1;
+        size_t got;
+        if (net_receive(c->fd, chunk, sizeof chunk, &got, nullptr) != ERR_OK || got == 0) break;
+        str_builder_append(&buf, (String){chunk, got});
+        size_t start = 0, nl;
+        while (str_find_char((String){buf.data + start, buf.len - start}, '\n', &nl)) {
+            handle_line(c, &previous, (String){buf.data + start, nl});
+            start += nl + 1;
         }
-        size_t rest = buf.len - (size_t)(start - buf.data);
-        memmove(buf.data, start, rest);
-        buf.len = rest;
+        memmove(buf.data, buf.data + start, buf.len - start);
+        buf.len -= start;
         if (buf.len > MAX_REQUEST_LINE) break;
     }
-    if (buf.len > 0 && buf.len <= MAX_REQUEST_LINE) handle_line(c, &previous, buf.data, buf.len);
+    if (buf.len > 0 && buf.len <= MAX_REQUEST_LINE) handle_line(c, &previous, (String){buf.data, buf.len});
     finish_request(previous);
-    sb_free(&buf);
-    close(c->fd);
+    net_close(c->fd);
     untrack(c->srv, c);
-    pthread_mutex_destroy(&c->write_mu);
-    free(c);
-    return NULL;
+    mutex_destroy(&c->write_mutex);
+    arena_destroy(c->arena);
+    return nullptr;
 }
 
-static void *accept_loop(void *arg) {
-    Server *srv = arg;
+static void *accept_loop(void *argument) {
+    Server *srv = argument;
     while (!atomic_load(&srv->stopping)) {
-        struct pollfd pfd = {.fd = srv->listen_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 250) <= 0) continue;
-        int fd = accept(srv->listen_fd, NULL, NULL);
-        if (fd < 0) continue;
-#ifdef SO_NOSIGPIPE
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
-#endif
-        Conn *c = xcalloc(1, sizeof *c);
+        int fd;
+        if (!net_accept(srv->listen_fd, ACCEPT_POLL_MS, &fd)) continue;
+        Arena *arena = arena_create(4 * READ_CHUNK);
+        Conn *c = arena_push(arena, sizeof *c);
+        c->arena = arena;
         c->srv = srv;
         c->fd = fd;
-        pthread_mutex_init(&c->write_mu, NULL);
+        mutex_init(&c->write_mutex);
         track(srv, c);
-        pthread_t t;
-        pthread_create(&t, NULL, serve_conn, c);
-        pthread_detach(t);
+        Thread thread;
+        if (thread_start(&thread, serve_conn, c, nullptr) != ERR_OK) {
+            untrack(srv, c);
+            mutex_destroy(&c->write_mutex);
+            net_close(fd);
+            arena_destroy(arena);
+            continue;
+        }
+        thread_detach(&thread);
     }
-    return NULL;
+    return nullptr;
 }
 
-static int listen_unix(const char *path, Err *err) {
-    if (strlen(path) > MAX_SOCKET_PATH) {
-        err_set(err, "socket path \"%s\" is longer than %d bytes; choose a shorter --socket", path, MAX_SOCKET_PATH);
-        return -1;
+[[nodiscard]] static Error listen_unix(String path, int *fd, Err *err) {
+    if (file_exists(path)) {
+        if (server_running(path))
+            return err_set(err, ERR_IO, "another eind daemon is already serving %.*s", (int)path.len, path.data);
+        Error e = file_remove(path, err);
+        if (e != ERR_OK) return e;
     }
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        if (server_running(path)) {
-            err_set(err, "another eind daemon is already serving %s", path);
-            return -1;
-        }
-        if (unlink(path) != 0) {
-            err_set(err, "%s: %s", path, strerror(errno));
-            return -1;
-        }
-    }
-    char *dir = path_dir(path);
-    bool ok = mkdir_p(dir, 0700, err);
-    free(dir);
-    if (!ok) return -1;
-    struct sockaddr_un addr = {.sun_family = AF_UNIX};
-    strcpy(addr.sun_path, path);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0 || bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 64) != 0) {
-        err_set(err, "listen on %s: %s", path, strerror(errno));
-        if (fd >= 0) close(fd);
-        return -1;
-    }
-    chmod(path, 0600);
-    return fd;
+    Error e = dir_create_all(path_dir(path), 0700, err);
+    return e == ERR_OK ? net_listen_unix(path, 0600, fd, err) : e;
 }
 
-Server *server_start(ThreadPool *cpu, Index *ix, const char *socket_path, const char *index_path, Err *err) {
-    int fd = listen_unix(socket_path, err);
-    if (fd < 0) return NULL;
-    Server *srv = xcalloc(1, sizeof *srv);
+Error server_start(ThreadPool *cpu, Index *ix, String socket_path, String index_path, Server **server, Err *err) {
+    *server = nullptr;
+    Arena *arena = arena_create(4096);
+    int fd;
+    Error e = listen_unix(socket_path, &fd, err);
+    if (e != ERR_OK) {
+        arena_destroy(arena);
+        return e;
+    }
+    Server *srv = arena_push(arena, sizeof *srv);
+    srv->arena = arena;
     srv->ix = ix;
     srv->cpu = cpu;
-    srv->index_path = xstrdup(index_path);
-    srv->socket_path = xstrdup(socket_path);
+    srv->index_path = str_copy(arena, index_path);
+    srv->socket_path = str_copy(arena, socket_path);
     srv->listen_fd = fd;
     atomic_init(&srv->stopping, false);
-    pthread_mutex_init(&srv->mu, NULL);
-    pthread_cond_init(&srv->idle, NULL);
-    pthread_create(&srv->accept_thread, NULL, accept_loop, srv);
-    return srv;
+    mutex_init(&srv->mutex);
+    cond_init(&srv->idle);
+    e = thread_start(&srv->accept_thread, accept_loop, srv, err);
+    if (e != ERR_OK) {
+        net_close(fd);
+        (void)file_remove(srv->socket_path, nullptr);
+        mutex_destroy(&srv->mutex);
+        cond_destroy(&srv->idle);
+        arena_destroy(arena);
+        return e;
+    }
+    *server = srv;
+    return ERR_OK;
 }
 
-/* server_stop closes the listener and every open connection, so shutdown never waits on an idle client. */
 void server_stop(Server *srv) {
     atomic_store(&srv->stopping, true);
-    pthread_join(srv->accept_thread, NULL);
-    close(srv->listen_fd);
-    unlink(srv->socket_path);
-    pthread_mutex_lock(&srv->mu);
-    for (size_t i = 0; i < srv->conn_count; i++) shutdown(srv->conns[i]->fd, SHUT_RDWR);
-    while (srv->conn_count > 0) pthread_cond_wait(&srv->idle, &srv->mu);
-    pthread_mutex_unlock(&srv->mu);
-    pthread_mutex_destroy(&srv->mu);
-    pthread_cond_destroy(&srv->idle);
-    free(srv->conns);
-    free(srv->index_path);
-    free(srv->socket_path);
-    free(srv);
+    thread_join(&srv->accept_thread);
+    net_close(srv->listen_fd);
+    /* A socket already gone is what stopping wants anyway. */
+    (void)file_remove(srv->socket_path, nullptr);
+    mutex_lock(&srv->mutex);
+    for (size_t i = 0; i < srv->conn_count; i++) net_shutdown(srv->conns[i]->fd);
+    while (srv->conn_count > 0) cond_wait(&srv->idle, &srv->mutex);
+    mutex_unlock(&srv->mutex);
+    mutex_destroy(&srv->mutex);
+    cond_destroy(&srv->idle);
+    arena_destroy(srv->arena);
 }

@@ -1,9 +1,9 @@
 #ifndef EIND_CONFIG_H
 #define EIND_CONFIG_H
 
-#include <stdbool.h>
-
-#include "../core/util.h"
+#include "mc/core/arena.h"
+#include "mc/core/error.h"
+#include "mc/text/str.h"
 
 /*
  * The config file is a plain list of "key = value" lines:
@@ -13,20 +13,19 @@
  *   exclude = ~/Library/Caches
  */
 typedef struct {
-    StrList roots;
-    StrList excludes;
+    StringList roots;
+    StringList excludes;
 } Config;
 
-void config_free(Config *cfg);
-/* config_load falls back to the defaults when the file does not exist. */
-bool config_load(const char *path, Config *cfg, Err *err);
+/* config_load reads path into arena, falling back to the defaults when the file does not exist. */
+[[nodiscard]] Error config_load(Arena *arena, String path, Config *cfg, Err *err);
 /* config_render writes a config in the file format, with a short syntax primer. */
-void config_render(const Config *cfg, StrBuf *out);
+void config_render(const Config *cfg, StringBuilder *out);
 /* config_write_default creates the file unless it exists; *created says which. */
-bool config_write_default(const char *path, bool *created, Err *err);
+[[nodiscard]] Error config_write_default(Arena *scratch, String path, bool *created, Err *err);
 
 /* Paths default to XDG locations; EIND_CONFIG and EIND_INDEX override them. */
-char *config_path(void);
-char *index_path(void);
+String config_path(Arena *arena);
+String index_path(Arena *arena);
 
 #endif

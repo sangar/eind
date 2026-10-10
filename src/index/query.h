@@ -1,12 +1,11 @@
 #ifndef EIND_QUERY_H
 #define EIND_QUERY_H
 
-#include <stdbool.h>
-#include <stdint.h>
 #include <time.h>
 
-#include "../core/arena.h"
-#include "../core/util.h"
+#include "mc/core/arena.h"
+#include "mc/core/error.h"
+#include "mc/text/str.h"
 
 /*
  * The query language:
@@ -47,15 +46,15 @@ typedef struct QueryNode {
     uint32_t kid_count;
     struct QueryNode *kid; /* NOT */
     /* TEXT: matched against the name, or the full path when match_path is set */
-    const char *text;
+    String text;
     TextMode mode;
     bool match_path;
     bool case_sensitive;
-    const char **exts; /* EXT: lowercase, no dot */
+    String *exts; /* EXT: lowercase, no dot */
     uint32_t ext_count;
     Range range; /* SIZE, MODIFIED, CREATED, NAMELEN, DEPTH */
     bool dir;    /* ISDIR */
-    const char *path; /* PARENT, INFOLDER */
+    String path; /* PARENT, INFOLDER */
 } QueryNode;
 
 /* QueryDefaults come from command line switches and apply to plain words. */
@@ -64,13 +63,16 @@ typedef struct {
     time_t now; /* anchors relative dates such as dm:today; 0 means the current time */
 } QueryDefaults;
 
-QueryNode *query_parse(Arena *arena, const char *s, QueryDefaults defaults, Err *err);
+/* query_parse builds the tree in arena; a malformed function argument is ERR_PARSE. */
+[[nodiscard]] Error query_parse(Arena *arena, String text, QueryDefaults defaults, QueryNode **query, Err *err);
 /* query_restrict narrows a query to a folder and to files or folders, like --path, --files, --dirs. */
-QueryNode *query_restrict(Arena *arena, QueryNode *node, const char *path, bool files_only, bool dirs_only);
+QueryNode *query_restrict(Arena *arena, QueryNode *node, String path, bool files_only, bool dirs_only);
 
-typedef bool (*ValueParser)(const char *s, time_t now, Range *out, Err *err);
-bool parse_range(const char *s, ValueParser parse, time_t now, Range *out, Err *err);
-bool parse_size_value(const char *s, time_t now, Range *out, Err *err);
-bool parse_date_value(const char *s, time_t now, Range *out, Err *err);
+/* A ValueParser reads one function argument such as 10mb or today; what it cannot read is ERR_PARSE. */
+typedef Error (*ValueParser)(String s, time_t now, Range *out, Err *err);
+/* parse_range reads a value, a comparison such as >=10mb, or a range such as 2023..2024. */
+[[nodiscard]] Error parse_range(String s, ValueParser parse, time_t now, Range *out, Err *err);
+[[nodiscard]] Error parse_size_value(String s, time_t now, Range *out, Err *err);
+[[nodiscard]] Error parse_date_value(String s, time_t now, Range *out, Err *err);
 
 #endif

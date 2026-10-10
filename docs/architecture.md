@@ -42,15 +42,15 @@ snapshot finishes on it, mapping included.
 1. For each configured root, `fs/scanner.c: scan_tree` lists directories on
    the I/O thread pool (at most 6 threads). Each worker reads one directory,
    skipping excluded names, and returns a batch; the collecting thread appends
-   the batch to one `SegmentBuilder`, so parents always precede children. On
-   macOS a directory's names and metadata come from `getattrlistbulk` in bulk
-   (`fs_macos.c: fs_read_dir`); elsewhere from `readdir` and `fstatat`.
+   the batch to one `SegmentBuilder`, so parents always precede children. A
+   directory's names and metadata come from libmc's `dir_read`: on macOS from
+   `getattrlistbulk` in bulk, elsewhere from `readdir` and `fstatat`.
 2. `segment.c: segment_write` orders the records by lowercased path, stores
    every distinct name once in name order, and writes the columns of the index
    file (see [file-format.md](file-format.md)), together with an empty journal.
 3. The file is loaded back with `index_load` and the snapshot returned.
 
-Excludes (`fs/fs_common.c`) are globs: a pattern without a slash matches names,
+Excludes (`fs/excludes.c`, on libmc's `glob_match`) are globs: a pattern without a slash matches names,
 one with a slash matches the full path and everything below it; `**` spans
 directories.
 
@@ -92,16 +92,19 @@ Output (`app/output.c`) prints plain lines, NUL-separated lines, JSON or CSV.
 `eind watch` and `eind serve` run `app/daemon.c: daemon_run`:
 
 1. Load the index (or build it) and publish it.
-2. Open the watcher (`fs/watcher.c`): FSEvents on macOS watches whole trees;
-   inotify on Linux needs one watch per directory, so the daemon adds one for
-   every directory in the index and for each one that appears later.
+2. Open libmc's watcher (`mc/platform/watch.h`) on the roots, skipping
+   excluded directories: FSEvents on macOS watches whole trees; inotify on
+   Linux needs one watch per directory, so libmc adds one for every directory
+   below the roots and for each one that appears later.
 3. Open the journal for the loaded file (`journal_open`), which cuts off a
    half-written last entry or starts a fresh journal.
-4. Loop: `watcher_collect` waits for a change and keeps collecting until
-   events have been quiet for 250 ms (at most 2 s), so a path touched many
-   times is examined once. `updater_apply` re-examines each changed path on
-   disk: what exists is added or refreshed, what is gone is tombstoned, a new
-   directory is scanned in full. The batch becomes one delta segment and a new
+4. Loop: `watch_read` waits for a change and keeps collecting until events
+   have been quiet for 250 ms (at most 2 s), so a path touched many times is
+   examined once. `updater_apply` re-examines each changed path on disk: what
+   exists is added or refreshed, what is gone is tombstoned, a new directory
+   is scanned in full. An event marked `rescan` (a directory moved in or out,
+   a root that moved, events the system dropped) replaces the directory's
+   whole subtree with a fresh scan. The batch becomes one delta segment and a new
    tombstone bitmap, published as a new snapshot. The differences between the
    old and new snapshot are appended to the journal at once (`journal_record`,
    `journal_flush`).
@@ -112,6 +115,10 @@ Output (`app/output.c`) prints plain lines, NUL-separated lines, JSON or CSV.
    and journal. Compact once more on exit.
 6. If a flush finds that another process wrote a new index file (its journal
    header names another generation), load that file and continue from it.
+
+SIGINT, SIGTERM and SIGHUP are blocked in every thread and taken by one
+thread in `signals_wait`, which cancels the loop; the daemon then compacts
+and exits.
 
 The updater (`fs/updater.c`) finds records by (parent id, name) in a hash table
 of ids, so a path is looked up by walking down from its root.
@@ -126,23 +133,31 @@ The protocol is in [protocol.md](protocol.md).
 
 ## The interactive view
 
-`app/tui.c` draws on `/dev/tty` in raw mode with ANSI escapes. Each change to
-the input cancels the running search and starts a new one on a worker thread
-after a short typing pause; Enter prints the selected path to stdout.
+`app/tui.c` draws on `/dev/tty` in raw mode with ANSI escapes, through
+libmc's `Terminal`. Each change to the input cancels the running search and
+starts a new one on a thread of its own after a short typing pause; a
+finished search queues itself and wakes `terminal_wait`, which also reports
+window resizes. Enter prints the selected path to stdout.
 
 ## The login service
 
-`app/service.c` writes a launchd agent (`~/Library/LaunchAgents/eind.plist`)
-or a systemd user unit (`~/.config/systemd/user/eind.service`) that runs
-`eind serve`, and loads it.
+`eind service` (`main.c: cmd_service`) uses libmc's login services
+(`mc/platform/service.h`) to write a launchd agent
+(`~/Library/LaunchAgents/eind.plist`) or a systemd user unit
+(`~/.config/systemd/user/eind.service`) that runs `eind serve`, and loads it.
 
 ## Memory
 
+Everything lives in libmc arenas; nothing in `src/` calls `malloc`.
+
 | Data | Lives in | Freed |
 |---|---|---|
-| parsed query, matchers | per-query `Arena` | after the search |
-| socket request and its JSON | per-request `Arena` | when the request finishes |
-| scanned directory batch | worker buffers | after the collector appends it |
-| records being built | `SegmentBuilder` | handed to a `Segment` |
-| segments, snapshots | reference counts | when the last holder releases |
-| base names | the file mapping | with the base segment |
+| parsed query, hits | the caller's `Arena` | with it |
+| matchers, compiled regexes | the search's own arena | after the search |
+| one chunk's hits and paths | an arena per chunk | merged into the hits, then freed |
+| socket request, its JSON and response | per-request `Arena` | when the request finishes |
+| scanned directory batch | a pooled read buffer's arena | released after the collector appends it; freed if it grew large |
+| records being built | `SegmentBuilder`, an arena per array, replaced as it grows | handed to a `Segment` |
+| segments, snapshots | an arena each, reference counted | when the last holder releases |
+| base names and columns | the file mapping | with the base segment |
+| a daemon batch's events, tombstones | per-batch arenas | when the next batch starts |

@@ -2,13 +2,14 @@
 #define EIND_SEGMENT_H
 
 #include <stdatomic.h>
-#include <stdbool.h>
-#include <stdint.h>
 
-#include "../core/util.h"
+#include "mc/core/arena.h"
+#include "mc/core/error.h"
+#include "mc/platform/platform.h"
+#include "mc/text/str.h"
 
 /* A root record has no parent; its name is the absolute root path. */
-#define NO_PARENT UINT32_MAX
+static const uint32_t NO_PARENT = UINT32_MAX;
 
 enum { RECORD_DIR = 1 };
 
@@ -41,26 +42,29 @@ typedef struct {
  * A Segment is immutable once built. The base segment reads the mapped
  * index file in place, so a command touches only the columns its query
  * needs; delta segments hold the watcher's additions in memory as records.
- * Searches scan every segment in parallel.
+ * Searches scan every segment in parallel. Everything a segment owns,
+ * itself included, lives in its arenas.
  */
 typedef struct Segment {
     atomic_int refs;
+    Arena *arena;
+    Arena *records_arena, *names_arena; /* delta segments: the builder's arrays */
     uint32_t base_id;
     uint32_t count;
     uint64_t generation; /* of the index file; its journal names the same one */
+    int64_t built_at;    /* base segment only: when the index file was built */
+    StringList roots;    /* base segment only: views into the mapping */
     const char *names;
-    const FileRecord *recs; /* delta segments only; NULL for the base */
+    const FileRecord *recs; /* delta segments only; nullptr for the base */
     Columns col;            /* base segment only */
     /*
      * Journal entries that replace a base record's size and times, applied
      * before the segment is published: a bitset over the records plus the
-     * new values at the same index. NULL until the first one.
+     * new values at the same index. nullptr until the first one.
      */
     uint64_t *updated;
     int64_t *updated_size, *updated_mtime, *updated_ctime;
-    void *map;
-    size_t map_len;
-    void *owned_recs, *owned_names;
+    FileMap map;
 } Segment;
 
 static inline bool segment_bit(const uint64_t *bits, uint32_t i) { return bits[i >> 6] >> (i & 63) & 1; }
@@ -100,30 +104,41 @@ static inline uint32_t seg_name_len(const Segment *s, uint32_t i) {
     return end - 1 - s->col.name_off[id];
 }
 
-/* SegmentBuilder accumulates records in id order before they become a segment. */
+/*
+ * SegmentBuilder accumulates records in id order before they become a
+ * segment. Its records and its names each live in an arena of their own,
+ * which segment_from_builder hands to the segment.
+ */
 typedef struct {
+    Arena *records_arena, *names_arena;
     uint32_t base_id;
     FileRecord *recs;
-    uint32_t count, cap;
+    uint32_t count;
+    size_t cap;
     char *names;
     size_t names_len, names_cap;
 } SegmentBuilder;
 
+/* builder_init starts an empty builder whose first record gets base_id; builder_free releases it. */
 void builder_init(SegmentBuilder *b, uint32_t base_id);
 void builder_free(SegmentBuilder *b);
 /* builder_add appends a record and returns its file id. */
-uint32_t builder_add(SegmentBuilder *b, const char *name, size_t len, uint32_t parent, int64_t size,
-                     int64_t mtime, int64_t ctime, uint32_t flags);
-static inline const char *builder_name(const SegmentBuilder *b, uint32_t id) {
-    return b->names + b->recs[id - b->base_id].name_off;
+uint32_t builder_add(SegmentBuilder *b, String name, uint32_t parent, int64_t size, int64_t mtime, int64_t ctime,
+                     uint32_t flags);
+static inline String builder_name(const SegmentBuilder *b, uint32_t id) {
+    const FileRecord *r = &b->recs[id - b->base_id];
+    return (String){b->names + r->name_off, r->name_len};
 }
 
-/* segment_from_builder takes the builder's buffers; the builder is left empty. */
+/* segment_from_builder takes the builder's arenas; the builder is left empty. */
 Segment *segment_from_builder(SegmentBuilder *b);
 /* segment_write stores the builder as an index file in the shared format (docs/file-format.md). */
-bool segment_write(const char *path, const SegmentBuilder *b, const StrList *roots, int64_t built_at, Err *err);
-/* segment_open maps an index file; *missing is set when it does not exist. */
-Segment *segment_open(const char *path, StrList *roots, int64_t *built_at, bool *missing, Err *err);
+[[nodiscard]] Error segment_write(String path, const SegmentBuilder *b, StringList roots, int64_t built_at, Err *err);
+/*
+ * segment_open maps an index file into a new base segment; ERR_NOT_FOUND
+ * when it does not exist, ERR_PARSE when it is damaged.
+ */
+[[nodiscard]] Error segment_open(String path, Segment **segment, Err *err);
 /*
  * segment_set_times replaces a base record's size and times, for the journal
  * to replay before the segment is published; nobody else may call it.

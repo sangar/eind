@@ -1,15 +1,8 @@
 #include "segment.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
 
-#include "../core/sort.h"
+#include "mc/container/sort.h"
 
 /*
  * The index file format is shared by every eind implementation and is
@@ -36,62 +29,77 @@
  * empty one for the new file, so that a running daemon notices the file was
  * replaced.
  */
-#define SEGMENT_MAGIC "EIND"
-#define SEGMENT_VERSION 2
-#define SECTION_COUNT 10
-#define HEADER_SIZE (32 + 16 * SECTION_COUNT)
-#define JOURNAL_MAGIC "EINJ"
+static const char SEGMENT_MAGIC[4] = {'E', 'I', 'N', 'D'};
+static const char JOURNAL_MAGIC[4] = {'E', 'I', 'N', 'J'};
+enum { SEGMENT_VERSION = 2, SECTION_COUNT = 10, HEADER_SIZE = 32 + 16 * SECTION_COUNT };
 
 enum { SEC_ROOTS, SEC_NAMES, SEC_NAME_OFF, SEC_NAME_ID, SEC_PARENT, SEC_SIZE, SEC_MODIFIED, SEC_CREATED, SEC_DIRS, SEC_UNICODE };
 
-void builder_init(SegmentBuilder *b, uint32_t base_id) {
-    *b = (SegmentBuilder){.base_id = base_id};
-}
+void builder_init(SegmentBuilder *b, uint32_t base_id) { *b = (SegmentBuilder){.base_id = base_id}; }
 
 void builder_free(SegmentBuilder *b) {
-    free(b->recs);
-    free(b->names);
+    arena_destroy(b->records_arena);
+    arena_destroy(b->names_arena);
     *b = (SegmentBuilder){0};
 }
 
-uint32_t builder_add(SegmentBuilder *b, const char *name, size_t len, uint32_t parent, int64_t size,
-                     int64_t mtime, int64_t ctime, uint32_t flags) {
+/*
+ * move_to_larger moves an array into a fresh arena of capacity bytes and
+ * frees the old one, as realloc would. A scan appends millions of records,
+ * and an arena that kept every outgrown copy would double what it needs.
+ */
+static void *move_to_larger(Arena **arena, const void *items, size_t used, size_t capacity) {
+    Arena *larger = arena_create(capacity + 64);
+    void *moved = arena_push(larger, capacity);
+    if (used) memcpy(moved, items, used);
+    arena_destroy(*arena);
+    *arena = larger;
+    return moved;
+}
+
+/* reserve_names makes room for extra more bytes of names, doubling as it grows. */
+static void reserve_names(SegmentBuilder *b, size_t extra) {
+    size_t need = arena_size_add(b->names_len, extra);
+    if (need <= b->names_cap) return;
+    size_t cap = b->names_cap ? b->names_cap : 16384;
+    while (cap < need) cap = arena_size_mul(cap, 2);
+    b->names = move_to_larger(&b->names_arena, b->names, b->names_len, cap);
+    b->names_cap = cap;
+}
+
+uint32_t builder_add(SegmentBuilder *b, String name, uint32_t parent, int64_t size, int64_t mtime, int64_t ctime,
+                     uint32_t flags) {
     if (b->count == b->cap) {
-        b->cap = b->cap ? b->cap * 2 : 1024;
-        b->recs = xrealloc(b->recs, (size_t)b->cap * sizeof *b->recs);
+        size_t cap = b->cap ? arena_size_mul(b->cap, 2) : 1024;
+        b->recs = move_to_larger(&b->records_arena, b->recs, b->count * sizeof *b->recs, arena_size_mul(cap, sizeof *b->recs));
+        b->cap = cap;
     }
-    if (b->names_len + len + 1 > b->names_cap) {
-        size_t cap = b->names_cap ? b->names_cap : 16384;
-        while (cap < b->names_len + len + 1) cap *= 2;
-        b->names = xrealloc(b->names, cap);
-        b->names_cap = cap;
-    }
-    FileRecord *r = &b->recs[b->count];
-    *r = (FileRecord){.parent = parent,
-                      .name_off = (uint32_t)b->names_len,
-                      .name_len = (uint32_t)len,
-                      .flags = flags,
-                      .size = size,
-                      .mtime = mtime,
-                      .ctime = ctime};
-    memcpy(b->names + b->names_len, name, len);
-    b->names[b->names_len + len] = '\0';
-    b->names_len += len + 1;
+    reserve_names(b, name.len + 1);
+    b->recs[b->count] = (FileRecord){.parent = parent,
+                                     .name_off = (uint32_t)b->names_len,
+                                     .name_len = (uint32_t)name.len,
+                                     .flags = flags,
+                                     .size = size,
+                                     .mtime = mtime,
+                                     .ctime = ctime};
+    if (name.len) memcpy(b->names + b->names_len, name.data, name.len);
+    b->names[b->names_len + name.len] = '\0';
+    b->names_len += name.len + 1;
     return b->base_id + b->count++;
 }
 
 Segment *segment_from_builder(SegmentBuilder *b) {
-    Segment *s = xcalloc(1, sizeof *s);
+    Arena *arena = arena_create(1024);
+    Segment *s = arena_push(arena, sizeof *s);
     atomic_init(&s->refs, 1);
+    s->arena = arena;
+    s->records_arena = b->records_arena;
+    s->names_arena = b->names_arena;
     s->base_id = b->base_id;
     s->count = b->count;
-    s->owned_recs = b->recs ? b->recs : xcalloc(1, sizeof(FileRecord));
-    s->owned_names = b->names ? b->names : xcalloc(1, 1);
-    s->recs = s->owned_recs;
-    s->names = s->owned_names;
-    b->recs = NULL;
-    b->names = NULL;
-    builder_free(b);
+    s->recs = b->recs ? b->recs : arena_push(arena, sizeof(FileRecord));
+    s->names = b->names ? b->names : "";
+    *b = (SegmentBuilder){0};
     return s;
 }
 
@@ -100,6 +108,8 @@ Segment *segment_from_builder(SegmentBuilder *b) {
 typedef struct {
     const SegmentBuilder *b;
 } WriteCtx;
+
+static uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
 
 static const char *rec_name(const SegmentBuilder *b, uint32_t i) { return b->names + b->recs[i].name_off; }
 
@@ -151,27 +161,27 @@ static int compare_items(const void *ctx, const void *pa, const void *pb) {
  * as the subtree below it, keyed by its name and a separator. That places
  * "a.txt" between "a" and "a/b", as comparing whole paths would.
  */
-static void path_order(const SegmentBuilder *b, uint32_t *order, uint32_t *new_id) {
+static void path_order(Arena *scratch, const SegmentBuilder *b, uint32_t *order, uint32_t *new_id) {
     uint32_t n = b->count;
-    uint32_t *start = xcalloc((size_t)n + 2, sizeof *start);
+    uint32_t *start = arena_push(scratch, ((size_t)n + 2) * sizeof *start);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t p = min_u32(b->recs[i].parent, n);
         start[p + 1] += (b->recs[i].flags & RECORD_DIR) ? 2u : 1u;
     }
     for (uint32_t k = 1; k < n + 2; k++) start[k] += start[k - 1];
-    uint32_t *items = xmalloc(((size_t)start[n + 1] + 1) * sizeof *items);
-    uint32_t *fill = xmalloc(((size_t)n + 2) * sizeof *fill);
+    uint32_t *items = arena_push(scratch, ((size_t)start[n + 1] + 1) * sizeof *items);
+    uint32_t *fill = arena_push(scratch, ((size_t)n + 2) * sizeof *fill);
     memcpy(fill, start, ((size_t)n + 2) * sizeof *fill);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t p = min_u32(b->recs[i].parent, n);
         items[fill[p]++] = i << 1;
         if (b->recs[i].flags & RECORD_DIR) items[fill[p]++] = i << 1 | 1;
     }
-    free(fill);
     WriteCtx ctx = {b};
-    for (uint32_t p = 0; p <= n; p++) sort_stable(items + start[p], start[p + 1] - start[p], sizeof *items, compare_items, &ctx);
+    for (uint32_t p = 0; p <= n; p++)
+        sort_stable(scratch, items + start[p], start[p + 1] - start[p], sizeof *items, compare_items, &ctx);
 
-    uint32_t *stack = xmalloc(((size_t)start[n + 1] + 1) * sizeof *stack);
+    uint32_t *stack = arena_push(scratch, ((size_t)start[n + 1] + 1) * sizeof *stack);
     size_t depth = 0, placed = 0;
     stack[depth++] = n << 1 | 1;
     while (depth > 0) {
@@ -184,9 +194,6 @@ static void path_order(const SegmentBuilder *b, uint32_t *order, uint32_t *new_i
         uint32_t dir = it >> 1;
         for (uint32_t k = start[dir + 1]; k-- > start[dir];) stack[depth++] = items[k];
     }
-    free(stack);
-    free(items);
-    free(start);
 }
 
 static size_t bitmap_words(uint32_t n) { return ((size_t)n + 63) / 64; }
@@ -199,11 +206,13 @@ static bool has_non_ascii(const char *s, size_t n) {
     return false;
 }
 
-static void put_u32(StrBuf *sb, uint32_t v) { sb_append(sb, (const char *)&v, 4); }
+static void put_bytes(StringBuilder *out, const void *data, size_t len) { str_builder_append(out, (String){data, len}); }
 
-static void pad8(StrBuf *sb) {
+static void put_u32(StringBuilder *out, uint32_t v) { put_bytes(out, &v, 4); }
+
+static void pad8(StringBuilder *out) {
     static const char zeros[8] = {0};
-    if (sb->len % 8) sb_append(sb, zeros, 8 - sb->len % 8);
+    if (out->len % 8) put_bytes(out, zeros, 8 - out->len % 8);
 }
 
 /* Sections are laid out one after another; beginning one ends the one before it. */
@@ -212,12 +221,12 @@ typedef struct {
     int open; /* the section being written, or -1 */
 } Sections;
 
-static void end_sections(const StrBuf *out, Sections *s) {
+static void end_sections(const StringBuilder *out, Sections *s) {
     if (s->open >= 0) s->lens[s->open] = out->len - s->offs[s->open];
     s->open = -1;
 }
 
-static void begin_section(StrBuf *out, Sections *s, int k) {
+static void begin_section(StringBuilder *out, Sections *s, int k) {
     end_sections(out, s);
     pad8(out);
     s->offs[k] = out->len;
@@ -226,81 +235,77 @@ static void begin_section(StrBuf *out, Sections *s, int k) {
 
 static uint32_t clamp_time(int64_t t) { return t < 0 ? 0 : t > UINT32_MAX ? UINT32_MAX : (uint32_t)t; }
 
-static uint64_t new_generation(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
-}
-
-bool segment_write(const char *path, const SegmentBuilder *b, const StrList *roots, int64_t built_at, Err *err) {
+/*
+ * encode lays out the index file in out. Distinct names are numbered in name
+ * order; records are stored in path order.
+ */
+static void encode(Arena *scratch, const SegmentBuilder *b, StringList roots, int64_t built_at, uint64_t generation,
+                   StringBuilder *out) {
     uint32_t n = b->count;
     WriteCtx ctx = {b};
 
-    /* Distinct names, numbered in name order. */
-    uint32_t *by_name = xmalloc(((size_t)n + 1) * sizeof *by_name);
+    uint32_t *by_name = arena_push(scratch, ((size_t)n + 1) * sizeof *by_name);
     for (uint32_t i = 0; i < n; i++) by_name[i] = i;
-    sort_stable(by_name, n, sizeof *by_name, compare_by_name, &ctx);
-    uint32_t *name_id = xmalloc(((size_t)n + 1) * sizeof *name_id);
-    U32Vec name_off = {0};
-    StrBuf names = {0};
-    uint64_t *unicode = xcalloc(bitmap_words(n) + 1, sizeof *unicode);
+    sort_stable(scratch, by_name, n, sizeof *by_name, compare_by_name, &ctx);
+    uint32_t *name_id = arena_push(scratch, ((size_t)n + 1) * sizeof *name_id);
+    uint32_t *name_off = arena_push(scratch, ((size_t)n + 1) * sizeof *name_off);
+    uint32_t distinct = 0;
+    StringBuilder names = str_builder_create(scratch, b->names_len + 1);
+    uint64_t *unicode = arena_push(scratch, (bitmap_words(n) + 1) * sizeof *unicode);
     for (uint32_t k = 0; k < n; k++) {
         uint32_t i = by_name[k];
         const FileRecord *r = &b->recs[i];
-        const FileRecord *prev = k ? &b->recs[by_name[k - 1]] : NULL;
+        const FileRecord *prev = k ? &b->recs[by_name[k - 1]] : nullptr;
         bool same = prev && prev->name_len == r->name_len && memcmp(rec_name(b, by_name[k - 1]), rec_name(b, i), r->name_len) == 0;
         if (!same) {
-            if (has_non_ascii(rec_name(b, i), r->name_len)) bit_set(unicode, (uint32_t)name_off.len);
-            u32vec_push(&name_off, (uint32_t)names.len);
-            sb_append(&names, rec_name(b, i), r->name_len);
-            sb_putc(&names, '\0');
+            if (has_non_ascii(rec_name(b, i), r->name_len)) bit_set(unicode, distinct);
+            name_off[distinct++] = (uint32_t)names.len;
+            str_builder_append(&names, (String){rec_name(b, i), r->name_len});
+            str_builder_append_char(&names, '\0');
         }
-        name_id[i] = (uint32_t)name_off.len - 1;
+        name_id[i] = distinct - 1;
     }
-    free(by_name);
-    uint32_t distinct = (uint32_t)name_off.len;
 
-    uint32_t *order = xmalloc(((size_t)n + 1) * sizeof *order);
-    uint32_t *new_id = xmalloc(((size_t)n + 1) * sizeof *new_id);
-    path_order(b, order, new_id);
+    uint32_t *order = arena_push(scratch, ((size_t)n + 1) * sizeof *order);
+    uint32_t *new_id = arena_push(scratch, ((size_t)n + 1) * sizeof *new_id);
+    path_order(scratch, b, order, new_id);
 
-    StrBuf out = {0};
-    sb_grow(&out, HEADER_SIZE + names.len + (size_t)n * 32 + (size_t)distinct * 4 + 4096);
-    out.len = HEADER_SIZE;
-    memset(out.data, 0, HEADER_SIZE);
+    static const char zero_header[HEADER_SIZE] = {0};
+    put_bytes(out, zero_header, HEADER_SIZE);
     Sections sec = {.open = -1};
-    begin_section(&out, &sec, SEC_ROOTS);
-    for (size_t i = 0; i < roots->len; i++) sb_append(&out, roots->items[i], strlen(roots->items[i]) + 1);
-    begin_section(&out, &sec, SEC_NAMES);
-    sb_append(&out, names.data ? names.data : "", names.len);
-    begin_section(&out, &sec, SEC_NAME_OFF);
-    sb_append(&out, (const char *)name_off.data, (size_t)distinct * 4);
-    begin_section(&out, &sec, SEC_NAME_ID);
-    for (uint32_t i = 0; i < n; i++) put_u32(&out, name_id[order[i]]);
-    begin_section(&out, &sec, SEC_PARENT);
+    begin_section(out, &sec, SEC_ROOTS);
+    for (size_t i = 0; i < roots.count; i++) {
+        str_builder_append(out, roots.items[i]);
+        str_builder_append_char(out, '\0');
+    }
+    begin_section(out, &sec, SEC_NAMES);
+    put_bytes(out, names.data, names.len);
+    begin_section(out, &sec, SEC_NAME_OFF);
+    put_bytes(out, name_off, (size_t)distinct * 4);
+    begin_section(out, &sec, SEC_NAME_ID);
+    for (uint32_t i = 0; i < n; i++) put_u32(out, name_id[order[i]]);
+    begin_section(out, &sec, SEC_PARENT);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t p = b->recs[order[i]].parent;
-        put_u32(&out, p == NO_PARENT ? NO_PARENT : new_id[p]);
+        put_u32(out, p == NO_PARENT ? NO_PARENT : new_id[p]);
     }
-    begin_section(&out, &sec, SEC_SIZE);
-    for (uint32_t i = 0; i < n; i++) sb_append(&out, (const char *)&b->recs[order[i]].size, 8);
-    begin_section(&out, &sec, SEC_MODIFIED);
-    for (uint32_t i = 0; i < n; i++) put_u32(&out, clamp_time(b->recs[order[i]].mtime));
-    begin_section(&out, &sec, SEC_CREATED);
-    for (uint32_t i = 0; i < n; i++) put_u32(&out, clamp_time(b->recs[order[i]].ctime));
-    begin_section(&out, &sec, SEC_DIRS);
-    uint64_t *dirs = xcalloc(bitmap_words(n) + 1, sizeof *dirs);
+    begin_section(out, &sec, SEC_SIZE);
+    for (uint32_t i = 0; i < n; i++) put_bytes(out, &b->recs[order[i]].size, 8);
+    begin_section(out, &sec, SEC_MODIFIED);
+    for (uint32_t i = 0; i < n; i++) put_u32(out, clamp_time(b->recs[order[i]].mtime));
+    begin_section(out, &sec, SEC_CREATED);
+    for (uint32_t i = 0; i < n; i++) put_u32(out, clamp_time(b->recs[order[i]].ctime));
+    begin_section(out, &sec, SEC_DIRS);
+    uint64_t *dirs = arena_push(scratch, (bitmap_words(n) + 1) * sizeof *dirs);
     for (uint32_t i = 0; i < n; i++)
         if (b->recs[order[i]].flags & RECORD_DIR) bit_set(dirs, i);
-    sb_append(&out, (const char *)dirs, bitmap_words(n) * 8);
-    free(dirs);
-    begin_section(&out, &sec, SEC_UNICODE);
-    sb_append(&out, (const char *)unicode, bitmap_words(distinct) * 8);
-    end_sections(&out, &sec);
+    put_bytes(out, dirs, bitmap_words(n) * 8);
+    begin_section(out, &sec, SEC_UNICODE);
+    put_bytes(out, unicode, bitmap_words(distinct) * 8);
+    end_sections(out, &sec);
 
-    uint64_t generation = new_generation();
     uint32_t version = SEGMENT_VERSION;
-    char *h = out.data;
+    char *h = out->data;
     memcpy(h, SEGMENT_MAGIC, 4);
     memcpy(h + 4, &version, 4);
     memcpy(h + 8, &generation, 8);
@@ -311,24 +316,36 @@ bool segment_write(const char *path, const SegmentBuilder *b, const StrList *roo
         memcpy(h + 32 + 16 * k, &sec.offs[k], 8);
         memcpy(h + 40 + 16 * k, &sec.lens[k], 8);
     }
-    free(name_id);
-    free(order);
-    free(new_id);
-    free(unicode);
-    u32vec_free(&name_off);
-    sb_free(&names);
+}
+
+/*
+ * encoded_size bounds the length of the index file, so its buffer is
+ * allocated once: every section at its largest, plus the padding before each.
+ */
+static size_t encoded_size(const SegmentBuilder *b, StringList roots) {
+    size_t n = b->count, size = HEADER_SIZE + b->names_len + 8 * SECTION_COUNT;
+    for (size_t i = 0; i < roots.count; i++) size += roots.items[i].len + 1;
+    size += n * 4;                       /* name offsets, at most one per record */
+    size += n * (4 + 4 + 8 + 4 + 4);     /* name ids, parents, sizes, modified, created */
+    size += 2 * (bitmap_words((uint32_t)n) * 8); /* dirs and unicode */
+    return size;
+}
+
+Error segment_write(String path, const SegmentBuilder *b, StringList roots, int64_t built_at, Err *err) {
+    Arena *scratch = arena_create(0);
+    uint64_t generation = (uint64_t)clock_wall_ns();
+    StringBuilder out = str_builder_create(scratch, encoded_size(b, roots));
+    encode(scratch, b, roots, built_at, generation, &out);
 
     /* The new journal goes in first and the new file last: a reader ignores a journal of another generation. */
     char journal[12];
     memcpy(journal, JOURNAL_MAGIC, 4);
     memcpy(journal + 4, &generation, 8);
-    StrBuf journal_path = {0};
-    sb_printf(&journal_path, "%s.journal", path);
-    bool ok = write_file_atomic(journal_path.data, journal, sizeof journal, 0644, err) &&
-              write_file_atomic(path, out.data, out.len, 0644, err);
-    sb_free(&journal_path);
-    sb_free(&out);
-    return ok;
+    String journal_path = str_concat(scratch, path, S(".journal"));
+    Error e = file_write_atomic(journal_path, (String){journal, sizeof journal}, 0644, err);
+    if (e == ERR_OK) e = file_write_atomic(path, (String){out.data, out.len}, 0644, err);
+    arena_destroy(scratch);
+    return e;
 }
 
 /* ---- reading ---- */
@@ -350,7 +367,7 @@ static uint64_t le64(const char *p) {
  * validating every reference an accessor will follow so that a damaged file
  * is refused here rather than crashing a search. It returns false for one.
  */
-static bool decode(Segment *s, const char *base, size_t len, StrList *roots, int64_t *built_at) {
+static bool decode(Segment *s, const char *base, size_t len) {
     if (len < HEADER_SIZE || memcmp(base, SEGMENT_MAGIC, 4) != 0) return false;
     uint64_t n = le32(base + 24), d = le32(base + 28);
     const uint64_t elem[SECTION_COUNT] = {0, 0, 4, 4, 4, 8, 4, 4, 8, 8};
@@ -378,9 +395,12 @@ static bool decode(Segment *s, const char *base, size_t len, StrList *roots, int
 
     for (uint32_t i = 0; i < n; i++)
         if (name_id[i] >= d || (parent[i] != NO_PARENT && parent[i] >= i)) return false;
-    for (const char *p = sec[SEC_ROOTS], *e = p + sec_len[SEC_ROOTS]; p < e; p += strnlen(p, (size_t)(e - p)) + 1)
-        if (*p) strlist_push(roots, p);
-    *built_at = (int64_t)le64(base + 16);
+    String roots = {sec[SEC_ROOTS], (size_t)sec_len[SEC_ROOTS]}, root;
+    while (roots.len) {
+        str_cut(roots, '\0', &root, &roots);
+        if (root.len) strlist_push(s->arena, &s->roots, root);
+    }
+    s->built_at = (int64_t)le64(base + 16);
     s->generation = le64(base + 8);
 
     s->count = (uint32_t)n;
@@ -397,51 +417,40 @@ static bool decode(Segment *s, const char *base, size_t len, StrList *roots, int
     return true;
 }
 
-Segment *segment_open(const char *path, StrList *roots, int64_t *built_at, bool *missing, Err *err) {
-    *missing = false;
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        *missing = errno == ENOENT;
-        err_set(err, "%s: %s", path, strerror(errno));
-        return NULL;
+Error segment_open(String path, Segment **segment, Err *err) {
+    *segment = nullptr;
+    FileMap map;
+    Error e = file_map(path, &map, err);
+    if (e != ERR_OK) return e;
+    if (map.len < HEADER_SIZE) {
+        file_unmap(map);
+        return err_set(err, ERR_PARSE, "%.*s: corrupt index file", (int)path.len, path.data);
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0 || (size_t)st.st_size < HEADER_SIZE) {
-        close(fd);
-        err_set(err, "%s: corrupt index file", path);
-        return NULL;
+    if (memcmp(map.data, SEGMENT_MAGIC, 4) == 0 && le32((const char *)map.data + 4) != SEGMENT_VERSION) {
+        file_unmap(map);
+        return err_set(err, ERR_UNSUPPORTED, "index was written by an incompatible eind version; run `eind index`");
     }
-    size_t len = (size_t)st.st_size;
-    void *map = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) {
-        err_set(err, "%s: mmap: %s", path, strerror(errno));
-        return NULL;
-    }
-    if (memcmp(map, SEGMENT_MAGIC, 4) == 0 && le32((const char *)map + 4) != SEGMENT_VERSION) {
-        munmap(map, len);
-        err_set(err, "index was written by an incompatible eind version; run `eind index`");
-        return NULL;
-    }
-    Segment *s = xcalloc(1, sizeof *s);
+    Arena *arena = arena_create(4096);
+    Segment *s = arena_push(arena, sizeof *s);
     atomic_init(&s->refs, 1);
-    if (!decode(s, map, len, roots, built_at)) {
-        munmap(map, len);
-        free(s);
-        err_set(err, "%s: corrupt index file", path);
-        return NULL;
+    s->arena = arena;
+    if (!decode(s, map.data, map.len)) {
+        file_unmap(map);
+        arena_destroy(arena);
+        return err_set(err, ERR_PARSE, "%.*s: corrupt index file", (int)path.len, path.data);
     }
     s->map = map;
-    s->map_len = len;
-    return s;
+    *segment = s;
+    return ERR_OK;
 }
 
 void segment_set_times(Segment *s, uint32_t i, int64_t size, int64_t mtime, int64_t ctime) {
     if (!s->updated) {
-        s->updated = xcalloc(bitmap_words(s->count) + 1, sizeof *s->updated);
-        s->updated_size = xmalloc((s->count + 1) * sizeof *s->updated_size);
-        s->updated_mtime = xmalloc((s->count + 1) * sizeof *s->updated_mtime);
-        s->updated_ctime = xmalloc((s->count + 1) * sizeof *s->updated_ctime);
+        size_t n = (size_t)s->count + 1;
+        s->updated = arena_push(s->arena, (bitmap_words(s->count) + 1) * sizeof *s->updated);
+        s->updated_size = arena_push(s->arena, n * sizeof *s->updated_size);
+        s->updated_mtime = arena_push(s->arena, n * sizeof *s->updated_mtime);
+        s->updated_ctime = arena_push(s->arena, n * sizeof *s->updated_ctime);
     }
     bit_set(s->updated, i);
     s->updated_size[i] = size;
@@ -453,12 +462,8 @@ void segment_retain(Segment *s) { atomic_fetch_add(&s->refs, 1); }
 
 void segment_release(Segment *s) {
     if (!s || atomic_fetch_sub(&s->refs, 1) != 1) return;
-    if (s->map) munmap(s->map, s->map_len);
-    free(s->owned_recs);
-    free(s->owned_names);
-    free(s->updated);
-    free(s->updated_size);
-    free(s->updated_mtime);
-    free(s->updated_ctime);
-    free(s);
+    file_unmap(s->map);
+    arena_destroy(s->records_arena);
+    arena_destroy(s->names_arena);
+    arena_destroy(s->arena);
 }
