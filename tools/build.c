@@ -61,14 +61,15 @@ static const char *const WARNING_FLAGS[] = {
 static const char *const DEBUG_FLAGS[] = { "-g", "-O0", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                                            "-fno-omit-frame-pointer" };
 static const char *const RELEASE_FLAGS[] = { "-g", "-O2" };
-static const char *const INCLUDE_FLAGS[] = { "-Ideps/libmc/include", "-Ideps/libmc/deps/cyaml", "-Isrc" };
+static const char *const INCLUDE_FLAGS[] = { "-Ideps/libmc/include", "-Ideps/libmc/deps/cyaml", "-Ideps/libmc/deps/yyjson",
+                                           "-Isrc" };
 
 static const char *const SOURCE_DIRECTORIES[] = { "src/index", "src/fs", "src/app", "src/platform" };
 // libmc is vendored, pinned in deps.lock, and compiled with the project's own flags.
 static const char *const LIBMC_SOURCES = "deps/libmc/src";
-// libmc's own vendored dependency compiles in its own standard without the
+// libmc's own vendored dependencies compile in its own standard without the
 // warning flags: its warnings are upstream's to fix.
-static const char *const DEPENDENCY_DIRECTORIES[] = { "deps/libmc/deps/cyaml" };
+static const char *const DEPENDENCY_DIRECTORIES[] = { "deps/libmc/deps/cyaml", "deps/libmc/deps/yyjson" };
 static const char *const DEPENDENCY_FLAGS[] = { "-std=c11", "-w" };
 
 static void command_push(Command *command, const char *item)
