@@ -15,4 +15,12 @@
  */
 [[nodiscard]] Error tui_run(Arena *arena, Snapshot *s, QueryDefaults defaults, String *chosen, Err *err);
 
+/*
+ * tui_draw_row appends the list row of record id to frame: exactly width
+ * columns, whatever the name holds, with control characters drawn as '?' so a
+ * file name cannot send the terminal a sequence. What it formats lives in
+ * scratch. The view draws every row with it; the tests check it.
+ */
+void tui_draw_row(StringBuilder *frame, Arena *scratch, const Snapshot *s, uint32_t id, bool selected, int width);
+
 #endif

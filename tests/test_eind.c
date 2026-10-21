@@ -7,9 +7,11 @@
 #include "mc/platform/platform.h"
 #include "mc/text/glob.h"
 #include "mc/text/path.h"
+#include "mc/text/utf8.h"
 #include "app/build.h"
 #include "app/config.h"
 #include "app/server.h"
+#include "app/tui.h"
 #include "fs/excludes.h"
 #include "fs/updater.h"
 #include "index/journal.h"
@@ -579,6 +581,71 @@ static void test_config(Test *t) {
     arena_destroy(a);
 }
 
+/*
+ * visible_columns is how many terminal columns a drawn row takes once its
+ * colour sequences are dropped, or -1 if it holds any other escape or control
+ * character, which would act on the terminal.
+ */
+static int visible_columns(Arena *a, String row) {
+    StringBuilder text = str_builder_create(a, row.len);
+    for (size_t i = 0; i < row.len; i++) {
+        unsigned char c = (unsigned char)row.data[i];
+        if (c == 0x1b) {
+            if (i + 1 >= row.len || row.data[i + 1] != '[') return -1;
+            for (i += 2; i < row.len && (row.data[i] == ';' || (row.data[i] >= '0' && row.data[i] <= '9')); i++) {}
+            if (i >= row.len || row.data[i] != 'm') return -1;
+        } else if (c < 0x20 || c == 0x7f) {
+            return -1;
+        } else {
+            str_builder_append_char(&text, (char)c);
+        }
+    }
+    return (int)utf8_width((String){text.data, text.len});
+}
+
+static void test_tui_rows(Test *t) {
+    remove_tree(t, t->scratch);
+    make_file(t, "root/a-file-name-far-too-long-for-any-narrow-terminal-window-to-show.pdf", 10);
+    make_file(t, "root/日本語のファイル名前.jpg", 10);
+    make_file(t, "root/emoji-🎉-party-🎉🎉.png", 10);
+    make_file(t, "root/nfd-cafe\xcc\x81.txt", 10);
+    make_file(t, "root/evil\nline", 10);
+    make_file(t, "root/esc\x1b]0;title\x07\x1b[31mred", 10);
+    make_file(t, "root/deep/er/and/deeper/still/folder/structure/x.txt", 10);
+    Config cfg = {0};
+    strlist_push(t->arena, &cfg.roots, fixture_path(t, "root"));
+    Err err;
+    Snapshot *s;
+    if (build_index(&cfg, index_file(t), &s, &err) != ERR_OK) {
+        fprintf(stderr, "build_index: %s\n", err.msg);
+        t->failures++;
+        return;
+    }
+    ThreadPool *cpu = pool(t, 2);
+    IdList all = run_query(t->arena, cpu, s, "", nullptr);
+    CHECK(t, all.count == 15);
+    const int widths[] = {120, 80, 40, 20, 8};
+    bool exact = true, inert = true;
+    for (size_t w = 0; w < countof(widths); w++) {
+        for (size_t i = 0; i < all.count; i++) {
+            StringBuilder row = str_builder_create(t->arena, 256);
+            tui_draw_row(&row, t->arena, s, all.items[i], i == 0, widths[w]);
+            int cols = visible_columns(t->arena, (String){row.data, row.len});
+            inert = inert && cols >= 0;
+            exact = exact && cols == widths[w];
+            if (cols != widths[w]) fprintf(stderr, "row %zu at width %d takes %d columns\n", i, widths[w], cols);
+        }
+    }
+    CHECK(t, exact);
+    CHECK(t, inert);
+    IdList evil = run_query(t->arena, cpu, s, "evil", nullptr);
+    StringBuilder row = str_builder_create(t->arena, 256);
+    if (evil.count == 1) tui_draw_row(&row, t->arena, s, evil.items[0], false, 80);
+    CHECK(t, str_contains((String){row.data, row.len}, S("evil?line")));
+    threadpool_destroy(cpu);
+    snapshot_release(s);
+}
+
 int main(void) {
     Arena *arena = arena_create(0);
     String top;
@@ -595,6 +662,7 @@ int main(void) {
     test_journal(&t);
     test_server(&t);
     test_config(&t);
+    test_tui_rows(&t);
     remove_tree(&t, top);
     printf("%d checks, %d failures\n", t.checks, t.failures);
     arena_destroy(arena);

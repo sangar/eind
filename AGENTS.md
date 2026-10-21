@@ -230,9 +230,12 @@ processes. For an end-to-end check of the binary, use an isolated environment
   stops with an error rather than watching part of the tree.
 - The TUI draws on `/dev/tty` through libmc's `Terminal`, not on stdout, so
   `vim "$(eind)"` works. Open it before starting threads: resizes arrive as
-  a signal that every thread must block. It has no automated tests; drive it
-  through a pseudo-terminal (`script -qfec "./eind tui" /dev/null`) or by
-  hand after changing `app/tui.c`.
+  a signal that every thread must block. Only its rows have automated tests
+  (`test_tui_rows`); drive the rest in tmux after changing `app/tui.c`
+  (`tmux new-session -d -x 80 -y 20 ./eind tui`, then `tmux send-keys` and
+  `tmux capture-pane -p`), with names that are long, wide (CJK, emoji) and
+  hold control characters. Text is measured in terminal columns with libmc's
+  `utf8_codepoint_width`, never in bytes or code points.
 - The repository is `git@github.com:sangar/eind.git`. It held a Go
   implementation until October 2026, kept at the `go-final` tag; this C
   implementation replaced it. Ask the user before large rewrites.
@@ -244,8 +247,9 @@ Known gaps, roughly by value:
 1. **A folder's own modified time is not refreshed** by the watcher
    (`upsert` in `updater.c` skips directories); changes below it are seen.
 2. **Unicode case folding** (`É` matching `é`) in name matching and sorting.
-3. **The TUI has no tests**; a scripted input source like the server tests use
-   would allow them.
+3. **The TUI's input handling has no tests**; its rows are checked through
+   `tui_draw_row`, and a scripted input source like the server tests use
+   would allow the rest.
 4. **Regex speed**: POSIX `regexec` makes regex queries about 3x slower than
    RE2-style engines (see the benchmarks).
 5. **FreeBSD** would need a kqueue backend in libmc's watcher; Windows needs

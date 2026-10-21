@@ -80,6 +80,7 @@ typedef struct {
     Search *shown; /* the search whose hits are listed, or nullptr */
     size_t selected, top;
     Err error; /* shown instead of the status while its message is set */
+    bool query_failed; /* the input does not parse, so the hits listed are an earlier input's */
 
     Search *search;  /* the search whose result is still wanted */
     int outstanding; /* searches that have not reported yet, wanted or not */
@@ -126,6 +127,7 @@ static void apply_search(View *v, Search *job) {
     v->search = nullptr;
     v->searching = false;
     v->selected = v->top = 0;
+    v->query_failed = job->status != ERR_OK;
     if (job->status == ERR_OK) {
         free_search(v->shown);
         v->shown = job;
@@ -179,71 +181,115 @@ static void open_selected(View *v) {
 
 /* ---- drawing ---- */
 
-/* put appends at most width code points of s and returns how many it wrote. */
+/*
+ * Text is measured in terminal columns: CJK and emoji take two, combining
+ * accents none. A control character in a file name would act on the terminal,
+ * so it is drawn as '?' and takes a column.
+ */
+static bool is_control(uint32_t c) { return c < 0x20 || (c >= 0x7f && c < 0xa0); }
+
+static int glyph_width(uint32_t c) { return is_control(c) ? 1 : utf8_codepoint_width(c); }
+
+/* columns is how many columns put draws s in. */
+static int columns(String s) {
+    int cols = 0;
+    size_t p = 0;
+    uint32_t c;
+    while (p < s.len) {
+        utf8_decode(s, &p, &c);
+        cols += glyph_width(c);
+    }
+    return cols;
+}
+
+/* put draws as much of s as fits in width columns and returns how many it used. */
 static int put(StringBuilder *frame, String s, int width) {
     int cols = 0;
     size_t p = 0;
-    while (p < s.len && cols < width) {
-        size_t start = p++;
-        while (p < s.len && ((unsigned char)s.data[p] & 0xC0) == 0x80) p++;
-        str_builder_append(frame, str_slice(s, start, p));
-        cols++;
+    while (p < s.len) {
+        size_t start = p;
+        uint32_t c;
+        bool valid = utf8_decode(s, &p, &c);
+        int w = glyph_width(c);
+        if (cols + w > width) break;
+        if (is_control(c)) {
+            str_builder_append_char(frame, '?');
+        } else {
+            str_builder_append(frame, valid ? str_slice(s, start, p) : S("�"));
+        }
+        cols += w;
     }
     return cols;
+}
+
+/* put_clipped draws s in width columns, cut short with an ellipsis when it does not fit. */
+static int put_clipped(StringBuilder *frame, String s, int width) {
+    if (columns(s) <= width) return put(frame, s, width);
+    if (width < 1) return 0;
+    int x = put(frame, s, width - 1);
+    return x + put(frame, S("…"), 1);
+}
+
+/* tail is the end of s that fits in width columns. */
+static String tail(String s, int width) {
+    int excess = columns(s) - width;
+    size_t p = 0;
+    uint32_t c;
+    while (excess > 0 && p < s.len) {
+        utf8_decode(s, &p, &c);
+        excess -= glyph_width(c);
+    }
+    /* Marks that combined with a dropped character go with it. */
+    for (size_t next = p; next < s.len; p = next) {
+        utf8_decode(s, &next, &c);
+        if (glyph_width(c) != 0) break;
+    }
+    return str_slice(s, p, s.len);
 }
 
 static void pad(StringBuilder *frame, int n) {
     for (int i = 0; i < n; i++) str_builder_append_char(frame, ' ');
 }
 
-static int min_int(int a, int b) { return a < b ? a : b; }
 static int max_int(int a, int b) { return a > b ? a : b; }
 
-/* skip_columns drops the first n code points of s. */
-static String skip_columns(String s, int n) {
-    size_t p = 0;
-    for (; n > 0 && p < s.len; n--) {
-        p++;
-        while (p < s.len && ((unsigned char)s.data[p] & 0xC0) == 0x80) p++;
-    }
-    return str_slice(s, p, s.len);
-}
+/* Below this many columns for the name, a row leaves out the size and date. */
+enum { MIN_NAME_COLUMNS = 12 };
 
-static void draw_row(View *v, StringBuilder *frame, uint32_t id, bool selected) {
-    int width = v->size.columns;
-    bool is_dir = snap_is_dir(v->s, id);
+void tui_draw_row(StringBuilder *frame, Arena *scratch, const Snapshot *s, uint32_t id, bool selected, int width) {
+    bool is_dir = snap_is_dir(s, id);
     char when[32];
-    time_t mtime = (time_t)snap_mtime(v->s, id);
+    time_t mtime = (time_t)snap_mtime(s, id);
     struct tm tm;
     localtime_r(&mtime, &tm);
     strftime(when, sizeof when, "%Y-%m-%d %H:%M", &tm);
-    String size = is_dir ? S("") : fmt_bytes(v->frame, snap_size(v->s, id));
-    String meta = str_format(v->frame, "%9.*s  %s", (int)size.len, size.data, when);
-    int meta_width = (int)meta.len + 1;
+    String size = is_dir ? S("") : fmt_bytes(scratch, snap_size(s, id));
+    String meta = str_format(scratch, "%9.*s  %s ", (int)size.len, size.data, when);
+    int meta_width = columns(meta);
+    int name_room = width - meta_width >= MIN_NAME_COLUMNS ? width - meta_width : width;
     String base = selected ? S("\x1b[0;7m") : S("\x1b[0m");
     str_builder_append(frame, base);
     if (is_dir) str_builder_append(frame, S("\x1b[1;34m"));
-    int x = put(frame, S(" "), width);
-    x += put(frame, snap_name_view(v->s, id), width - x);
+    int x = put(frame, S(" "), name_room);
+    x += put_clipped(frame, snap_name_view(s, id), name_room - x);
     str_builder_append(frame, base);
-    int available = width - x - meta_width - 2;
-    uint32_t parent = snap_parent(v->s, id);
+    int available = name_room - x - 2;
+    uint32_t parent = snap_parent(s, id);
     if (parent != NO_PARENT && available > 4) {
-        StringBuilder dir_path = str_builder_create(v->frame, 256);
-        String dir = snap_path(v->s, parent, &dir_path);
-        int len = (int)utf8_count(dir);
+        StringBuilder dir_path = str_builder_create(scratch, 256);
+        String dir = snap_path(s, parent, &dir_path);
         str_builder_append(frame, S("\x1b[2m"));
         x += put(frame, S("  "), 2);
-        if (len > available) {
+        if (columns(dir) > available) {
             x += put(frame, S("…"), 1);
-            x += put(frame, skip_columns(dir, len - available + 1), available - 1);
+            x += put(frame, tail(dir, available - 1), available - 1);
         } else {
             x += put(frame, dir, available);
         }
         str_builder_append(frame, base);
     }
-    if (width - meta_width > x) pad(frame, width - meta_width - x);
-    if (width >= meta_width) {
+    pad(frame, name_room - x);
+    if (name_room < width) {
         str_builder_append(frame, S("\x1b[2m"));
         put(frame, meta, meta_width);
     }
@@ -253,10 +299,12 @@ static void draw_row(View *v, StringBuilder *frame, uint32_t id, bool selected) 
 static void draw(View *v) {
     arena_reset(v->frame);
     int width = v->size.columns;
-    String input = {v->input.data, v->input.len};
+    /* The end of a long input stays in view, since that is where the cursor is. */
+    String input = tail((String){v->input.data, v->input.len}, max_int(width - 3, 0));
     StringBuilder frame = str_builder_create(v->frame, 64 * 1024);
-    str_builder_append(&frame, S("\x1b[?25l\x1b[H\x1b[0;1m> "));
-    put(&frame, input, width - 2);
+    str_builder_append(&frame, S("\x1b[?25l\x1b[H\x1b[0;1m"));
+    int cursor = 1 + put(&frame, S("> "), width);
+    cursor += put(&frame, input, width - cursor + 1);
     str_builder_append(&frame, S("\x1b[0m\x1b[K\r\n\x1b[K"));
 
     IdList hits = shown_hits(v);
@@ -267,7 +315,7 @@ static void draw(View *v) {
         for (int row = 0; row < list_height; row++) {
             str_builder_append(&frame, S("\r\n\x1b[K"));
             size_t i = v->top + (size_t)row;
-            if (i < hits.count) draw_row(v, &frame, hits.items[i], i == v->selected);
+            if (i < hits.count) tui_draw_row(&frame, v->frame, v->s, hits.items[i], i == v->selected, width);
         }
         String shown = fmt_thousands(v->frame, (int64_t)hits.count);
         String total = fmt_thousands(v->frame, snap_live_count(v->s));
@@ -282,16 +330,20 @@ static void draw(View *v) {
             status = str_format(v->frame, " %.*s of %.*s objects  %.0fms", (int)shown.len, shown.data, (int)total.len,
                                 total.data, elapsed_ms);
         }
+        /* The status, an error message especially, matters more than the help, which steps aside for it. */
         String help = S("Enter print path  Ctrl-O open  Esc quit ");
-        int help_width = (int)help.len;
+        int help_width = columns(help);
         str_builder_append(&frame, S("\r\n\x1b[0;7m"));
-        int x = put(&frame, status, max_int(width - help_width, 0));
-        pad(&frame, width - help_width - x);
-        put(&frame, help, width - max_int(x, width - help_width));
+        int x = put(&frame, status, width);
+        if (width - x >= help_width + 1) {
+            pad(&frame, width - help_width - x);
+            put(&frame, help, help_width);
+        } else {
+            pad(&frame, width - x);
+        }
         str_builder_append(&frame, S("\x1b[0m"));
     }
-    int cursor = 3 + (int)utf8_count(input);
-    str_builder_append_format(&frame, "\x1b[1;%dH\x1b[?25h", min_int(cursor, width));
+    str_builder_append_format(&frame, "\x1b[1;%dH\x1b[?25h", max_int(cursor, 1));
     /* Nothing useful is left to do when the terminal is gone. */
     (void)terminal_write(v->terminal, (String){frame.data, frame.len}, nullptr);
 }
@@ -415,14 +467,20 @@ static bool run_view(View *v) {
             v->settle_at_ns = 0;
             start_search(v);
         }
-        if (collect_searches(v) && v->accept_when_done) return true;
+        if (collect_searches(v) && v->accept_when_done) {
+            if (!v->query_failed) return true;
+            v->accept_when_done = false;
+        }
         if (!ready.input) continue;
         int c = read_byte(v, 0);
         if (c < 0) return false; /* the terminal went away */
         switch (key(v, c)) {
         case ACT_QUIT: return false;
         case ACT_ACCEPT:
-            if (!v->searching) return true;
+            if (!v->searching) {
+                if (!v->query_failed) return true;
+                break;
+            }
             v->accept_when_done = true;
             if (!v->search) {
                 v->settle_at_ns = 0;
