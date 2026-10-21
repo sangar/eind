@@ -8,8 +8,8 @@
 /*
  * A read buffer starts small, since most directories are, and one that grew
  * past KEEP_BUF_BYTES for a large directory is freed rather than pooled:
- * releasing an arena keeps its blocks, and results can queue up by the
- * thousand while the collector catches up.
+ * releasing an arena keeps its blocks, and a pooled buffer would hold them
+ * for the rest of the scan.
  */
 enum { PROGRESS_EVERY = 10000, BUF_BLOCK_BYTES = 4096, KEEP_BUF_BYTES = 16 * 1024 };
 
@@ -27,9 +27,9 @@ typedef struct {
 } ReadBuf;
 
 /*
- * DirScan is one queued directory. The collector keeps finished items and
- * reuses them, so a scan allocates one per directory only while the queue
- * grows to the tree's widest level. Items and their paths live in the
+ * DirScan is one directory waiting to be listed. The collector keeps finished
+ * items and reuses them, so a scan allocates one per directory only while its
+ * pending stack grows. Items and their paths live in the
  * scan's arena, which only the collecting thread touches.
  */
 typedef struct DirScan {
@@ -113,12 +113,28 @@ static void set_path(Arena *arena, DirScan *d, String path) {
     d->path[path.len] = '\0';
 }
 
+/*
+ * The collector hands the pool the most recently found directory first and
+ * only a few at a time, so the scan goes depth first. Breadth first, a tree
+ * with more directories than the kernel's vnode cache (kern.maxvnodes,
+ * 263,168 on an 18 GB Mac) comes back to each directory after its vnode and
+ * its ancestors' were recycled, and every open walks the path cold: a home
+ * directory of two million entries took 14.5 s breadth first and 9.5 s
+ * depth first. How many are in flight at once made no difference.
+ */
 typedef struct {
     Arena *arena;
     DirScan *spares;
     const Excludes *ex;
     Queue *results, *bufs;
+    DirScan **pending;
+    size_t pending_count, pending_cap;
 } Collector;
+
+static void push_pending(Collector *c, DirScan *d) {
+    c->pending = arena_grow(c->arena, c->pending, &c->pending_cap, c->pending_count, sizeof *c->pending);
+    c->pending[c->pending_count++] = d;
+}
 
 static DirScan *take_scan(Collector *c, String path, uint32_t id) {
     DirScan *d = c->spares;
@@ -159,10 +175,12 @@ Error scan_tree(ThreadPool *pool, SegmentBuilder *b, String root, uint32_t paren
 
     Collector c = {.arena = arena_create(0), .ex = ex, .results = queue_create(), .bufs = queue_create()};
     StringBuilder child = str_builder_create(c.arena, 256);
-    threadpool_submit(pool, &take_scan(&c, root, root_id)->task);
-    size_t inflight = 1;
+    push_pending(&c, take_scan(&c, root, root_id));
+    size_t inflight = 0, max_inflight = 2 * threadpool_size(pool);
     uint32_t start_count = b->count, last_reported = 0;
-    while (inflight > 0) {
+    while (inflight > 0 || c.pending_count > 0) {
+        for (; inflight < max_inflight && c.pending_count > 0; inflight++)
+            threadpool_submit(pool, &c.pending[--c.pending_count]->task);
         DirScan *d = queue_pop(c.results);
         inflight--;
         if (d->failed) result->errors++;
@@ -174,8 +192,7 @@ Error scan_tree(ThreadPool *pool, SegmentBuilder *b, String root, uint32_t paren
                 str_builder_append(&child, S(d->path));
                 if (child.len == 0 || child.data[child.len - 1] != '/') str_builder_append_char(&child, '/');
                 str_builder_append(&child, entry->name);
-                threadpool_submit(pool, &take_scan(&c, (String){child.data, child.len}, id)->task);
-                inflight++;
+                push_pending(&c, take_scan(&c, (String){child.data, child.len}, id));
             }
         }
         return_buf(c.bufs, d->buf);
