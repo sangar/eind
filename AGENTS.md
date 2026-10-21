@@ -30,6 +30,8 @@ cc tools/build.c -o nob   # once; ./nob rebuilds itself when tools/build.c chang
 ./nob test        # out/debug/test_eind under AddressSanitizer + UndefinedBehaviorSanitizer
 ./nob check       # the modern-c checker (ruby ~/.agents/tools/modern-c/modern-c check), then the tests
 ./nob cross       # out/<target>/eind with the zig pinned in mise.toml (mise exec -- ./nob cross)
+./nob install     # ./eind to $DESTDIR$PREFIX/bin (PREFIX defaults to ~/.local), nothing else
+./nob uninstall   # remove that binary; the login service is `eind service enable/disable`
 ./nob clean
 VERSION=1.2.3 ./nob   # what `eind version` prints (default: git describe or "dev")
 ```

@@ -68,19 +68,24 @@ VERSION=1.2.3 ./nob   # what `eind version` prints (default: git describe or "de
 ## Install
 
 ```sh
-./nob install      # ~/.local/bin/eind, and eind serve at login
-./nob uninstall    # stop the service and remove the binary
+./nob install          # ~/.local/bin/eind
+eind service enable    # eind serve at login
 ```
 
 `./nob install` builds and copies the binary to `~/.local/bin`, which must be
-on your `PATH`, and enables the login service (`eind service enable`). Run it
-again after pulling to upgrade; the service restarts on the new binary.
-Install elsewhere with `PREFIX=/usr/local ./nob install`, and uninstall with
-the same `PREFIX`.
+on your `PATH`, and does nothing else. `eind service enable` starts the daemon
+at login. To upgrade after pulling, run both again; enabling the service
+restarts it on the new binary. Install elsewhere with
+`PREFIX=/usr/local ./nob install`; `DESTDIR` stages the install for a package.
 
-`./nob uninstall` keeps the index and config; `eind status` shows where they
-are, so you can delete them too. On macOS the service logs to
-`~/Library/Logs/eind.log`.
+```sh
+eind service disable   # stop the daemon and remove the login service
+./nob uninstall        # remove the binary
+```
+
+`./nob uninstall` takes the same `PREFIX` and removes only the binary; the
+index and config stay, and `eind status` shows where they are, so you can
+delete them too. On macOS the service logs to `~/Library/Logs/eind.log`.
 
 On Linux, raise the inotify limit once, since the watcher registers every
 indexed directory and the default of 8192 watches is too low for a home

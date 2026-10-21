@@ -57,6 +57,7 @@ Do them in this order, so that only one daemon ever writes to the journal.
    cc tools/build.c -o nob
    ./nob test
    ./nob install
+   eind service enable
    ```
 
    This copies the binary to `~/.local/bin`, which must be on your `PATH`,

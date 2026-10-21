@@ -6,8 +6,8 @@
 //     ./nob test            the tests under AddressSanitizer and UBSan
 //     ./nob check           modern-c contract check, then the tests
 //     ./nob cross           every target with zig cc           -> out/<target>/eind
-//     ./nob install         ./eind to $PREFIX/bin (default ~/.local) and `eind service enable`
-//     ./nob uninstall       stop the service and remove the installed binary
+//     ./nob install         ./eind to $DESTDIR$PREFIX/bin (PREFIX defaults to ~/.local)
+//     ./nob uninstall       remove what install placed
 //     ./nob clean           remove out/ and ./eind
 //
 // Host builds compile with $CC, or cc when it is unset. $VERSION sets what
@@ -545,19 +545,22 @@ static int run_check(void)
     return command_run(&command);
 }
 
+// bin_dir is $DESTDIR$PREFIX/bin; DESTDIR stages the install for a package.
 static void bin_dir(char *out)
 {
+    const char *destdir = getenv("DESTDIR");
     const char *prefix = getenv("PREFIX");
     const char *home = getenv("HOME");
+    destdir = destdir == NULL ? "" : destdir;
     if (prefix != NULL && prefix[0] != '\0') {
-        snprintf(out, PATH_MAX_LEN, "%s/bin", prefix);
+        snprintf(out, PATH_MAX_LEN, "%s%s/bin", destdir, prefix);
     } else {
-        snprintf(out, PATH_MAX_LEN, "%s/.local/bin", home == NULL ? "" : home);
+        snprintf(out, PATH_MAX_LEN, "%s%s/.local/bin", destdir, home == NULL ? "" : home);
     }
 }
 
-// run_install copies the binary and runs `eind serve` at login. Run again to
-// upgrade: enabling the service restarts it on the new binary.
+// run_install copies the binary and nothing else; the login service is the
+// user's choice, `eind service enable`.
 static int run_install(void)
 {
     char directory[PATH_MAX_LEN];
@@ -575,30 +578,20 @@ static int run_install(void)
     command_push(&copy, "755");
     command_push(&copy, "eind");
     command_push(&copy, installed);
-    run_or_die(&copy);
-    Command enable = { 0 };
-    command_push(&enable, installed);
-    command_push(&enable, "service");
-    command_push(&enable, "enable");
-    return command_run(&enable);
+    int status = command_run(&copy);
+    if (status == 0) {
+        printf("installed %s\n", installed);
+    }
+    return status;
 }
 
-// run_uninstall stops the login service and removes the binary; the index and config are kept.
+// run_uninstall removes the binary that run_install placed.
 static int run_uninstall(void)
 {
     char directory[PATH_MAX_LEN];
     bin_dir(directory);
     char installed[PATH_MAX_LEN];
     snprintf(installed, sizeof installed, "%s/eind", directory);
-    char status[PATH_MAX_LEN + 64];
-    snprintf(status, sizeof status, "'%s' status 2>/dev/null | grep -q '^service: enabled'", installed);
-    if (access(installed, X_OK) == 0 && system(status) == 0) {
-        Command disable = { 0 };
-        command_push(&disable, installed);
-        command_push(&disable, "service");
-        command_push(&disable, "disable");
-        run_or_die(&disable);
-    }
     Command remove_binary = { 0 };
     command_push(&remove_binary, "rm");
     command_push(&remove_binary, "-f");
