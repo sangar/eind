@@ -7,8 +7,10 @@ fresh from filesystem events, and serves a JSON-lines socket for GUIs.
 
 This directory is the C implementation, built on immutable segments,
 snapshots and arenas. It follows the Modern C profile at Level 2 and is
-built on [libmc](https://github.com/sangar/libmc), vendored in `deps/libmc`;
-beyond that it needs libc, pthreads and, on macOS, CoreServices.
+built on [libmc](https://github.com/sangar/libmc), vendored in `deps/libmc`
+and built by its own build program, which fetches libmc's pinned
+dependencies on the first build; beyond that it needs libc, pthreads and,
+on macOS, CoreServices.
 
 Read in this order:
 
@@ -38,8 +40,9 @@ VERSION=1.2.3 ./nob   # what `eind version` prints (default: git describe or "de
 
 Run `./nob test` after every change and `./nob check` before finishing one;
 both must pass with `CC=clang` and `CC=gcc`. The tests always run under the
-sanitizers, and a sanitizer finding fails them. A full rebuild, libmc
-included, takes a few seconds and an incremental one well under a second.
+sanitizers, and a sanitizer finding fails them. The first build of libmc
+fetches its dependencies and takes about 15 seconds; after that a rebuild
+of eind takes a few seconds and an incremental one well under a second.
 
 The code is C23 and builds with `-Werror` under `-Wall -Wextra -Wshadow
 -Wconversion -Wvla -Wstrict-prototypes -Wimplicit-fallthrough`, with clang

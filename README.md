@@ -8,9 +8,10 @@ language: `report ext:pdf size:>1mb dm:thisweek !draft`. A daemon keeps the
 index current from filesystem events and answers launchers over a Unix
 socket.
 
-Runs on macOS and Linux. Building needs only a C23 compiler: its one
-dependency, [libmc](https://github.com/sangar/libmc), is vendored in
-`deps/libmc`, and the build program is C too.
+Runs on macOS and Linux. Building needs only a C23 compiler and, for the
+first build, `curl` and the network: its one dependency,
+[libmc](https://github.com/sangar/libmc), is vendored in `deps/libmc` and
+fetches its own pinned dependencies, and the build program is C too.
 
 ## Profile
 

@@ -2,3 +2,6 @@
 /nob
 /out/
 /macos/.build/
+/deps/libmc/deps/
+/deps/libmc/out/
+/deps/libmc/nob

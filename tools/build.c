@@ -48,8 +48,9 @@ typedef struct {
 } Target;
 
 static const Target TARGETS[] = {
-    { "linux-x86_64", "x86_64-linux-gnu", true },
-    { "linux-aarch64", "aarch64-linux-gnu", true },
+    // The glibc version matches libmc's cross builds.
+    { "linux-x86_64", "x86_64-linux-gnu.2.39", true },
+    { "linux-aarch64", "aarch64-linux-gnu.2.39", true },
     { "macos-aarch64", "aarch64-macos", false },
 };
 
@@ -61,16 +62,12 @@ static const char *const WARNING_FLAGS[] = {
 static const char *const DEBUG_FLAGS[] = { "-g", "-O0", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
                                            "-fno-omit-frame-pointer" };
 static const char *const RELEASE_FLAGS[] = { "-g", "-O2" };
-static const char *const INCLUDE_FLAGS[] = { "-Ideps/libmc/include", "-Ideps/libmc/deps/cyaml", "-Ideps/libmc/deps/yyjson",
-                                           "-Isrc" };
+static const char *const INCLUDE_FLAGS[] = { "-Ideps/libmc/include", "-Isrc" };
 
 static const char *const SOURCE_DIRECTORIES[] = { "src/index", "src/fs", "src/app", "src/platform" };
-// libmc is vendored, pinned in deps.lock, and compiled with the project's own flags.
-static const char *const LIBMC_SOURCES = "deps/libmc/src";
-// libmc's own vendored dependencies compile in its own standard without the
-// warning flags: its warnings are upstream's to fix.
-static const char *const DEPENDENCY_DIRECTORIES[] = { "deps/libmc/deps/cyaml", "deps/libmc/deps/yyjson" };
-static const char *const DEPENDENCY_FLAGS[] = { "-std=c11", "-w" };
+// libmc is vendored and pinned in deps.lock. Its own build program fetches
+// its dependencies and builds deps/libmc/out/.../libmc.a, which is linked.
+static const char *const LIBMC = "deps/libmc";
 
 static void command_push(Command *command, const char *item)
 {
@@ -200,12 +197,8 @@ static time_t newest_header_mtime(void)
 {
     FileList directories = { 0 };
     list_subdirectories(&directories, "deps/libmc/include/mc");
-    list_subdirectories(&directories, LIBMC_SOURCES);
     for (size_t i = 0; i < sizeof SOURCE_DIRECTORIES / sizeof *SOURCE_DIRECTORIES; i++) {
         list_push(&directories, SOURCE_DIRECTORIES[i]);
-    }
-    for (size_t i = 0; i < sizeof DEPENDENCY_DIRECTORIES / sizeof *DEPENDENCY_DIRECTORIES; i++) {
-        list_push(&directories, DEPENDENCY_DIRECTORIES[i]);
     }
     FileList headers = { 0 };
     for (size_t i = 0; i < directories.count; i++) {
@@ -216,7 +209,6 @@ static time_t newest_header_mtime(void)
 
 typedef struct {
     bool release;
-    bool dependency;
     const Target *target;
     char out_dir[PATH_MAX_LEN];
     char obj_dir[PATH_MAX_LEN];
@@ -288,11 +280,7 @@ static void push_compile_command(Command *command, const Build *build)
 {
     static char version_define[300];
     push_compiler(command, build);
-    if (build->dependency) {
-        command_push_many(command, DEPENDENCY_FLAGS, sizeof DEPENDENCY_FLAGS / sizeof *DEPENDENCY_FLAGS);
-    } else {
-        command_push_many(command, WARNING_FLAGS, sizeof WARNING_FLAGS / sizeof *WARNING_FLAGS);
-    }
+    command_push_many(command, WARNING_FLAGS, sizeof WARNING_FLAGS / sizeof *WARNING_FLAGS);
     if (build->release) {
         command_push_many(command, RELEASE_FLAGS, sizeof RELEASE_FLAGS / sizeof *RELEASE_FLAGS);
     } else if (sanitized(build)) {
@@ -408,21 +396,31 @@ static void compile_directory(const Build *build, const char *directory, FileLis
     }
 }
 
-// compile_program compiles libmc and the project's sources but not main.c or the tests.
+// build_libmc runs libmc's build program, bootstrapping it first, in the
+// mode matching build; cross builds of libmc cover every target at once.
+static void build_libmc(const Build *build)
+{
+    const char *mode = build->target != NULL ? "cross" : build->release ? "release" : "build";
+    char script[PATH_MAX_LEN];
+    snprintf(script, sizeof script, "cd %s && { [ -x nob ] || cc tools/build.c -o nob; } && ./nob %s", LIBMC, mode);
+    Command command = { 0 };
+    command_push(&command, "sh");
+    command_push(&command, "-c");
+    command_push(&command, script);
+    run_or_die(&command);
+}
+
+static void libmc_archive(const Build *build, char *out)
+{
+    snprintf(out, PATH_MAX_LEN, "%s/out/%s%s%s/libmc.a", LIBMC, build->target != NULL ? build->target->name : "",
+             build->target != NULL ? "/" : "", build->release ? "release" : "debug");
+}
+
+// compile_program compiles the project's sources but not main.c or the tests.
 static void compile_program(const Build *build, FileList *objects)
 {
     mkdir_p(build->obj_dir);
     discard_stale_objects(build);
-    FileList libmc_areas = { 0 };
-    list_subdirectories(&libmc_areas, LIBMC_SOURCES);
-    for (size_t i = 0; i < libmc_areas.count; i++) {
-        compile_directory(build, libmc_areas.items[i], objects);
-    }
-    Build dependency = *build;
-    dependency.dependency = true;
-    for (size_t i = 0; i < sizeof DEPENDENCY_DIRECTORIES / sizeof *DEPENDENCY_DIRECTORIES; i++) {
-        compile_directory(&dependency, DEPENDENCY_DIRECTORIES[i], objects);
-    }
     for (size_t i = 0; i < sizeof SOURCE_DIRECTORIES / sizeof *SOURCE_DIRECTORIES; i++) {
         compile_directory(build, SOURCE_DIRECTORIES[i], objects);
     }
@@ -430,7 +428,10 @@ static void compile_program(const Build *build, FileList *objects)
 
 static void link_binary(const Build *build, const FileList *objects, const char *binary)
 {
-    if (mtime_of(binary) > newest_of(objects)) {
+    build_libmc(build);
+    char libmc[PATH_MAX_LEN];
+    libmc_archive(build, libmc);
+    if (mtime_of(binary) > newest_of(objects) && mtime_of(binary) > mtime_of(libmc)) {
         return;
     }
     Command command = { 0 };
@@ -442,6 +443,7 @@ static void link_binary(const Build *build, const FileList *objects, const char 
     for (size_t i = 0; i < objects->count; i++) {
         command_push(&command, objects->items[i]);
     }
+    command_push(&command, libmc);
     command_push(&command, "-lpthread");
     command_push(&command, "-lm");
     bool macos = build->target != NULL ? strstr(build->target->zig_target, "macos") != NULL : false;
@@ -449,8 +451,11 @@ static void link_binary(const Build *build, const FileList *objects, const char 
     macos = macos || build->target == NULL;
 #endif
     if (macos) {
-        command_push(&command, "-framework");
-        command_push(&command, "CoreServices");
+        const char *frameworks[] = { "CoreServices", "SystemConfiguration", "CoreFoundation" };
+        for (size_t i = 0; i < sizeof frameworks / sizeof *frameworks; i++) {
+            command_push(&command, "-framework");
+            command_push(&command, frameworks[i]);
+        }
     }
     command_push(&command, "-o");
     command_push(&command, binary);
@@ -484,7 +489,6 @@ static int build_and_run_tests(const Build *build)
 static void configure(Build *build, bool release, const Target *target)
 {
     build->release = release;
-    build->dependency = false;
     build->target = target;
     build->headers_mtime = newest_header_mtime();
     snprintf(build->out_dir, sizeof build->out_dir, "out/%s%s%s", target != NULL ? target->name : "",
