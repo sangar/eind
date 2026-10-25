@@ -226,12 +226,15 @@ void journal_record(Journal *j, const Snapshot *before, const Snapshot *after) {
         put_bytes(&j->pending, snap_name(after, id), len);
         j->entries++;
     }
-    for (uint32_t id = 0; id < after->total; id++) {
-        bool was_dead = id < before->total && !snap_live(before, id);
-        if (snap_live(after, id) || was_dead) continue;
-        str_builder_append_char(&j->pending, OP_REMOVE);
-        put_u32(&j->pending, id);
-        j->entries++;
+    for (size_t w = 0; w < bitmap_words(after->total); w++) {
+        uint64_t was_dead = w < bitmap_words(before->total) ? before->dead[w] : 0;
+        uint64_t removed = after->dead[w] & ~was_dead;
+        for (uint32_t bit = 0; removed && bit < 64; bit++) {
+            if (!(removed >> bit & 1)) continue;
+            str_builder_append_char(&j->pending, OP_REMOVE);
+            put_u32(&j->pending, (uint32_t)(w * 64 + bit));
+            j->entries++;
+        }
     }
 }
 

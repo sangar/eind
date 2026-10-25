@@ -57,11 +57,16 @@ static void *move_to_larger(Arena **arena, const void *items, size_t used, size_
     return moved;
 }
 
+/*
+ * Builders start small: the daemon keeps a delta segment per batch of events,
+ * usually of a record or two, until it next compacts.
+ */
+
 /* reserve_names makes room for extra more bytes of names, doubling as it grows. */
 static void reserve_names(SegmentBuilder *b, size_t extra) {
     size_t need = arena_size_add(b->names_len, extra);
     if (need <= b->names_cap) return;
-    size_t cap = b->names_cap ? b->names_cap : 16384;
+    size_t cap = b->names_cap ? b->names_cap : 256;
     while (cap < need) cap = arena_size_mul(cap, 2);
     b->names = move_to_larger(&b->names_arena, b->names, b->names_len, cap);
     b->names_cap = cap;
@@ -70,7 +75,7 @@ static void reserve_names(SegmentBuilder *b, size_t extra) {
 uint32_t builder_add(SegmentBuilder *b, String name, uint32_t parent, int64_t size, int64_t mtime, int64_t ctime,
                      uint32_t flags) {
     if (b->count == b->cap) {
-        size_t cap = b->cap ? arena_size_mul(b->cap, 2) : 1024;
+        size_t cap = b->cap ? arena_size_mul(b->cap, 2) : 16;
         b->recs = move_to_larger(&b->records_arena, b->recs, b->count * sizeof *b->recs, arena_size_mul(cap, sizeof *b->recs));
         b->cap = cap;
     }
