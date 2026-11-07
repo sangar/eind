@@ -403,6 +403,54 @@ static void test_updater_and_compaction(Test *t) {
     arena_destroy(a);
 }
 
+/* A record added under a name the builder already holds, the moment the names have to grow. */
+static void test_builder_reuses_own_name(Test *t) {
+    SegmentBuilder b;
+    builder_init(&b, 0);
+    uint32_t first = builder_add(&b, S("first.txt"), NO_PARENT, 1, 0, 0, 0);
+    while (b.names_len + sizeof "first.txt" <= b.names_cap) builder_add(&b, S("x"), NO_PARENT, 1, 0, 0, 0);
+    uint32_t again = builder_add(&b, builder_name(&b, first), NO_PARENT, 2, 0, 0, 0);
+    CHECK_STR(t, builder_name(&b, again), "first.txt");
+    builder_free(&b);
+}
+
+/* A file replaced by a folder, reported only through the folder's new child. */
+static void test_file_replaced_by_folder(Test *t) {
+    Snapshot *s = build_fixture(t);
+    CHECK(t, s != nullptr);
+    if (!s) return;
+    Index ix;
+    index_init(&ix, s);
+    Excludes ex = node_modules_excluded(t);
+    ThreadPool *cpu = pool(t, 0), *io = pool(t, io_thread_count());
+    Updater *u = updater_create(io, &ix, &ex);
+    Arena *a = arena_create(0);
+
+    CHECK(t, dir_remove_all(fixture_path(t, "root/docs/Readme.md"), nullptr) == ERR_OK);
+    make_file(t, "root/docs/Readme.md/child.txt", 3);
+    const char *const batch[] = {"root/docs/Readme.md/child.txt"};
+    WatchEventList events = changed(t, countof(batch), batch, false);
+    CHECK(t, updater_apply(u, events.items, events.count));
+
+    Err err;
+    Snapshot *latest = index_acquire(&ix);
+    CHECK_STR(t, search_names(a, cpu, latest, "Readme"), "Readme.md");
+    CHECK_STR(t, search_names(a, cpu, latest, "folder: Readme"), "Readme.md");
+    CHECK_STR(t, search_names(a, cpu, latest, "child"), "child.txt");
+    Snapshot *merged;
+    CHECK(t, index_compact(latest, index_file(t), &merged, &err) == ERR_OK);
+    CHECK(t, merged->total == snap_live_count(latest));
+    CHECK_STR(t, search_names(a, cpu, merged, ""), search_names(a, cpu, latest, "").data);
+    snapshot_release(latest);
+    snapshot_release(merged);
+
+    updater_destroy(u);
+    threadpool_destroy(cpu);
+    threadpool_destroy(io);
+    index_destroy(&ix);
+    arena_destroy(a);
+}
+
 /* append_entry writes raw journal bytes after what is there, as another implementation would. */
 static void append_entry(Test *t, String path, String bytes) {
     int fd;
@@ -658,7 +706,9 @@ int main(void) {
     test_values(&t);
     test_excludes(&t);
     test_index_search(&t);
+    test_builder_reuses_own_name(&t);
     test_updater_and_compaction(&t);
+    test_file_replaced_by_folder(&t);
     test_journal(&t);
     test_server(&t);
     test_config(&t);
