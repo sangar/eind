@@ -206,8 +206,11 @@ static bool upsert(Updater *u, String path, const FileInfo *info, bool rescan) {
     uint32_t parent = NO_PARENT;
     if (rest.len > 0) {
         String parent_path = path_dir(path);
-        if (!lookup(u, parent_path, &parent)) {
-            /* The parent is not indexed yet (events arrive out of order); reconciling it scans this path too. */
+        if (!lookup(u, parent_path, &parent) || !view_is_dir(u, parent)) {
+            /*
+             * The parent is not indexed yet, or only as the file it replaced (events arrive out of
+             * order); reconciling it scans this path too.
+             */
             return reconcile(u, parent_path, false);
         }
     }
