@@ -62,14 +62,21 @@ static void *move_to_larger(Arena **arena, const void *items, size_t used, size_
  * usually of a record or two, until it next compacts.
  */
 
-/* reserve_names makes room for extra more bytes of names, doubling as it grows. */
-static void reserve_names(SegmentBuilder *b, size_t extra) {
+/*
+ * reserve_names makes room for extra more bytes of names, doubling as it
+ * grows. It returns the outgrown arena, or nullptr, for the caller to free
+ * once nothing points into it.
+ */
+static Arena *reserve_names(SegmentBuilder *b, size_t extra) {
     size_t need = arena_size_add(b->names_len, extra);
-    if (need <= b->names_cap) return;
+    if (need <= b->names_cap) return nullptr;
     size_t cap = b->names_cap ? b->names_cap : 256;
     while (cap < need) cap = arena_size_mul(cap, 2);
+    Arena *outgrown = b->names_arena;
+    b->names_arena = nullptr;
     b->names = move_to_larger(&b->names_arena, b->names, b->names_len, cap);
     b->names_cap = cap;
+    return outgrown;
 }
 
 uint32_t builder_add(SegmentBuilder *b, String name, uint32_t parent, int64_t size, int64_t mtime, int64_t ctime,
@@ -79,7 +86,8 @@ uint32_t builder_add(SegmentBuilder *b, String name, uint32_t parent, int64_t si
         b->recs = move_to_larger(&b->records_arena, b->recs, b->count * sizeof *b->recs, arena_size_mul(cap, sizeof *b->recs));
         b->cap = cap;
     }
-    reserve_names(b, name.len + 1);
+    /* name may be one of b's own, as when the updater replaces a record it added in the same batch */
+    Arena *outgrown = reserve_names(b, name.len + 1);
     b->recs[b->count] = (FileRecord){.parent = parent,
                                      .name_off = (uint32_t)b->names_len,
                                      .name_len = (uint32_t)name.len,
@@ -90,6 +98,7 @@ uint32_t builder_add(SegmentBuilder *b, String name, uint32_t parent, int64_t si
     if (name.len) memcpy(b->names + b->names_len, name.data, name.len);
     b->names[b->names_len + name.len] = '\0';
     b->names_len += name.len + 1;
+    arena_destroy(outgrown);
     return b->base_id + b->count++;
 }
 

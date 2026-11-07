@@ -403,6 +403,17 @@ static void test_updater_and_compaction(Test *t) {
     arena_destroy(a);
 }
 
+/* A record added under a name the builder already holds, the moment the names have to grow. */
+static void test_builder_reuses_own_name(Test *t) {
+    SegmentBuilder b;
+    builder_init(&b, 0);
+    uint32_t first = builder_add(&b, S("first.txt"), NO_PARENT, 1, 0, 0, 0);
+    while (b.names_len + sizeof "first.txt" <= b.names_cap) builder_add(&b, S("x"), NO_PARENT, 1, 0, 0, 0);
+    uint32_t again = builder_add(&b, builder_name(&b, first), NO_PARENT, 2, 0, 0, 0);
+    CHECK_STR(t, builder_name(&b, again), "first.txt");
+    builder_free(&b);
+}
+
 /* A file replaced by a folder, reported only through the folder's new child. */
 static void test_file_replaced_by_folder(Test *t) {
     Snapshot *s = build_fixture(t);
@@ -695,6 +706,7 @@ int main(void) {
     test_values(&t);
     test_excludes(&t);
     test_index_search(&t);
+    test_builder_reuses_own_name(&t);
     test_updater_and_compaction(&t);
     test_file_replaced_by_folder(&t);
     test_journal(&t);
